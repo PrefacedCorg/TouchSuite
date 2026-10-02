@@ -1,2 +1,6 @@
 /bin
 /obj
+/publish
+/release
+TouchErase-*.zip
+logs/

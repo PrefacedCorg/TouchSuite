@@ -11,6 +11,8 @@
     <AssemblyName>TouchErase</AssemblyName>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <Version>1.0.0</Version>
+    <Product>TouchErase 手掌擦矫正 Demo</Product>
   </PropertyGroup>
 
 </Project>

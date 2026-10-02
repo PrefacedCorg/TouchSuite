@@ -71,6 +71,7 @@ public partial class MainWindow : Window
 
     private const long SourceFreshMs = 300;
     private readonly Dictionary<ContactSource, (long Time, Rect Rect)> _sourceState = new();
+    private readonly Dictionary<ContactSource, string> _sourceDetail = new();
     private ContactSource _activeSource = ContactSource.None;
 
     private static readonly Color[] ClusterPalette =
@@ -192,7 +193,8 @@ public partial class MainWindow : Window
             ly = EraserHost.ActualHeight / 2;
         }
 
-        SubmitContact(ContactSource.RawHid, new Rect(lx - wDiu / 2, ly - hDiu / 2, wDiu, hDiu), applyThreshold: false);
+        string detail = $"W={s.WidthLogical} H={s.HeightLogical} → {s.WidthMm?.ToString("0.0") ?? "-"}×{s.HeightMm?.ToString("0.0") ?? "-"} mm";
+        SubmitContact(ContactSource.RawHid, new Rect(lx - wDiu / 2, ly - hDiu / 2, wDiu, hDiu), applyThreshold: false, detail);
     }
 
     private void HandlePointerContact(PointerTouch.POINTER_TOUCH_INFO ti, bool hasArea)
@@ -238,7 +240,8 @@ public partial class MainWindow : Window
         Point hostOffset = EraserHost.TranslatePoint(new Point(0, 0), this);
 
         var rect = new Rect(cxDiu - hostOffset.X - wDiu / 2, cyDiu - hostOffset.Y - hDiu / 2, wDiu, hDiu);
-        SubmitContact(ContactSource.Pointer, rect, applyThreshold: true);
+        string detail = $"{ti.rcContact.Width}×{ti.rcContact.Height} px → {wDiu * _mmPerDiuX:0.0}×{hDiu * _mmPerDiuY:0.0} mm";
+        SubmitContact(ContactSource.Pointer, rect, applyThreshold: true, detail);
     }
 
     // ================= 生命周期 =================
@@ -681,15 +684,18 @@ public partial class MainWindow : Window
     {
         Rect b = e.GetTouchPoint(EraserHost).Bounds;
         LogHidFrame(b);
-        SubmitContact(ContactSource.Wpf, b, applyThreshold: true);
+        SubmitContact(ContactSource.Wpf, b, applyThreshold: true, WpfDetail(b));
     }
 
     private void OnEraserTouchMove(object sender, TouchEventArgs e)
     {
         Rect b = e.GetTouchPoint(EraserHost).Bounds;
         LogHidFrame(b);
-        SubmitContact(ContactSource.Wpf, b, applyThreshold: true);
+        SubmitContact(ContactSource.Wpf, b, applyThreshold: true, WpfDetail(b));
     }
+
+    private string WpfDetail(Rect b)
+        => $"{b.Width:0.###}×{b.Height:0.###} DIP → {b.Width * _mmPerDiuX:0.###}×{b.Height * _mmPerDiuY:0.###} mm";
 
     private void OnEraserTouchUp(object sender, TouchEventArgs e)
     {
@@ -723,7 +729,7 @@ public partial class MainWindow : Window
             if (best is TouchPoint p)
             {
                 LogHidFrame(p.Bounds);
-                SubmitContact(ContactSource.Wpf, p.Bounds, applyThreshold: true);
+                SubmitContact(ContactSource.Wpf, p.Bounds, applyThreshold: true, WpfDetail(p.Bounds));
             }
         }
         catch
@@ -823,10 +829,11 @@ public partial class MainWindow : Window
     // ---------- 实时接触 -> 擦除区（按多大，擦多大） ----------
 
     /// <summary>三路接触来源统一入口：按优先级（原始HID &gt; WM_POINTER &gt; WPF）仲裁后驱动预览。</summary>
-    private void SubmitContact(ContactSource src, Rect rectDiu, bool applyThreshold)
+    private void SubmitContact(ContactSource src, Rect rectDiu, bool applyThreshold, string detail)
     {
         long now = Environment.TickCount64;
         _sourceState[src] = (now, rectDiu);
+        _sourceDetail[src] = detail;
 
         // 选优先级最高、且仍在"活跃"（近 SourceFreshMs 内）的来源
         ContactSource eff = ContactSource.None;
@@ -865,7 +872,19 @@ public partial class MainWindow : Window
     {
         if (ContactSourceText is null)
             return;
-        ContactSourceText.Text = $"接触来源: {SourceName(_activeSource)}";
+
+        long now = Environment.TickCount64;
+        var sb = new StringBuilder();
+        sb.Append("生效来源: ").Append(SourceName(_activeSource));
+        foreach (ContactSource s in new[] { ContactSource.RawHid, ContactSource.Pointer, ContactSource.Wpf })
+        {
+            bool active = s == _activeSource;
+            bool fresh = _sourceState.TryGetValue(s, out var st) && now - st.Time <= SourceFreshMs;
+            string val = _sourceDetail.TryGetValue(s, out string? d) ? d : "（无）";
+            sb.Append('\n').Append(active ? "▶ " : "   ").Append(SourceName(s)).Append(": ").Append(val);
+            if (!fresh && _sourceState.ContainsKey(s)) sb.Append("  (旧)");
+        }
+        ContactSourceText.Text = sb.ToString();
     }
 
     /// <summary>

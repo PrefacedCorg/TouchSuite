@@ -183,8 +183,9 @@
                                     <TextBlock Text="面积擦预览" FontWeight="Bold" FontSize="15" Foreground="#FF1E1E1E" />
                                     <TextBlock Text="读驱动上报的接触矩形 → 实时画出等大的擦除区（按多大，擦多大）"
                                                TextWrapping="Wrap" Foreground="#FF666666" Margin="0,4,0,0" />
-                                    <TextBlock x:Name="ContactSourceText" Text="接触来源: 无" Margin="0,6,0,0"
-                                               FontWeight="SemiBold" Foreground="#FF0A5A9A" TextWrapping="Wrap" />
+                                    <TextBlock x:Name="ContactSourceText" Text="生效来源: 无" Margin="0,6,0,0"
+                                               FontFamily="Consolas" FontSize="11" Foreground="#FF0A5A9A"
+                                               TextWrapping="Wrap" />
 
                                     <TextBlock Text="擦除形状：" Margin="0,12,0,0" Foreground="#FF444444" />
                                     <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
