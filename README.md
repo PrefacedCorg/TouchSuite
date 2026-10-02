@@ -122,24 +122,22 @@ Windows 侧有三条通路，按优先级仲裁（`原始HID > WM_POINTER > WPF`
 
 ## CI / 发版
 
-`.github/workflows/build.yml`：
+两个工作流，职责分开：
 
-- push 到 `main` / PR：构建并上传 artifact。
-- 推 `v*` 标签：额外创建 GitHub Release，附自包含单文件 zip。
-- 版本号取自 tag（`v1.2.3` → `1.2.3`），非 tag 构建取 `TouchErase.csproj` 的 `<Version>`。
+- `.github/workflows/build.yml` —— **提交即编译**。push 到 `main` / PR 时执行 `restore` + `build -c Release`，不产出安装包、不发布。
+- `.github/workflows/release.yml` —— **手动发版**。GitHub → Actions → `release` → `Run workflow`，填版本号（**留空**则读取 `TouchErase.csproj` 的 `<Version>`），可选预发布。流程：`restore` → `build` → `publish`（自包含单文件 win-x64）→ 打包 zip → 上传 artifact → 自动打 tag `vX.Y.Z` 并创建 **GitHub Release**。
 
-发版：
+注意：
 
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
+- 发版是**手动**触发的，推 tag **不会**自动发版。
+- 若目标 tag 或 Release 已存在，创建会失败；请换版本号，或先删除同名 Release。
 
 ## 目录结构
 
 ```
 TouchErase/
-├─ .github/workflows/build.yml   CI：构建 / 发布
+├─ .github/workflows/build.yml    CI：提交即编译
+├─ .github/workflows/release.yml  CI：手动发版（publish + Release）
 ├─ app.manifest                  PerMonitorV2 DPI 声明
 ├─ App.xaml / App.xaml.cs        应用入口、全局异常兜底
 ├─ MainWindow.xaml / .cs         界面、引导模式、各业务逻辑
