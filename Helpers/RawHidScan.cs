@@ -151,7 +151,10 @@ public static class RawHidScan
                 }
             }
 
-            Ctx[hDevice] = ctx; // 保留 preparsed 供解码使用（不释放）
+            // 重复扫描（启动 + 按钮）时释放旧缓冲，避免 preparsed 累积
+            if (Ctx.TryGetValue(hDevice, out DeviceCtx? old) && old.Preparsed != IntPtr.Zero && old.Preparsed != preparsed)
+                Marshal.FreeHGlobal(old.Preparsed);
+            Ctx[hDevice] = ctx; // 保留当前 preparsed 供解码使用（最后一个随进程结束回收）
 
             results.Add(new HidTouchInfo(name, ctx.IsTouch, ctx.HasWidth, ctx.HasHeight, caps.NumberInputValueCaps,
                 usages.ToString().Trim(),
@@ -172,36 +175,66 @@ public static class RawHidScan
         return RegisterRawInputDevices(devices, 1, (uint)Marshal.SizeOf<RAWINPUTDEVICE>());
     }
 
-    /// <summary>处理 WM_INPUT，解码第一触点的接触尺寸/坐标。不可解码时返回 null。</summary>
-    public static RawTouchSample? HandleWmInput(IntPtr lParam)
+    /// <summary>WM_INPUT 解析结果。</summary>
+    public enum WmInputResult
     {
+        /// <summary>已处理（sample 可能仍为 null，例如报文里没有可解的量）。</summary>
+        Handled,
+        /// <summary>不是触摸 HID 设备，忽略。</summary>
+        NotForUs,
+        /// <summary>是 HID 设备，但句柄不在能力表里（启动时设备没枚举到 / 中途重枚举）→ 调用方应 Scan() 后重试。</summary>
+        UnknownDevice,
+    }
+
+    private static long _lastAutoRescanTicks;
+
+    /// <summary>自动重扫节流：距上次不足 800ms 返回 false，避免 WM_INPUT 高频时反复枚举设备。</summary>
+    public static bool TryBeginAutoRescan()
+    {
+        long now = Environment.TickCount64;
+        if (now - _lastAutoRescanTicks < 800)
+            return false;
+        _lastAutoRescanTicks = now;
+        return true;
+    }
+
+    /// <summary>处理 WM_INPUT，解码第一触点的接触尺寸/坐标。</summary>
+    public static WmInputResult TryHandleWmInput(IntPtr lParam, out RawTouchSample? sample)
+    {
+        sample = null;
+
         uint size = 0;
         uint header = (uint)Marshal.SizeOf<RAWINPUTHEADER>();
         GetRawInputData(lParam, RID_INPUT, IntPtr.Zero, ref size, header);
         if (size == 0)
-            return null;
+            return WmInputResult.NotForUs;
 
         IntPtr buf = Marshal.AllocHGlobal((int)size);
         try
         {
             if (GetRawInputData(lParam, RID_INPUT, buf, ref size, header) != size)
-                return null;
+                return WmInputResult.NotForUs;
             if (Marshal.ReadInt32(buf, 0) != RIM_TYPEHID)
-                return null;
+                return WmInputResult.NotForUs;
 
             IntPtr hDevice = Marshal.ReadIntPtr(buf, 8);
-            if (!Ctx.TryGetValue(hDevice, out DeviceCtx? ctx) || ctx is null || !ctx.IsTouch)
-                return null;
+            if (!Ctx.TryGetValue(hDevice, out DeviceCtx? ctx) || ctx is null)
+                return WmInputResult.UnknownDevice;   // 句柄不认识 → 让调用方重扫后重试
+            if (!ctx.IsTouch)
+                return WmInputResult.NotForUs;
 
             uint sizeHid = (uint)Marshal.ReadInt32(buf, (int)header);
             uint reportCount = (uint)Marshal.ReadInt32(buf, (int)header + 4);
             if (sizeHid == 0 || reportCount == 0)
-                return null;
+                return WmInputResult.Handled;
 
             IntPtr dataPtr = buf + (int)header + 8;
             var report = new byte[sizeHid];
             Marshal.Copy(dataPtr, report, 0, (int)sizeHid);
 
+            // 注意：下面统一用 linkCollection = 0。多触点报文里每个触点是一个 link collection，
+            // 因此读到的 W/H 与 X/Y 未必属于同一根手指（单指/单手掌场景是正确的）。
+            // 要严格区分需配合 HidP_GetLinkCollectionNodes 遍历；当前按"第一个触点"近似。
             uint w = 0, h = 0, x = 0, y = 0;
             bool hasW = ctx.HasWidth && HidP_GetUsageValue(HidP_Input, 0x0D, 0, 0x48, out w, ctx.Preparsed, report, sizeHid) == HIDP_STATUS_SUCCESS;
             bool hasH = ctx.HasHeight && HidP_GetUsageValue(HidP_Input, 0x0D, 0, 0x49, out h, ctx.Preparsed, report, sizeHid) == HIDP_STATUS_SUCCESS;
@@ -213,7 +246,8 @@ public static class RawHidScan
             double? xNorm = ctx.XLogMax > 0 ? (double)x / ctx.XLogMax : null;
             double? yNorm = ctx.YLogMax > 0 ? (double)y / ctx.YLogMax : null;
 
-            return new RawTouchSample(wMm, hMm, xNorm, yNorm, (int)w, (int)h, ToHex(report));
+            sample = new RawTouchSample(wMm, hMm, xNorm, yNorm, (int)w, (int)h, ToHex(report));
+            return WmInputResult.Handled;
         }
         finally
         {
@@ -221,17 +255,30 @@ public static class RawHidScan
         }
     }
 
-    /// <summary>逻辑值 → 物理毫米（含单位与指数换算）。</summary>
+    /// <summary>
+    /// 当设备的 Width/Height 没有声明物理量程（PhysicalMax=0 / Units=0）时，
+    /// 用它把"逻辑计数"换算成毫米：mm = 计数 × 本比例。由界面标定后设置。
+    /// </summary>
+    public static double CountsToMmScale { get; set; }
+
+    /// <summary>逻辑值 → 物理毫米。无物理量程时回退到已标定的 CountsToMmScale。</summary>
     private static double? ToMm(uint logical, int logicalMax, int physicalMax, int unitsExp, int units)
     {
-        if (logicalMax <= 0 || physicalMax <= 0)
+        if (logicalMax <= 0)
             return null;
-        double physical = (double)logical / logicalMax * physicalMax; // 单位 × 10^exp
-        int exp = unitsExp & 0xF;
-        if (exp >= 8) exp -= 16;                                       // 4 位补码
-        double inUnit = physical * Math.Pow(10, exp);
-        bool englishSystem = (units & 0xF000) == 0x3000;               // 3 = English Linear
-        return englishSystem ? inUnit * 25.4 : inUnit * 10.0;          // 英寸 / 厘米
+
+        if (physicalMax > 0)
+        {
+            double physical = (double)logical / logicalMax * physicalMax; // 单位 × 10^exp
+            int exp = unitsExp & 0xF;
+            if (exp >= 8) exp -= 16;                                   // 4 位补码
+            double inUnit = physical * Math.Pow(10, exp);
+            bool englishSystem = (units & 0xF000) == 0x3000;           // 3 = English Linear
+            return englishSystem ? inUnit * 25.4 : inUnit * 10.0;      // 英寸 / 厘米
+        }
+
+        // 设备没给物理量程：只能用标定比例
+        return CountsToMmScale > 0 ? logical * CountsToMmScale : null;
     }
 
     private static string GetDeviceName(IntPtr device)

@@ -30,26 +30,23 @@ public partial class MainWindow : Window
     private bool _hasArea;
     private double _traceAreaDiu2;
 
-    private readonly List<Point> _touchPoints = new();
-    private List<List<Point>>? _clusters;
-    private readonly HashSet<int> _palmClusters = new();
-    private bool _hasPalm;
-    private Point _palmCenterDiu;
-    private double _palmRadiusMm;
-
-    // 驱动直接上报的接触矩形（来自 TouchPoint.Bounds，单位 DIP）
-    private bool _hasDriverContact;
-    private double _driverContactWidthMm;
-    private double _driverContactHeightMm;
-
     // 实时接触 -> 擦除区
     private bool _shapeIsCircle;                 // 默认 false = 矩形
-    private double _eraserRatio = 1.0;
+    private double _eraserRatio = 1.0;           // 手动倍率（滑块）
+    private bool _autoRatio = true;              // 自动倍率：k = √(①手掌面积a / ②按压峰值b)，不用滑块、不设上限
+    private bool _followPressure = true;         // true=擦除区随接触面积等比变化；false=固定为①的手掌面积
     private readonly List<Rect> _contactHistory = new();
     private Rect? _lastContact;
-    private bool _ratioCalibrating;
+    private double _peakContactMmW;              // 本次按压峰值接触的物理尺寸（mm），与 DPI 无关
+    private double _peakContactMmH;
+    private long _lastContactTicks;              // 上次有效接触时刻，用于判断“是否是一次新的按压”
+    private double _lastContactMmW;              // 上一次接触的物理尺寸（mm），DPI 变化时用它重建 DIU
+    private double _lastContactMmH;
     private const int ContactHistoryMax = 5;
     private const double MinContactMm = 1.0;   // 小于此物理尺寸视为"驱动未上报有效接触面积"（占位值≈0.03mm，真实指腹≥5mm）
+    private const int MinHandPeakCount = 5;    // 手掌接触的最小计数；低于此值视为单指轻按，拒绝用于标定
+    private const int MaxSimCount = 2000;      // 自测注入的计数上限
+    private const double MaxInjectMm = 500;    // 自测注入的物理尺寸上限（避免生成超大 Visual）
     private bool _driverSizeWarned;
 
     // 日志
@@ -58,6 +55,7 @@ public partial class MainWindow : Window
     private long _lastHidLogTicks;
     private long _lastFilteredLogTicks;
     private readonly DispatcherTimer _logFlushTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private readonly DispatcherTimer _sourceRefreshTimer = new() { Interval = TimeSpan.FromMilliseconds(400) };
 
     // WM_POINTER 通路（绕开 WPF 的 WM_TOUCH 直读接触矩形）
     private IntPtr _hwnd = IntPtr.Zero;
@@ -70,17 +68,24 @@ public partial class MainWindow : Window
     private enum ContactSource { None, Wpf, Pointer, RawHid }
 
     private const long SourceFreshMs = 300;
-    private readonly Dictionary<ContactSource, (long Time, Rect Rect)> _sourceState = new();
+    private readonly Dictionary<ContactSource, (long Time, Rect Rect, bool Eligible)> _sourceState = new();
     private readonly Dictionary<ContactSource, string> _sourceDetail = new();
     private ContactSource _activeSource = ContactSource.None;
 
-    private static readonly Color[] ClusterPalette =
-    {
-        Color.FromRgb(0x7F, 0xD4, 0xFF), Color.FromRgb(0xFF, 0xC1, 0x6B),
-        Color.FromRgb(0x9A, 0xE6, 0x7F), Color.FromRgb(0xE0, 0x9A, 0xFF),
-        Color.FromRgb(0x6B, 0xE0, 0xC8), Color.FromRgb(0xFF, 0x9A, 0xB0),
-        Color.FromRgb(0xD4, 0xD4, 0xD4), Color.FromRgb(0xC9, 0xA9, 0x6B),
-    };
+    // 来源选择：自适应（自动锁定）或手动指定某一路
+    private enum SourceMode { Auto, RawHid, Pointer, Wpf }
+    private SourceMode _sourceMode = SourceMode.Auto;
+    private ContactSource _lockedSource = ContactSource.None;
+    private readonly Dictionary<ContactSource, long> _sourceValidSince = new(); // 各来源“连续有效”的起始时刻
+    private const long SourceLockObserveMs = 300;   // 自适应：某来源连续有效达到此时长才锁定
+    private const long SourceLockReleaseMs = 1500;  // 自适应：锁定来源静默超过此时长则解锁、重新识别
+
+    // HID 计数标定（设备只给逻辑计数、不给物理单位时用）
+    private double _palmAreaCm2;
+    private double _palmAspect;      // 手掌长宽比 w/h（来自"手输长宽"或①页轮廓外接矩形）；<=0 = 未设定
+    private string _palmSource = "";  // "手输" / "描摹"，仅用于显示
+    private int _handPeakCount;
+    private bool _hidScaleHintShown;
 
     // ---- 引导模式 ----
     private sealed record GuideStep(string Title, string Body,
@@ -95,9 +100,6 @@ public partial class MainWindow : Window
 
         RulerCanvas.SizeChanged += (_, _) => DrawRuler();
         RulerCanvasV.SizeChanged += (_, _) => DrawRulerV();
-        ThresholdSlider.ValueChanged += (_, _) => UpdateSliderLabels();
-        CutSlider.ValueChanged += (_, _) => UpdateSliderLabels();
-        UpdateSliderLabels();
 
         TraceCanvas.DefaultDrawingAttributes = new System.Windows.Ink.DrawingAttributes
         {
@@ -116,6 +118,10 @@ public partial class MainWindow : Window
         _logFlushTimer.Tick += (_, _) => Log.Flush();
         _logFlushTimer.Start();
         Closing += (_, _) => Log.Flush();
+
+        // 定时刷新来源状态：来源全部过期后把"生效来源"归零，避免界面一直显示某个来源在用
+        _sourceRefreshTimer.Tick += (_, _) => RefreshSourceState();
+        _sourceRefreshTimer.Start();
 
         _uiReady = true;
     }
@@ -137,9 +143,19 @@ public partial class MainWindow : Window
         switch (msg)
         {
             case WM_INPUT:
-                if (StageTabs.SelectedIndex == 2)
+                if (StageTabs.SelectedIndex is 1 or 2) // ② 手掌接触面积 / ③ 面积擦预览 都接收原始HID
                 {
-                    RawHidScan.RawTouchSample? sample = RawHidScan.HandleWmInput(lParam);
+                    RawHidScan.WmInputResult r = RawHidScan.TryHandleWmInput(lParam, out RawHidScan.RawTouchSample? sample);
+
+                    // 句柄不在能力表（启动时设备没枚举到 / 中途重枚举）→ 自动重扫一次再解（自愈）
+                    if (r == RawHidScan.WmInputResult.UnknownDevice && RawHidScan.TryBeginAutoRescan())
+                    {
+                        List<RawHidScan.HidTouchInfo> rescan = RawHidScan.Scan();
+                        int touchCount = rescan.Count(h => h.IsTouchScreen);
+                        Log.Info($"原始HID 遇到未知设备句柄 → 自动重扫：{rescan.Count} 个 HID 设备（触摸屏 {touchCount} 个）");
+                        RawHidScan.TryHandleWmInput(lParam, out sample);
+                    }
+
                     if (sample is not null)
                         HandleRawHidSample(sample);
                 }
@@ -148,7 +164,7 @@ public partial class MainWindow : Window
             case PointerTouch.WM_POINTERDOWN:
             case PointerTouch.WM_POINTERENTER:
             case PointerTouch.WM_POINTERUPDATE:
-                if (StageTabs.SelectedIndex == 2)
+                if (StageTabs.SelectedIndex is 1 or 2)
                 {
                     uint id = PointerTouch.GetPointerId(wParam);
                     if (id != 0 && PointerTouch.TryRead(id, out PointerTouch.POINTER_TOUCH_INFO ti, out bool hasArea))
@@ -158,6 +174,10 @@ public partial class MainWindow : Window
         }
         return IntPtr.Zero;
     }
+
+    /// <summary>当前页接收触摸的宿主元素：② 手掌接触面积 → ContactHost，其余 → EraserHost。</summary>
+    private FrameworkElement TouchHostElement()
+        => StageTabs.SelectedIndex == 1 ? ContactHost : EraserHost;
 
     private const int WM_INPUT = 0x00FF;
 
@@ -171,27 +191,60 @@ public partial class MainWindow : Window
             Log.Info($"原始HID: W={s.WidthLogical}({s.WidthMm?.ToString("0.0") ?? "-"}mm) H={s.HeightLogical}({s.HeightMm?.ToString("0.0") ?? "-"}mm) Xn={s.XNorm?.ToString("0.000") ?? "-"} Yn={s.YNorm?.ToString("0.000") ?? "-"} raw=[{s.Hex}]");
         }
 
-        if (s.WidthMm is null || s.HeightMm is null || _mmPerDiuX <= 0 || _mmPerDiuY <= 0)
+        // 记录"整只手按下"时的峰值计数，供「计数→mm」标定用（即使当前还没标定也要记）
+        int peak = Math.Max(s.WidthLogical, s.HeightLogical);
+        if (peak > _handPeakCount)
+        {
+            _handPeakCount = peak;
+            UpdateHidScaleLabel();
+        }
+
+        if (s.WidthMm is null || s.HeightMm is null)
+        {
+            // 设备只给逻辑计数、又还没标定 → 明确引导用户去标定，而不是"没反应"
+            if (!_hidScaleHintShown)
+            {
+                _hidScaleHintShown = true;
+                Log.Warn($"原始HID 无物理单位且未标定（W={s.WidthLogical} H={s.HeightLogical}）：需先用第①页手掌面积标定「计数→mm」");
+                if (EraserInfoText is not null)
+                    EraserInfoText.Text =
+                        "该设备只上报逻辑计数（无毫米单位），当前未标定，因此还算不出擦除区。\n" +
+                        "请依次：① 在「① 描摹手掌轮廓」页描一圈手掌并计算面积 → " +
+                        "② 回到本页用整只手按一下 → ③ 点「标定 HID 计数→mm」。";
+            }
+            return;
+        }
+
+        if (_mmPerDiuX <= 0 || _mmPerDiuY <= 0)
             return;
 
         double wDiu = s.WidthMm.Value / _mmPerDiuX;
         double hDiu = s.HeightMm.Value / _mmPerDiuY;
 
-        Point hostOffset = EraserHost.TranslatePoint(new Point(0, 0), this);
+        FrameworkElement host = TouchHostElement();
+        Point hostOffset = host.TranslatePoint(new Point(0, 0), this);
         double lx, ly;
         if (s.XNorm is double xn && s.YNorm is double yn)
         {
+            // 数字化器归一化坐标 → 虚拟桌面 DIP（多显示器时比 PrimaryScreen 更贴近真实映射）。
+            // 注意：位置换算用的是本窗口所在屏的 dpiScale，混合 DPI 场景下会有误差。
             Point winOrigin = PointToScreen(new Point(0, 0));
-            double screenDipX = xn * SystemParameters.PrimaryScreenWidth;
-            double screenDipY = yn * SystemParameters.PrimaryScreenHeight;
+            double screenDipX = SystemParameters.VirtualScreenLeft + xn * SystemParameters.VirtualScreenWidth;
+            double screenDipY = SystemParameters.VirtualScreenTop + yn * SystemParameters.VirtualScreenHeight;
             lx = screenDipX - winOrigin.X / _dpiScaleX - hostOffset.X;
             ly = screenDipY - winOrigin.Y / _dpiScaleY - hostOffset.Y;
         }
         else
         {
-            lx = EraserHost.ActualWidth / 2;
-            ly = EraserHost.ActualHeight / 2;
+            lx = host.ActualWidth / 2;
+            ly = host.ActualHeight / 2;
         }
+
+        // 夹取到预览区内，避免坐标异常时把擦除区画到看不见的地方
+        if (host.ActualWidth > 0)
+            lx = Math.Clamp(lx, 0, host.ActualWidth);
+        if (host.ActualHeight > 0)
+            ly = Math.Clamp(ly, 0, host.ActualHeight);
 
         string detail = $"W={s.WidthLogical} H={s.HeightLogical} → {s.WidthMm?.ToString("0.0") ?? "-"}×{s.HeightMm?.ToString("0.0") ?? "-"} mm";
         SubmitContact(ContactSource.RawHid, new Rect(lx - wDiu / 2, ly - hDiu / 2, wDiu, hDiu), applyThreshold: false, detail);
@@ -214,7 +267,7 @@ public partial class MainWindow : Window
         if (!_pointerAreaLogged)
         {
             _pointerAreaLogged = true;
-            Log.Info($"WM_POINTER: 有接触矩形 rcContact={ti.rcContact.Width}x{ti.rcContact.Height} 物理像素 pressure={ti.pressure} touchFlags=0x{ti.touchFlags:X} → 改用 WM_POINTER 作为接触尺寸来源");
+            Log.Info($"WM_POINTER: 有接触矩形 rcContact={ti.rcContact.Width}x{ti.rcContact.Height} 物理像素 pressure={ti.pressure} touchFlags=0x{ti.touchFlags:X} → 作为接触尺寸候选来源（是否生效由优先级仲裁决定）");
         }
 
         long now = Environment.TickCount64;
@@ -234,10 +287,11 @@ public partial class MainWindow : Window
         if (!PointerTouch.ScreenToClient(_hwnd, ref pt))
             return;
 
-        // 客户区物理像素 → DIP，再换算到 EraserHost 局部坐标
+        // 客户区物理像素 → DIP，再换算到当前宿主元素局部坐标
         double cxDiu = pt.X / _dpiScaleX;
         double cyDiu = pt.Y / _dpiScaleY;
-        Point hostOffset = EraserHost.TranslatePoint(new Point(0, 0), this);
+        FrameworkElement host = TouchHostElement();
+        Point hostOffset = host.TranslatePoint(new Point(0, 0), this);
 
         var rect = new Rect(cxDiu - hostOffset.X - wDiu / 2, cyDiu - hostOffset.Y - hDiu / 2, wDiu, hDiu);
         string detail = $"{ti.rcContact.Width}×{ti.rcContact.Height} px → {wDiu * _mmPerDiuX:0.0}×{hDiu * _mmPerDiuY:0.0} mm";
@@ -251,8 +305,11 @@ public partial class MainWindow : Window
         UpdateDpiFromVisual();
         ReloadEdid();
         UpdateLogUi();
-        RunHidDiagnostics();
+        RunHidDiagnostics(full: false); // 启动只做轻量自检；完整诊断留给「HID 触摸诊断」按钮
         UpdateSourceLabel();
+        UpdateHidScaleLabel();
+        UpdateRatioLabel();
+        UpdatePalmSizeText();
 
         // 启动即进入引导模式（等布局完成后再定位高亮框）。
         Dispatcher.BeginInvoke(new Action(StartGuide), DispatcherPriority.Loaded);
@@ -266,7 +323,7 @@ public partial class MainWindow : Window
         DrawRuler();
         DrawRulerV();
         if (_hasArea) UpdateAreaOutput();
-        if (_hasPalm) DrawTouchOverlay();
+        RescaleLiveEraserToDpi();
         SetStatus($"DPI 变化：{e.OldDpi.PixelsPerInchX:0} → {e.NewDpi.PixelsPerInchX:0} DPI，已按当前屏重算 mm/DIU。");
         Log.Info($"DPI 变化: {e.OldDpi.PixelsPerInchX:0} -> {e.NewDpi.PixelsPerInchX:0} DPI, mm/DIU={_mmPerDiuX:0.0000}x{_mmPerDiuY:0.0000}");
     }
@@ -337,6 +394,7 @@ public partial class MainWindow : Window
         DrawRuler();
         DrawRulerV();
         if (_hasArea) UpdateAreaOutput();
+        RescaleLiveEraserToDpi();           // 擦除区按新的 mm/DIU 重建
 
         string modeLabel = _edidSizeMode switch
         {
@@ -361,7 +419,14 @@ public partial class MainWindow : Window
         Log.Info($"EDID 尺寸推算方式切换为索引 {EdidModeCombo.SelectedIndex}（{_edidSizeMode}）");
 
         if (_edidCandidates.Count > 0)
+        {
             ApplyEdidCalibration();
+        }
+        else
+        {
+            SetStatus("当前是手动对角线校准，「EDID 尺寸推算方式」暂不生效；想改回 EDID 请点「重新读取 EDID」。");
+            Log.Info("切换 EDID 推算方式被忽略：当前为手动对角线校准");
+        }
     }
 
     private void OnReloadEdid(object sender, RoutedEventArgs e) => ReloadEdid();
@@ -380,10 +445,13 @@ public partial class MainWindow : Window
 
         // 直接用分辨率当作宽高比，不再猜 16:9 / 16:10 / 4:3（否则 3:2 等会被算错）。
         _calib = ScreenCalibration.FromDiagonal(diag, resX, resY, resX, resY);
+        _edidCandidates = new(); // 已改为手动，清空 EDID 候选，避免切换推算方式时把手动值悄悄覆盖
         RefreshDerivedMm();
         UpdateCalibText();
         DrawRuler();
         DrawRulerV();
+        if (_hasArea) UpdateAreaOutput();
+        RescaleLiveEraserToDpi();
         SetStatus($"已按对角线 {diag:0.##}\" 反推物理尺寸（按分辨率比例 {resX}:{resY}）。");
         Log.Info($"校准(手动): 对角线={diag:0.##}\" 按分辨率比例 {resX}:{resY} 物理={_calib.ScreenWidthMm:0.0}x{_calib.ScreenHeightMm:0.0}mm mm/DIU={_mmPerDiuX:0.0000}x{_mmPerDiuY:0.0000}");
     }
@@ -410,12 +478,6 @@ public partial class MainWindow : Window
             if (Math.Abs(pxRatio - 1) > 0.03)
                 CalibInfoText.Text += $"\n⚠ 物理比例({_calib.ScreenWidthMm / _calib.ScreenHeightMm:0.00})与分辨率比例({(double)_calib.ResX / _calib.ResY:0.00})不符，两轴 mm/px 相差 {Math.Abs(pxRatio - 1) * 100:0}%，物理尺寸不可信——建议改用右侧手动填对角线英寸。";
         }
-    }
-
-    private void UpdateSliderLabels()
-    {
-        ThresholdLabel.Text = $"θ = {ThresholdSlider.Value:0} mm";
-        CutLabel.Text = $"k = {(int)CutSlider.Value}";
     }
 
     // ================= 参考标尺 =================
@@ -552,6 +614,18 @@ public partial class MainWindow : Window
         TraceOverlay.Children.Clear();
         TraceInfoText.Text = "已清除。请重新描一圈手掌轮廓。";
         ResultText.Text = "";
+
+        // 若当前手掌尺寸来自描摹，则一并清除（手输的不受影响）
+        if (_palmSource == "描摹")
+        {
+            _palmAreaCm2 = 0;
+            _palmAspect = 0;
+            _palmSource = "";
+        }
+        UpdatePalmSizeText();
+        UpdateHidScaleLabel();
+        RedrawEraser();
+
         SetStatus("描摹已清除。");
         Log.Info("清除描摹");
     }
@@ -589,6 +663,45 @@ public partial class MainWindow : Window
         UpdateAreaOutput();
     }
 
+    /// <summary>方式二：直接量手宽×手长（cm）→ 手掌面积 a = 宽×长，长宽比 = 宽/长。</summary>
+    private void OnApplyHandSize(object sender, RoutedEventArgs e)
+    {
+        if (!double.TryParse(HandWidthInput.Text.Trim(), out double w) ||
+            !double.TryParse(HandHeightInput.Text.Trim(), out double h) ||
+            w < 2 || w > 60 || h < 2 || h > 60)
+        {
+            SetStatus("手宽/手长请填 2~60 cm。");
+            Log.Warn("手输手掌尺寸无效");
+            return;
+        }
+
+        _palmAreaCm2 = w * h;
+        _palmAspect = w / h;
+        _palmSource = "手输";
+        Log.Info($"手掌尺寸(手输): {w:0.0} × {h:0.0} cm = {_palmAreaCm2:0.0} cm²，长宽比 {_palmAspect:0.000}");
+        SetStatus($"已按手输尺寸设定手掌：{w:0.0} × {h:0.0} cm = {_palmAreaCm2:0.0} cm²。");
+
+        UpdatePalmSizeText();
+        UpdateHidScaleLabel();
+        RedrawEraser(); // 自动倍率随之更新
+    }
+
+    private void UpdatePalmSizeText()
+    {
+        if (PalmSizeText is null)
+            return;
+
+        if (_palmAreaCm2 <= 0)
+        {
+            PalmSizeText.Text = "尚未设定手掌尺寸。";
+            return;
+        }
+
+        string src = string.IsNullOrEmpty(_palmSource) ? "" : $"（{_palmSource}）";
+        string shape = _palmAspect > 0 ? $"\n长宽比 {_palmAspect:0.000}（擦除区形状按此比值）" : "";
+        PalmSizeText.Text = $"手掌 a = {_palmAreaCm2:0.0} cm²{src}{shape}";
+    }
+
     private void UpdateAreaOutput()
     {
         if (!_hasArea || _hull is null || _simplified is null || _calib is null)
@@ -603,6 +716,17 @@ public partial class MainWindow : Window
         double hullCm2 = hullDiu2 * _mmPerDiuX * _mmPerDiuY / 100.0;
         double traceCm2 = traceDiu2 * _mmPerDiuX * _mmPerDiuY / 100.0;
         double ratio = traceDiu2 > 0 ? hullDiu2 / traceDiu2 : 0;
+
+        _palmAreaCm2 = traceCm2; // 供第③页「HID 计数→mm」标定使用
+        _palmSource = "描摹";
+        // 轮廓外接矩形的长宽比作为擦除区形状（你描横就横、描竖就竖）
+        double minX = _hull.Min(p => p.X), maxX = _hull.Max(p => p.X);
+        double minY = _hull.Min(p => p.Y), maxY = _hull.Max(p => p.Y);
+        double bboxW = maxX - minX, bboxH = maxY - minY;
+        _palmAspect = (bboxW > 0 && bboxH > 0) ? bboxW / bboxH : 0;
+        UpdatePalmSizeText();
+        UpdateHidScaleLabel();
+        RedrawEraser(); // 手掌面积变了 → 自动倍率随之更新
 
         Log.Info($"手掌面积: 原始点={_palmPoints.Count} 去抖后={_simplified.Count} 凸包顶点={_hull.Count} 描摹曲线={traceCm2:0.00}cm² 凸包={hullCm2:0.00}cm² 凸包/描摹={ratio:0.00}");
 
@@ -659,23 +783,31 @@ public partial class MainWindow : Window
         return line;
     }
 
-    // ================= ③ 触点采集 =================
+    // ================= ② 手掌接触面积（只读，不推算） =================
 
-    private void OnTouchDown(object sender, TouchEventArgs e)
+    private void OnContactTouchDown(object sender, TouchEventArgs e)
     {
-        TouchPoint tp = e.GetTouchPoint(TouchHost);
-        AddTouchPoint(tp.Position, tp.Bounds);
+        Rect b = e.GetTouchPoint(ContactHost).Bounds;
+        LogHidFrame(b);
+        SubmitContact(ContactSource.Wpf, b, applyThreshold: true, WpfDetail(b));
     }
 
-    private void OnTouchMove(object sender, TouchEventArgs e)
+    private void OnContactTouchMove(object sender, TouchEventArgs e)
     {
-        TouchPoint tp = e.GetTouchPoint(TouchHost);
-        AddTouchPoint(tp.Position, tp.Bounds);
+        Rect b = e.GetTouchPoint(ContactHost).Bounds;
+        LogHidFrame(b);
+        SubmitContact(ContactSource.Wpf, b, applyThreshold: true, WpfDetail(b));
     }
 
-    private void OnTouchUp(object sender, TouchEventArgs e)
+    private void OnContactTouchUp(object sender, TouchEventArgs e)
+        => SetStatus("手掌接触面积：" + PeakContactLine());
+
+    private void OnContactMouseDown(object sender, MouseButtonEventArgs e)
+        => SetStatus("鼠标不携带接触尺寸；请用真触摸屏，或到「③ 面积擦预览」页用「注入」自测。");
+
+    private void OnContactMouseMove(object sender, MouseEventArgs e)
     {
-        SetStatus($"触点采样：{_touchPoints.Count} 个触点。{DriverContactSummary()}");
+        // 鼠标没有接触尺寸，这里不做任何事（留空以免页面无响应）
     }
 
     // ---- 第三页「面积擦预览」的触摸入口 ----
@@ -699,7 +831,7 @@ public partial class MainWindow : Window
 
     private void OnEraserTouchUp(object sender, TouchEventArgs e)
     {
-        SetStatus($"面积擦预览：{DriverContactSummary()}");
+        SetStatus($"面积擦预览：{CurrentContactLine()}");
     }
 
     /// <summary>
@@ -754,76 +886,57 @@ public partial class MainWindow : Window
     {
         _contactHistory.Clear();
         _lastContact = null;
+        _peakContactMmW = 0;
+        _peakContactMmH = 0;
+        _lastContactTicks = 0;
         _driverSizeWarned = false;
         _sourceState.Clear();
+        _sourceDetail.Clear();
         _activeSource = ContactSource.None;
+        _lockedSource = ContactSource.None;
+        _sourceValidSince.Clear();
+        _handPeakCount = 0;
+        _hidScaleHintShown = false;
         EraserOverlay.Children.Clear();
         UpdateSourceLabel();
+        UpdateHidScaleLabel();
         EraserInfoText.Text = "已清除。用真触摸屏按一下手掌即可实时显示擦除区。";
+        UpdateContactInfo();
+        UpdateRatioLabel();
         SetStatus("面积擦预览已清除。");
         Log.Info("清除面积擦预览");
     }
 
-    private void OnTouchMouseDown(object sender, MouseButtonEventArgs e)
+    /// <summary>把某个接触矩形格式化成一行物理尺寸（mm）。</summary>
+    private bool TryFormatContact(Rect? r, out string text)
     {
-        AddTouchPoint(e.GetPosition(TouchHost), null);
+        text = "";
+        if (r is not Rect c || _mmPerDiuX <= 0)
+            return false;
+        double wMm = c.Width * _mmPerDiuX;
+        double hMm = c.Height * _mmPerDiuY;
+        text = $"{wMm:0.0} × {hMm:0.0} mm = {wMm * hMm:0} mm²";
+        return true;
     }
 
-    private void OnTouchMouseMove(object sender, MouseEventArgs e)
+    private string CurrentContactLine()
+        => TryFormatContact(_lastContact, out string s) ? "当前 " + s : "当前：未读到（需真触摸屏）";
+
+    private string PeakContactLine()
+        => _peakContactMmW > 0 && _peakContactMmH > 0
+            ? $"本次峰值 {_peakContactMmW:0.0} × {_peakContactMmH:0.0} mm = {_peakContactMmW * _peakContactMmH:0} mm²"
+            : "本次峰值：未读到";
+
+    private void UpdateContactInfo()
     {
-        if (e.LeftButton == MouseButtonState.Pressed)
-            AddTouchPoint(e.GetPosition(TouchHost), null);
-    }
-
-    /// <summary>
-    /// 记录驱动直接上报的接触矩形（TouchPoint.Bounds，单位 DIP），取面积最大的一次（= 手掌）。
-    /// 换算成 mm 后即为"驱动给的接触面积"，正好复用 EDID 标定出的 mm/DIU。
-    /// </summary>
-    private void RecordDriverContact(Rect bounds)
-    {
-        if (_mmPerDiuX <= 0 || bounds.Width <= 0 || bounds.Height <= 0)
+        if (ContactInfoText is null)
             return;
-
-        double wMm = bounds.Width * _mmPerDiuX;
-        double hMm = bounds.Height * _mmPerDiuY;
-
-        // 与面积擦预览同样的判断：极小占位值（如 0.1×0.1 DIP）视为"驱动未上报"，不记录。
-        if (wMm < MinContactMm || hMm < MinContactMm)
-            return;
-
-        if (!_hasDriverContact || wMm * hMm > _driverContactWidthMm * _driverContactHeightMm)
+        if (_lastContact is not Rect && !(_peakContactMmW > 0 && _peakContactMmH > 0))
         {
-            _hasDriverContact = true;
-            _driverContactWidthMm = wMm;
-            _driverContactHeightMm = hMm;
-            Log.Info($"驱动接触(最大): {wMm:0.0}x{hMm:0.0}mm = {wMm * hMm:0}mm² (原始 {bounds.Width:0.0}x{bounds.Height:0.0} DIP)");
-        }
-    }
-
-    private string DriverContactSummary()
-    {
-        if (!_hasDriverContact)
-            return "驱动接触: 未上报（鼠标，或该驱动/屏幕不提供 Bounds）";
-        double area = _driverContactWidthMm * _driverContactHeightMm;
-        return $"驱动接触: {_driverContactWidthMm:0.0} × {_driverContactHeightMm:0.0} mm = {area:0} mm²";
-    }
-
-    private void AddTouchPoint(Point p, Rect? contactBounds)
-    {
-        // 按住移动时不逐像素堆点：与已有点最小间距需 > 6mm，防止数据灌爆。
-        double minGapDiu = _mmPerDiuX > 0 ? 6.0 / _mmPerDiuX : 12;
-        if (_touchPoints.Any(q => Geometry2D.Distance(q, p) < minGapDiu))
+            ContactInfoText.Text = "尚未读到接触尺寸。";
             return;
-
-        if (contactBounds is Rect b)
-            RecordDriverContact(b);
-
-        _touchPoints.Add(p);
-        _hasPalm = false;
-        _clusters = null;
-        _palmClusters.Clear();
-        DrawTouchOverlay();
-        TouchInfoText.Text = $"已采样 {_touchPoints.Count} 个触点。\n{DriverContactSummary()}";
+        }
+        ContactInfoText.Text = CurrentContactLine() + "\n" + PeakContactLine();
     }
 
     // ---------- 实时接触 -> 擦除区（按多大，擦多大） ----------
@@ -832,21 +945,47 @@ public partial class MainWindow : Window
     private void SubmitContact(ContactSource src, Rect rectDiu, bool applyThreshold, string detail)
     {
         long now = Environment.TickCount64;
-        _sourceState[src] = (now, rectDiu);
+
+        // 退化接触框（0×0）不携带任何尺寸信息：设备即使手指没抬起，也会周期性地夹带这种"空槽位"帧
+        // （实测真机 raw HID 会间歇报 W=0 H=0）。若把它记成"该来源不可用"，高优先来源会被短暂降级，
+        // 于是与低优先来源反复横跳，而每次切换都会清空中值滤波窗 → 擦除区尺寸抖动。
+        // 故直接忽略退化帧，保留上一次有效值，直到超过 SourceFreshMs 自然过期。
+        if (rectDiu.Width <= 0 || rectDiu.Height <= 0)
+            return;
+
+        // 只有"尺寸可用"的来源才有资格成为生效来源（避免被拒的来源与有效来源反复横跳）
+        bool eligible = true;
+        if (applyThreshold && _mmPerDiuX > 0)
+            eligible = rectDiu.Width * _mmPerDiuX >= MinContactMm && rectDiu.Height * _mmPerDiuY >= MinContactMm;
+
+        _sourceState[src] = (now, rectDiu, eligible);
         _sourceDetail[src] = detail;
 
-        // 选优先级最高、且仍在"活跃"（近 SourceFreshMs 内）的来源
-        ContactSource eff = ContactSource.None;
-        foreach (ContactSource s in new[] { ContactSource.RawHid, ContactSource.Pointer, ContactSource.Wpf })
+        // 维护“连续有效起始时刻”：自适应锁定靠它判断某一路是否稳定可用
+        if (eligible)
         {
-            if (_sourceState.TryGetValue(s, out var st) && now - st.Time <= SourceFreshMs)
+            if (!_sourceValidSince.ContainsKey(src))
+                _sourceValidSince[src] = now;
+
+            // 距上一次有效接触超过新鲜窗口 → 判定为一次新的按压，重置峰值
+            if (now - _lastContactTicks > SourceFreshMs)
             {
-                eff = s;
-                break;
+                _peakContactMmW = 0;
+                _peakContactMmH = 0;
             }
+            _lastContactTicks = now;
         }
+        else
+        {
+            _sourceValidSince.Remove(src);
+        }
+
+        ContactSource eff = ResolveSource(now);
         if (eff == ContactSource.None)
+        {
+            UpdateSourceLabel();
             return;
+        }
 
         if (eff != _activeSource)
         {
@@ -860,6 +999,91 @@ public partial class MainWindow : Window
         UpdateLiveContact(_sourceState[eff].Rect, applyThreshold: eff != ContactSource.RawHid);
     }
 
+    private static readonly ContactSource[] PriorityOrder =
+        { ContactSource.RawHid, ContactSource.Pointer, ContactSource.Wpf };
+
+    private bool IsSourceUsable(ContactSource s, long now)
+        => _sourceState.TryGetValue(s, out var st) && st.Eligible && now - st.Time <= SourceFreshMs;
+
+    /// <summary>决定当前该用哪一路来源：手动指定则只认那一路；自适应则稳定识别后锁定。</summary>
+    private ContactSource ResolveSource(long now)
+    {
+        // 手动指定：只认那一路，没数据就是没数据（避免又偷偷切回别的来源）
+        if (_sourceMode != SourceMode.Auto)
+        {
+            ContactSource want = _sourceMode switch
+            {
+                SourceMode.RawHid => ContactSource.RawHid,
+                SourceMode.Pointer => ContactSource.Pointer,
+                SourceMode.Wpf => ContactSource.Wpf,
+                _ => ContactSource.None,
+            };
+            return IsSourceUsable(want, now) ? want : ContactSource.None;
+        }
+
+        // 自适应：已锁定 → 一直跟随，直到它静默太久（抬手/失效）才解锁重新识别
+        if (_lockedSource != ContactSource.None)
+        {
+            if (_sourceState.TryGetValue(_lockedSource, out var st)
+                && st.Eligible && now - st.Time <= SourceLockReleaseMs)
+                return _lockedSource;
+
+            Log.Info($"自适应解锁：{SourceName(_lockedSource)} 已静默超过 {SourceLockReleaseMs}ms，重新识别");
+            _lockedSource = ContactSource.None;
+            _sourceValidSince.Clear();
+        }
+
+        // 未锁定：按优先级找“连续有效 ≥ 观察期”的来源并锁定
+        foreach (ContactSource s in PriorityOrder)
+        {
+            if (IsSourceUsable(s, now) && _sourceValidSince.TryGetValue(s, out long since)
+                && now - since >= SourceLockObserveMs)
+            {
+                _lockedSource = s;
+                Log.Info($"自适应锁定来源：{SourceName(s)}（连续有效 ≥ {SourceLockObserveMs}ms）");
+                return s;
+            }
+        }
+
+        // 观察期内还没锁定：先用当前最高优先的可用来源垫着显示
+        foreach (ContactSource s in PriorityOrder)
+            if (IsSourceUsable(s, now))
+                return s;
+
+        return ContactSource.None;
+    }
+
+    private static string SourceModeName(SourceMode m) => m switch
+    {
+        SourceMode.RawHid => "原始HID(设备上报)",
+        SourceMode.Pointer => "WM_POINTER rcContact",
+        SourceMode.Wpf => "WPF TouchPoint.Bounds",
+        _ => "自适应(自动锁定)",
+    };
+
+    private void OnSourceModeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (SourceModeCombo is null)
+            return; // XAML 解析期提前触发，忽略
+
+        _sourceMode = SourceModeCombo.SelectedIndex switch
+        {
+            1 => SourceMode.RawHid,
+            2 => SourceMode.Pointer,
+            3 => SourceMode.Wpf,
+            _ => SourceMode.Auto,
+        };
+        _lockedSource = ContactSource.None;
+        _activeSource = ContactSource.None;
+        _sourceValidSince.Clear();
+        _contactHistory.Clear();
+        _lastContact = null;
+        _peakContactMmW = 0;
+        _peakContactMmH = 0;
+        Log.Info($"接触来源模式切换为: {SourceModeName(_sourceMode)}");
+        UpdateSourceLabel();
+    }
+
     private static string SourceName(ContactSource s) => s switch
     {
         ContactSource.RawHid => "原始HID(设备上报)",
@@ -870,13 +1094,20 @@ public partial class MainWindow : Window
 
     private void UpdateSourceLabel()
     {
-        if (ContactSourceText is null)
+        if (SourceInfoText is null)
             return;
 
         long now = Environment.TickCount64;
         var sb = new StringBuilder();
-        sb.Append("生效来源: ").Append(SourceName(_activeSource));
-        foreach (ContactSource s in new[] { ContactSource.RawHid, ContactSource.Pointer, ContactSource.Wpf })
+
+        string mode = _sourceMode != SourceMode.Auto
+            ? $"手动：{SourceModeName(_sourceMode)}"
+            : (_lockedSource != ContactSource.None
+                ? $"自适应：已锁定 {SourceName(_lockedSource)}"
+                : "自适应：识别中…");
+        sb.Append(mode).Append("   |   生效: ").Append(SourceName(_activeSource));
+
+        foreach (ContactSource s in PriorityOrder)
         {
             bool active = s == _activeSource;
             bool fresh = _sourceState.TryGetValue(s, out var st) && now - st.Time <= SourceFreshMs;
@@ -884,7 +1115,125 @@ public partial class MainWindow : Window
             sb.Append('\n').Append(active ? "▶ " : "   ").Append(SourceName(s)).Append(": ").Append(val);
             if (!fresh && _sourceState.ContainsKey(s)) sb.Append("  (旧)");
         }
-        ContactSourceText.Text = sb.ToString();
+        SourceInfoText.Text = sb.ToString();
+    }
+
+    /// <summary>定时刷新来源状态：所有来源都过期后把生效来源归零，并让界面显示「无」。</summary>
+    private void RefreshSourceState()
+    {
+        long now = Environment.TickCount64;
+        bool anyFresh = false;
+        foreach (ContactSource s in new[] { ContactSource.RawHid, ContactSource.Pointer, ContactSource.Wpf })
+        {
+            if (_sourceState.TryGetValue(s, out var st) && st.Eligible && now - st.Time <= SourceFreshMs)
+            {
+                anyFresh = true;
+                break;
+            }
+        }
+
+        if (!anyFresh && _activeSource != ContactSource.None)
+        {
+            _activeSource = ContactSource.None;
+            Log.Info("接触来源全部过期，生效来源归零");
+        }
+        UpdateSourceLabel();
+    }
+
+    // ---------- HID 计数 → mm 标定（设备只给逻辑计数、不给物理单位时） ----------
+
+    /// <summary>用第①页量出的手掌面积标定"1 个 HID 计数 = 多少 mm"。</summary>
+    private void OnCalibrateHidScale(object sender, RoutedEventArgs e)
+    {
+        if (_palmAreaCm2 <= 0)
+        {
+            SetStatus("请先到「① 描摹手掌轮廓」页描一圈手掌并点「计算手掌面积」。");
+            Log.Warn("HID 标定中止：尚未测量手掌面积");
+            return;
+        }
+        if (_handPeakCount <= 0)
+        {
+            SetStatus("请先在本页用整只手（含手指）按一下，采到计数后再点标定。");
+            Log.Warn("HID 标定中止：未采到手掌计数");
+            return;
+        }
+        // 手掌接触的计数应明显大于单指；太小说明采到的是单指（或设备根本不上报尺寸），
+        // 直接标定会被放大成很大的 mm/计数，之后单指也能画出整只手大小的擦除区。
+        if (_handPeakCount < MinHandPeakCount)
+        {
+            SetStatus($"采到的峰值计数只有 {_handPeakCount}（< {MinHandPeakCount}），像是单指轻按或该设备不上报有效尺寸。" +
+                      "请用整只手重按一次；或改用「1 计数 = ? mm」手动设置。");
+            Log.Warn($"HID 标定中止：峰值计数 {_handPeakCount} < {MinHandPeakCount}，疑似单指或设备不上报有效尺寸");
+            return;
+        }
+
+        double diameterMm = 2 * Math.Sqrt(_palmAreaCm2 * 100 / Math.PI); // 面积 cm² → 等效圆直径 mm
+        double scale = diameterMm / _handPeakCount;
+        RawHidScan.CountsToMmScale = scale;
+        if (scale > 10)
+            Log.Warn($"HID 标定结果偏大：1 计数 = {scale:0.000}mm（等效直径 {diameterMm:0.0}mm ÷ 峰值计数 {_handPeakCount}），单指可能被画得过大，可用「倍率」修正");
+        Log.Info($"HID 计数标定: 手掌面积={_palmAreaCm2:0.00}cm² 等效直径={diameterMm:0.0}mm 峰值计数={_handPeakCount} → 1 计数 = {scale:0.0000} mm");
+        SetStatus($"标定完成：1 计数 ≈ {scale:0.0000} mm。现在按手掌即可看到等大擦除区。");
+        _driverSizeWarned = false; // 允许重新提示
+        _hidScaleHintShown = true; // 已标定，不再提示
+        UpdateHidScaleLabel();
+    }
+
+    private void UpdateHidScaleLabel()
+    {
+        if (HidScaleText is null)
+            return;
+        string scale = RawHidScan.CountsToMmScale > 0 ? $"{RawHidScan.CountsToMmScale:0.0000} mm/计数" : "未标定";
+        string area = _palmAreaCm2 > 0 ? $"{_palmAreaCm2:0.0} cm²" : "未测";
+        HidScaleText.Text = $"HID 计数标定: {scale}    手掌峰值计数: {_handPeakCount}    手掌面积: {area}";
+    }
+
+    /// <summary>手动设置「1 计数 = ? mm」（没硬件/无法按手掌时用）。</summary>
+    private void OnApplyManualScale(object sender, RoutedEventArgs e)
+    {
+        if (!double.TryParse(ScaleInput.Text.Trim(), out double k) || k <= 0 || k > 100)
+        {
+            SetStatus("请输入 0~100 之间的 mm/计数。");
+            return;
+        }
+        RawHidScan.CountsToMmScale = k;
+        _hidScaleHintShown = true;
+        Log.Info($"手动设置 HID 计数比例: 1 计数 = {k:0.0000} mm");
+        SetStatus($"已设置：1 计数 = {k:0.0000} mm。可点「注入」自测整条链路。");
+        UpdateHidScaleLabel();
+    }
+
+    /// <summary>注入一组模拟原始 HID 计数：无触摸硬件时也能验证绘制/倍率/等面积圆。</summary>
+    private void OnInjectSyntheticCount(object sender, RoutedEventArgs e)
+    {
+        if (!int.TryParse(SimCountInput.Text.Trim(), out int count) || count <= 0 || count > MaxSimCount)
+        {
+            SetStatus($"请输入 1~{MaxSimCount} 的模拟计数。");
+            return;
+        }
+        if (RawHidScan.CountsToMmScale <= 0)
+        {
+            SetStatus("请先设置「1 计数 = ? mm」或完成手掌标定。");
+            return;
+        }
+        if (_mmPerDiuX <= 0 || _mmPerDiuY <= 0)
+        {
+            SetStatus("尚未校准，无法换算。");
+            return;
+        }
+
+        double wMm = Math.Min(count * RawHidScan.CountsToMmScale, MaxInjectMm);
+        double wDiu = wMm / _mmPerDiuX;
+        double hDiu = wMm / _mmPerDiuY;
+        double lx = EraserHost.ActualWidth / 2;
+        double ly = EraserHost.ActualHeight / 2;
+
+        Log.Info($"注入模拟原始HID: 计数={count} → {wMm:0.0}mm");
+        _hidScaleHintShown = true;
+        SubmitContact(ContactSource.RawHid,
+            new Rect(lx - wDiu / 2, ly - hDiu / 2, wDiu, hDiu),
+            applyThreshold: false,
+            detail: $"W={count} H={count}(模拟) → {wMm:0.0}×{wMm:0.0} mm");
     }
 
     /// <summary>
@@ -906,11 +1255,13 @@ public partial class MainWindow : Window
 
         if (tooSmall)
         {
+            if (ContactInfoText is not null)
+                ContactInfoText.Text = "驱动未上报接触尺寸（只给位置或占位值）。";
             if (!_driverSizeWarned)
             {
                 _driverSizeWarned = true;
                 Log.Warn($"驱动未上报有效接触面积：原始 Bounds={b.Width:0.###}x{b.Height:0.###} DIP，面积擦预览不可用（需能上报接触尺寸的数字化器）");
-                if (EraserInfoText is not null)
+                if (EraserInfoText is not null && !_hidScaleHintShown)
                     EraserInfoText.Text = $"驱动只上报位置、未上报接触尺寸（原始 Bounds={b.Width:0.##}×{b.Height:0.##} DIP）。\n面积擦需要能上报接触尺寸的数字化器（真触摸屏/笔）。";
             }
             return;
@@ -931,19 +1282,26 @@ public partial class MainWindow : Window
 
         _lastContact = MedianRect(_contactHistory);
 
-        if (_ratioCalibrating && _mmPerDiuX > 0)
+        Rect cur = _lastContact.Value;
+        if (_mmPerDiuX > 0 && _mmPerDiuY > 0)
         {
-            double wMm = _lastContact.Value.Width * _mmPerDiuX;
-            double hMm = _lastContact.Value.Height * _mmPerDiuY;
-            _eraserRatio = 1.0;
-            RatioSlider.Value = 1.0;
-            _ratioCalibrating = false;
-            SetStatus($"倍率已标定并锁定：基准接触 {wMm:0.0} × {hMm:0.0} mm，倍率 1.00×（此后严格等比、稳定）。");
-            Log.Info($"倍率标定: 基准接触 {wMm:0.0}x{hMm:0.0}mm, 倍率锁定 1.00x");
+            double curMmW = cur.Width * _mmPerDiuX;
+            double curMmH = cur.Height * _mmPerDiuY;
+            _lastContactMmW = curMmW;
+            _lastContactMmH = curMmH;
+
+            // 记录本次按压的峰值接触（按面积最大）——“手掌接触面积”取峰值，而不是松手瞬间缩小的值
+            if (curMmW * curMmH > _peakContactMmW * _peakContactMmH)
+            {
+                _peakContactMmW = curMmW;
+                _peakContactMmH = curMmH;
+            }
         }
 
         DrawLiveEraser();
         UpdateEraserInfo();
+        UpdateContactInfo();
+        UpdateRatioLabel();
         LogFilteredContact();
     }
 
@@ -959,8 +1317,9 @@ public partial class MainWindow : Window
 
         double wMm = c.Width * _mmPerDiuX;
         double hMm = c.Height * _mmPerDiuY;
-        double areaMm2 = wMm * hMm * _eraserRatio * _eraserRatio;
-        Log.Info($"接触(滤波): {wMm:0.0}x{hMm:0.0}mm 倍率={_eraserRatio:0.00} 擦除区面积={areaMm2:0}mm² 形状={(_shapeIsCircle ? "正圆" : "矩形")}");
+        double areaMm2 = EraserAreaMm2(c);
+        double r = EffectiveRatio();
+        Log.Info($"接触(滤波): {wMm:0.0}x{hMm:0.0}mm 模式={(_followPressure ? "随压力" : "固定手掌")} 倍率={r:0.000}({(_autoRatio ? "自动" : "手动")}) 擦除区面积={areaMm2:0}mm² 形状={(_shapeIsCircle ? "正圆" : "矩形")}");
     }
 
     private void OnShapeChanged(object sender, RoutedEventArgs e)
@@ -981,7 +1340,92 @@ public partial class MainWindow : Window
         if (RatioLabel is null)
             return;
         _eraserRatio = e.NewValue;
-        RatioLabel.Text = $"倍率 = {_eraserRatio:0.00} ×";
+        Log.Info($"手动倍率 = {_eraserRatio:0.00} ×");
+        RedrawEraser();
+    }
+
+    private void OnAutoRatioChanged(object sender, RoutedEventArgs e)
+    {
+        if (AutoRatioCheck is null)
+            return;
+        _autoRatio = AutoRatioCheck.IsChecked == true;
+        if (RatioSlider is not null)
+            RatioSlider.IsEnabled = !_autoRatio; // 只有手动倍率才用滑块
+        Log.Info($"倍率模式: {(_autoRatio ? "自动" : "手动")}");
+        RedrawEraser();
+    }
+
+    private void OnFollowPressureChanged(object sender, RoutedEventArgs e)
+    {
+        if (FollowPressureCheck is null)
+            return;
+        _followPressure = FollowPressureCheck.IsChecked == true;
+        Log.Info($"擦除区随压力变化 = {_followPressure}");
+        RedrawEraser();
+    }
+
+    /// <summary>自动倍率 k = √(a / b)：a = ①手掌面积，b = ②页手掌按压峰值。数据不足返回 0；不设上限。</summary>
+    private double ComputeAutoRatio()
+    {
+        if (_palmAreaCm2 <= 0)
+            return 0;
+        if (_peakContactMmW <= 0 || _peakContactMmH <= 0)
+            return 0;
+
+        double aMm2 = _palmAreaCm2 * 100.0;
+        double bMm2 = _peakContactMmW * _peakContactMmH;
+        if (!(bMm2 > 0))
+            return 0;
+
+        double k = Math.Sqrt(aMm2 / bMm2);
+        return double.IsFinite(k) && k > 0 ? k : 0;
+    }
+
+    /// <summary>当前实际生效的倍率：自动优先；自动数据不足时退回手动滑块值。</summary>
+    private double EffectiveRatio()
+    {
+        if (_autoRatio)
+        {
+            double k = ComputeAutoRatio();
+            if (k > 0)
+                return k;
+        }
+        return _eraserRatio;
+    }
+
+    /// <summary>手动倍率滑块只在"手动模式"，或"自动模式但自动数据不足"时可用（避免自动模式下滑块成死控件）。</summary>
+    private void SyncRatioSliderEnabled()
+    {
+        if (RatioSlider is null)
+            return;
+        bool enable = !_autoRatio || ComputeAutoRatio() <= 0;
+        if (RatioSlider.IsEnabled != enable)
+            RatioSlider.IsEnabled = enable;
+    }
+
+    private void UpdateRatioLabel()
+    {
+        if (RatioLabel is null)
+            return;
+
+        SyncRatioSliderEnabled();
+
+        if (!_autoRatio)
+        {
+            RatioLabel.Text = $"倍率(手动) = {_eraserRatio:0.00} ×";
+            return;
+        }
+
+        double k = ComputeAutoRatio();
+        RatioLabel.Text = k > 0
+            ? $"倍率(自动) = {k:0.000} ×"
+            : $"倍率(自动) = 数据不足（需①面积 + ②按压）→ 暂用手动 {_eraserRatio:0.00} ×";
+    }
+
+    /// <summary>重画擦除区并刷新倍率标签与说明（倍率/开关/形状变化后调用）。</summary>
+    private void RedrawEraser()
+    {
+        UpdateRatioLabel();
         if (EraserOverlay is not null)
         {
             DrawLiveEraser();
@@ -989,11 +1433,25 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OnAutoCalibrateRatio(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// DPI/校准变化后用保存的物理毫米重建擦除区：DIU 尺寸已不是同一个物理尺寸，
+    /// 必须按新的 mm/DIU 反算，否则绿框会保持旧的物理大小。
+    /// </summary>
+    private void RescaleLiveEraserToDpi()
     {
-        _ratioCalibrating = true;
-        SetStatus("倍率标定中：请到「② 触按采集」页用手掌按一次…");
-        EraserInfoText.Text = "标定中…请在「② 触按采集」页用手掌按一次，程序会用该次稳定接触作为基准。";
+        if (_lastContact is not Rect c || _lastContactMmW <= 0 || _lastContactMmH <= 0)
+            return;
+        if (_mmPerDiuX <= 0 || _mmPerDiuY <= 0)
+            return;
+
+        double w = _lastContactMmW / _mmPerDiuX;
+        double h = _lastContactMmH / _mmPerDiuY;
+        if (!double.IsFinite(w) || !double.IsFinite(h) || w <= 0 || h <= 0)
+            return;
+
+        _lastContact = new Rect(c.X + c.Width / 2 - w / 2, c.Y + c.Height / 2 - h / 2, w, h);
+        DrawLiveEraser();
+        UpdateEraserInfo();
     }
 
     private void DrawLiveEraser()
@@ -1004,15 +1462,13 @@ public partial class MainWindow : Window
         if (_lastContact is not Rect c)
             return;
 
-        double ratio = _eraserRatio;
         double cx = c.X + c.Width / 2;
         double cy = c.Y + c.Height / 2;
 
         if (_shapeIsCircle)
         {
-            // 等面积圆：直径 = √(4·W·H/π)，保证"圆面积 = 接触面积"
-            double d = Math.Sqrt(4 * c.Width * c.Height / Math.PI) * ratio;
-            if (!double.IsFinite(d) || d <= 0) return;
+            if (CircleDiameterDiu(c) is not double d)
+                return;
             var circle = new Ellipse
             {
                 Width = d,
@@ -1027,9 +1483,9 @@ public partial class MainWindow : Window
         }
         else
         {
-            double w = c.Width * ratio;
-            double h = c.Height * ratio;
-            if (!double.IsFinite(w) || !double.IsFinite(h) || w <= 0 || h <= 0) return;
+            var (w, h) = RectSizeDiu(c);
+            if (w <= 0 || h <= 0)
+                return;
             var rect = new Rectangle
             {
                 Width = w,
@@ -1049,6 +1505,69 @@ public partial class MainWindow : Window
         Canvas.SetTop(dot, cy - 3);
     }
 
+    /// <summary>擦除区面积（mm²）：随压力=接触面积×倍率²；固定=①的手掌面积。</summary>
+    private double EraserAreaMm2(Rect c)
+    {
+        if (_followPressure)
+        {
+            double r = EffectiveRatio();
+            double wMm = c.Width * _mmPerDiuX;
+            double hMm = c.Height * _mmPerDiuY;
+            return wMm * hMm * r * r;
+        }
+        return _palmAreaCm2 * 100.0;
+    }
+
+    /// <summary>① 手掌面积换算成预览区的 DIU²；不可用返回 0。</summary>
+    private double PalmAreaDiu2()
+    {
+        if (_palmAreaCm2 <= 0 || _mmPerDiuX <= 0 || _mmPerDiuY <= 0)
+            return 0;
+        double a = _palmAreaCm2 * 100.0 / (_mmPerDiuX * _mmPerDiuY);
+        return double.IsFinite(a) && a > 0 ? a : 0;
+    }
+
+    /// <summary>擦除区矩形尺寸（DIU）：面积按模式算，形状（长宽比）用①页设定的手掌长宽比。</summary>
+    private (double w, double h) RectSizeDiu(Rect c)
+    {
+        if (_mmPerDiuX <= 0 || _mmPerDiuY <= 0)
+            return (0, 0);
+
+        double areaMm2 = EraserAreaMm2(c);
+        if (!(areaMm2 > 0))
+            return (0, 0);
+
+        double areaDiu2 = areaMm2 / (_mmPerDiuX * _mmPerDiuY);
+        if (!double.IsFinite(areaDiu2) || areaDiu2 <= 0)
+            return (0, 0);
+
+        // 形状（长宽比 w/h）：优先①页设定的手掌长宽比；没有则退回②页按压峰值；再没有用当前接触
+        double aspect = _palmAspect > 0
+            ? _palmAspect
+            : (_peakContactMmW > 0 && _peakContactMmH > 0
+                ? _peakContactMmW / _peakContactMmH
+                : (c.Height > 0 && c.Width > 0 ? c.Width / c.Height : 1));
+        if (!(aspect > 0) || !double.IsFinite(aspect))
+            aspect = 1;
+
+        double h = Math.Sqrt(areaDiu2 / aspect);
+        double w = aspect * h;
+        return double.IsFinite(w) && double.IsFinite(h) && w > 0 && h > 0 ? (w, h) : (0, 0);
+    }
+
+    /// <summary>擦除区为正圆时的直径（DIU）；不可用返回 null。</summary>
+    private double? CircleDiameterDiu(Rect c)
+    {
+        double r = EffectiveRatio();
+        double areaDiu2 = _followPressure
+            ? c.Width * c.Height * r * r
+            : PalmAreaDiu2();
+        if (!double.IsFinite(areaDiu2) || areaDiu2 <= 0)
+            return null;
+        double d = Math.Sqrt(4 * areaDiu2 / Math.PI);
+        return double.IsFinite(d) && d > 0 ? d : null;
+    }
+
     private void UpdateEraserInfo()
     {
         if (EraserInfoText is null)
@@ -1062,16 +1581,32 @@ public partial class MainWindow : Window
 
         double inW = c.Width * _mmPerDiuX;
         double inH = c.Height * _mmPerDiuY;
-        double areaMm2 = inW * inH * _eraserRatio * _eraserRatio;
+        double areaMm2 = EraserAreaMm2(c);
 
+        var (rectW, rectH) = RectSizeDiu(c);
         string shape = _shapeIsCircle
-            ? $"等面积圆 ⌀{2 * Math.Sqrt(areaMm2 / Math.PI):0.0} mm"
-            : $"矩形 {inW * _eraserRatio:0.0} × {inH * _eraserRatio:0.0} mm";
+            ? $"等面积圆 ⌀{2 * Math.Sqrt(Math.Max(areaMm2, 0) / Math.PI):0.0} mm（面积 {areaMm2:0} mm²）"
+            : $"矩形 {rectW * _mmPerDiuX:0.0} × {rectH * _mmPerDiuY:0.0} mm（面积 {areaMm2:0} mm²）";
 
-        EraserInfoText.Text =
-            $"接触(中值滤波): {inW:0.0} × {inH:0.0} mm = {inW * inH:0} mm²\n" +
-            $"倍率: {_eraserRatio:0.00} ×（固定，保证等比）\n" +
-            $"擦除区: {shape}，面积 {areaMm2:0} mm²";
+        double autoK = ComputeAutoRatio();
+        string ratioText = _autoRatio
+            ? (autoK > 0 ? $"自动 {autoK:0.000} ×" : $"手动 {_eraserRatio:0.00} ×（自动数据不足）")
+            : $"手动 {_eraserRatio:0.00} ×";
+
+        if (_followPressure)
+        {
+            EraserInfoText.Text =
+                $"模式: 随压力变化（按越重越大）\n" +
+                $"接触(中值滤波): {inW:0.0} × {inH:0.0} mm = {inW * inH:0} mm²，倍率 {ratioText}\n" +
+                $"擦除区: {shape}";
+        }
+        else
+        {
+            string line = _palmAreaCm2 > 0
+                ? $"手掌面积 a: {_palmAreaCm2:0.0} cm² = {areaMm2:0} mm²\n擦除区: {shape}"
+                : "尚未测出手掌面积——请先到「① 描摹手掌轮廓」页描一圈并点「计算手掌面积」。";
+            EraserInfoText.Text = "模式: 固定为手掌面积（不随压力变）\n" + line;
+        }
     }
 
     private static Rect MedianRect(List<Rect> items)
@@ -1089,196 +1624,6 @@ public partial class MainWindow : Window
         int n = a.Length;
         if (n == 0) return 0;
         return n % 2 == 1 ? a[n / 2] : (a[n / 2 - 1] + a[n / 2]) / 2.0;
-    }
-
-    private void OnClearTouch(object sender, RoutedEventArgs e)
-    {
-        _touchPoints.Clear();
-        _clusters = null;
-        _palmClusters.Clear();
-        _hasPalm = false;
-        _hasDriverContact = false;
-        _driverContactWidthMm = 0;
-        _driverContactHeightMm = 0;
-        TouchOverlay.Children.Clear();
-        TouchInfoText.Text = "已清除。请重新采样触点或点「生成模拟触点」。";
-        ResultText.Text = "";
-        SetStatus("触点已清除。");
-        Log.Info("清除触点");
-    }
-
-    private void OnGenerateSynthetic(object sender, RoutedEventArgs e)
-    {
-        if (_mmPerDiuX <= 0)
-        {
-            SetStatus("未校准，无法按毫米生成模拟触点，请先校准。");
-            return;
-        }
-
-        double mm = _mmPerDiuX;
-        var rnd = new Random(7);
-        var pts = new List<Point>();
-        var center = new Point(TouchHost.ActualWidth / 2, TouchHost.ActualHeight * 0.62);
-        if (center.X < 100 || center.Y < 100)
-            center = new Point(400, 320);
-
-        // 掌心：致密椭圆点阵（间距 6 mm，保证 θ<10mm 时聚成一簇）
-        for (double y = -32; y <= 32; y += 6)
-        {
-            for (double x = -38; x <= 38; x += 6)
-            {
-                if (x * x / (38.0 * 38.0) + y * y / (32.0 * 32.0) <= 1.0)
-                {
-                    double jx = x + (rnd.NextDouble() * 3 - 1.5);
-                    double jy = y + (rnd.NextDouble() * 3 - 1.5);
-                    pts.Add(new Point(center.X + jx / mm, center.Y + jy / mm));
-                }
-            }
-        }
-
-        // 4 根手指：掌心上方，簇间距 18 mm（> θ，故各自成簇）
-        for (int f = 0; f < 4; f++)
-        {
-            double fx = -27 + f * 18;
-            double fy = -48 - rnd.NextDouble() * 3;
-            for (int k = 0; k < 3; k++)
-            {
-                pts.Add(new Point(
-                    center.X + (fx + rnd.Next(-3, 4)) / mm,
-                    center.Y + (fy + rnd.Next(-3, 4)) / mm));
-            }
-        }
-
-        // 笔尖：右侧远处
-        pts.Add(new Point(center.X + 72 / mm, center.Y - 18 / mm));
-
-        _touchPoints.Clear();
-        _touchPoints.AddRange(pts);
-        _clusters = null;
-        _palmClusters.Clear();
-        _hasPalm = false;
-        _hasDriverContact = false;
-        _driverContactWidthMm = 0;
-        _driverContactHeightMm = 0;
-        DrawTouchOverlay();
-        TouchInfoText.Text = $"已生成模拟触点 {_touchPoints.Count} 个（掌心 1 + 手指 4 + 笔尖 1 组）。\n" +
-                             "模拟数据没有驱动 Bounds，故「驱动接触」显示未上报。";
-        SetStatus("模拟触点已生成，点「计算遮挡半径」运行聚类 + MST。");
-        Log.Info($"生成模拟触点 {_touchPoints.Count} 个");
-    }
-
-    private void OnComputePalm(object sender, RoutedEventArgs e)
-    {
-        if (_touchPoints.Count < 2)
-        {
-            SetStatus("触点太少，请先采样或生成模拟触点。");
-            return;
-        }
-        if (_mmPerDiuX <= 0)
-        {
-            SetStatus("未校准，无法换算物理阈值。");
-            return;
-        }
-
-        double thresholdDiu = ThresholdSlider.Value / _mmPerDiuX;
-        int cutCount = (int)CutSlider.Value;
-
-        var clusters = Geometry2D.ClusterByDistance(_touchPoints, thresholdDiu);
-        var centers = clusters.Select(Geometry2D.Centroid).ToList();
-        var weights = clusters.Select(c => c.Count).ToList();
-        List<int> palmIdx = Geometry2D.LargestComponentAfterCuts(centers, weights, cutCount);
-
-        var palmPts = new List<Point>();
-        foreach (int ci in palmIdx)
-            palmPts.AddRange(clusters[ci]);
-
-        var (cCenter, rDiu) = Geometry2D.MinEnclosingCircle(palmPts);
-
-        _clusters = clusters;
-        _palmClusters.Clear();
-        foreach (int ci in palmIdx)
-            _palmClusters.Add(ci);
-        _hasPalm = true;
-        _palmCenterDiu = cCenter;
-        _palmRadiusMm = rDiu * _mmPerDiuX;
-
-        DrawTouchOverlay();
-
-        TouchInfoText.Text =
-            $"触点: {_touchPoints.Count}   簇: {clusters.Count}\n" +
-            $"θ = {ThresholdSlider.Value:0} mm, k = {cutCount}\n" +
-            $"手掌(含手指)簇: {palmIdx.Count}/{clusters.Count} 簇、{palmPts.Count} 触点（触点最多连通分量）";
-
-        double diameterMm = _palmRadiusMm * 2;
-        Log.Info($"遮挡半径: 触点={_touchPoints.Count} 簇={clusters.Count} θ={ThresholdSlider.Value:0}mm k={cutCount} 手掌簇={palmIdx.Count}/{clusters.Count} 手掌触点={palmPts.Count} r={_palmRadiusMm:0.0}mm 直径={diameterMm:0.0}mm");
-        Log.Info("  对照 " + DriverContactSummary());
-        ResultText.Text =
-            $"【③ 遮挡半径】\n" +
-            $"手掌(含手指)触点: {palmPts.Count} 个\n" +
-            $"最小覆盖圆半径 r ≈ {_palmRadiusMm:0.0} mm（直径 {diameterMm:0.0} mm）\n" +
-            $"渲染直径: {2 * rDiu:0} DIU\n" +
-            $"—— 对照 ——\n" +
-            $"{DriverContactSummary()}\n" +
-            $"（聚类 → MST 切 k 条最长边（去掉笔尖等离群点）→ 触发点最多的连通分量 → Welzl 最小覆盖圆）";
-    }
-
-    // ================= 触按层渲染 =================
-
-    private void DrawTouchOverlay()
-    {
-        TouchOverlay.Children.Clear();
-
-        if (_clusters is null)
-        {
-            foreach (Point p in _touchPoints)
-                TouchOverlay.Children.Add(Dot(p, 3, Color.FromRgb(0xAA, 0xAA, 0xAA)));
-            return;
-        }
-
-        for (int ci = 0; ci < _clusters.Count; ci++)
-        {
-            bool isPalm = _palmClusters.Contains(ci);
-            Color color = isPalm ? Color.FromRgb(0xFF, 0x44, 0x44) : ClusterPalette[ci % ClusterPalette.Length];
-            foreach (Point p in _clusters[ci])
-                TouchOverlay.Children.Add(Dot(p, isPalm ? 4 : 3, color));
-        }
-
-        if (!_hasPalm || _mmPerDiuX <= 0)
-            return;
-
-        // 用「物理毫米」换算成 DIU 直径，DPI 改变时尺寸随之修正。
-        double rDiu = _palmRadiusMm / _mmPerDiuX;
-        if (!double.IsFinite(rDiu) || rDiu <= 0)
-            return; // 半径非法就不画，避免给 Ellipse.Width 赋负值/NaN 而崩溃
-        var ring = new Ellipse
-        {
-            Width = 2 * rDiu,
-            Height = 2 * rDiu,
-            Stroke = Brushes.Red,
-            StrokeThickness = 2,
-            Fill = new SolidColorBrush(Color.FromArgb(0x33, 0xFF, 0x44, 0x44)),
-        };
-        TouchOverlay.Children.Add(ring);
-        Canvas.SetLeft(ring, _palmCenterDiu.X - rDiu);
-        Canvas.SetTop(ring, _palmCenterDiu.Y - rDiu);
-
-        var cross = new Ellipse { Width = 8, Height = 8, Fill = Brushes.Yellow };
-        TouchOverlay.Children.Add(cross);
-        Canvas.SetLeft(cross, _palmCenterDiu.X - 4);
-        Canvas.SetTop(cross, _palmCenterDiu.Y - 4);
-    }
-
-    private static Ellipse Dot(Point p, double radiusDiu, Color color)
-    {
-        var e = new Ellipse
-        {
-            Width = radiusDiu * 2,
-            Height = radiusDiu * 2,
-            Fill = new SolidColorBrush(color),
-        };
-        Canvas.SetLeft(e, p.X - radiusDiu);
-        Canvas.SetTop(e, p.Y - radiusDiu);
-        return e;
     }
 
     // ================= 引导模式 =================
@@ -1299,8 +1644,8 @@ public partial class MainWindow : Window
         new GuideStep("欢迎使用 TouchErase · 手掌擦矫正 Demo",
             "整个流程：\n" +
             "1) 校准屏幕物理尺寸\n" +
-            "2) 描一圈手掌轮廓 → 算面积\n" +
-            "3) 放一次手掌 → 算遮挡半径\n" +
+            "2) 描一圈手掌轮廓 → 算手掌面积\n" +
+            "3) 把手掌按上去 → 读驱动上报的接触面积\n" +
             "4) 面积擦预览 → 按多大、擦多大\n\n" +
             "点「下一步」我带你按顺序走一遍；想直接上手就点「跳过引导」。"),
 
@@ -1320,42 +1665,25 @@ public partial class MainWindow : Window
 
         new GuideStep("第 2 步 · 计算面积",
             "描好后点这个按钮。\n" +
-            "白区会出现蓝色虚线（你描的圈）和红色实线（凸包），右侧会同时给出两个面积。",
+            "白区会出现蓝色虚线（你描的圈）和红色实线（凸包），右侧会同时给出两个面积。算出的手掌面积还会用于第③页的「HID 计数→mm」标定。",
             () => ComputeAreaButton),
 
-        new GuideStep("第 3 步 · 切到「触按采集」页",
-            "接下来切到「② 触按采集」页，准备采集手掌触点。",
+        new GuideStep("第 3 步 · 把手掌按上去读接触面积",
+            "切到「② 手掌接触面积」页，把整只手（含手指）按在黑区上。\n" +
+            "右侧实时显示当前接触尺寸，并记录本次按压的峰值（手掌接触面积取峰值）；不抬手、改变按压轻重或手的角度也会跟着变。\n" +
+            "注意：需要能上报接触尺寸的数字化器（真触摸屏/笔）；鼠标不携带接触尺寸。",
             () => StageTabs, () => StageTabs.SelectedIndex = 1),
 
-        new GuideStep("第 3 步 · 采集触点",
-            "有触摸屏就把手掌（含手指、笔尖）自然按上去一次——程序会同时读取\n" +
-            "① 触点坐标（用于聚类）\n" +
-            "② 驱动直接上报的接触矩形 TouchPoint.Bounds（换算成 mm² 的接触面积）\n" +
-            "没有触摸屏（大概率）就直接点「生成模拟触点」。",
-            () => GenerateButton),
-
-        new GuideStep("第 3 步 · 计算遮挡半径",
-            "点这个按钮，黑区会按簇分色显示触点。\n" +
-            "红色圆就是算出的遮挡半径，它覆盖「整只手（掌心 + 手指）」，黄点是圆心。",
-            () => ComputePalmButton),
-
-        new GuideStep("第 3 步 · 调参（可选）",
-            "结果不对就调这两个滑块再算一次：\n" +
-            "θ 控制多近的触点算同一簇；\n" +
-            "k 默认 1，只切掉笔尖等离群触点、保留整只手；\n" +
-            "若你只想取「掌心」不要手指，把 k 调大即可把手指簇也切掉。",
-            () => ThresholdSlider),
-
-        new GuideStep("第 4 步 · 面积擦预览（第 ③ 页，需真触摸屏）",
-            "切到新建的「③ 面积擦预览」页，把手掌按在黑区上：\n" +
-            "程序读驱动上报的接触矩形，用「固定倍率 + 中值滤波」画出稳定、等比的擦除区——按多大，擦多大。\n" +
-            "不抬手也会刷新：改变按压轻重/手的角度，接触面积跟着变，擦除区实时跟着变（能否变取决于驱动是否上报）。\n" +
-            "默认矩形，可切正圆（等面积）；点「自动标定倍率」可用手掌一次锁定基准。",
-            () => RatioSlider, () => StageTabs.SelectedIndex = 2),
+        new GuideStep("第 4 步 · 面积擦预览（第 ③ 页）",
+            "切到「③ 面积擦预览」页，把手掌按在黑区上（真触摸屏）。\n" +
+            "程序取驱动上报的接触尺寸画出等大擦除区——按多大，擦多大。\n" +
+            "倍率默认「自动」= √(①手掌面积 ÷ ②按压峰值)，不用点、实时算，按下时擦除区≈手掌面积；取消自动才用下面的手动滑块。\n" +
+            "设备只给逻辑计数（无毫米单位）时，先用①的手掌面积点「标定 HID 计数→mm」。\n" +
+            "没有触摸硬件时：设「1 计数 = ? mm」再点「注入」，可自测整条链路。",
+            () => AutoRatioCheck, () => StageTabs.SelectedIndex = 2),
 
         new GuideStep("完成",
-            "至此四件事都齐了：手掌面积(cm²)、遮挡半径(mm)、按物理毫米渲染的遮挡圆、\n" +
-            "以及第 ③ 页「按多大、擦多大」的实时面积擦预览。\n" +
+            "至此都齐了：手掌面积(cm²)、驱动上报的接触面积，以及第 ③ 页「按多大、擦多大」的实时面积擦预览。\n" +
             "随时可以点右上角「引导」重新看一遍。"),
     };
 
@@ -1551,17 +1879,22 @@ public partial class MainWindow : Window
 
     // ================= HID 触摸诊断 =================
 
-    private void OnHidDiagnostics(object sender, RoutedEventArgs e) => RunHidDiagnostics();
+    private void OnHidDiagnostics(object sender, RoutedEventArgs e) => RunHidDiagnostics(full: true);
 
-    private void RunHidDiagnostics()
+    /// <summary>
+    /// HID 触摸诊断：Raw Input + HidP_* 直接读 HID 能力（不打开设备）。
+    /// <paramref name="full"/> = false 仅写日志（启动轻量自检）；true 时额外把结论显示到界面。
+    /// </summary>
+    private void RunHidDiagnostics(bool full)
     {
-        // 方案一（主）：Raw Input + HidP_* 直接读 HID 能力，不打开设备
         List<RawHidScan.HidTouchInfo> hid = RawHidScan.Scan();
         Log.Info($"RawInput HID 扫描: {hid.Count} 个 HID 设备");
         foreach (RawHidScan.HidTouchInfo h in hid)
             Log.Info($"HID(raw): {h.DeviceName} | 触摸屏={h.IsTouchScreen} | Width(0x48)={h.HasWidth} Height(0x49)={h.HasHeight} | 值用法数={h.InputValueCaps} | 用法: {h.UsageSummary}");
 
         List<RawHidScan.HidTouchInfo> touchHid = hid.Where(h => h.IsTouchScreen).ToList();
+        RawHidScan.HidTouchInfo? withSize = touchHid.FirstOrDefault(t => t.HasWidth && t.HasHeight);
+
         if (touchHid.Count == 0)
         {
             Log.Warn("RawHid 结论: 未发现触摸屏 HID 设备（Digitizer 0x0D / Touch Screen 0x04）");
@@ -1577,56 +1910,15 @@ public partial class MainWindow : Window
             }
         }
 
-        // 方案二（辅）：接口 + IOCTL / 注册表兜底
-        List<HidDescriptor.HidDeviceReport> reports = HidDescriptor.Enumerate();
-        Log.Info($"HID 诊断: 枚举到 {HidDescriptor.LastEnumeratedCount} 个 HID 设备，其中 {reports.Count} 个读到描述符（来源: {HidDescriptor.LastSource}）");
-        foreach (string d in HidDescriptor.Diagnostics)
-            Log.Info("HID 诊断细节: " + d);
+        if (!full || EraserInfoText is null)
+            return;
 
-        List<HidDescriptor.HidDeviceReport> touch = reports.Where(r => r.IsTouchScreen).ToList();
-        foreach (HidDescriptor.HidDeviceReport r in reports)
-            Log.Info($"HID: {r.Name} | 描述符 {r.DescriptorLength}B | 触摸屏={r.IsTouchScreen} | Width(0x48)={r.HasWidth} Height(0x49)={r.HasHeight}");
-
-        if (touch.Count == 0)
-        {
-            Log.Warn("HID 诊断: 未发现触摸屏 HID 设备（Digitizer 0x0D / Touch Screen 0x04）");
-        }
+        if (withSize is not null)
+            EraserInfoText.Text = $"HID 诊断：触摸屏『{withSize.DeviceName}』声明了 Width/Height → 可尝试原始 HID 解码。";
+        else if (touchHid.Count > 0)
+            EraserInfoText.Text = "HID 诊断：检测到触摸屏但未声明 Width/Height → 设备不上报接触尺寸。";
         else
-        {
-            foreach (HidDescriptor.HidDeviceReport t in touch)
-            {
-                if (t.HasWidth && t.HasHeight)
-                    Log.Info($"HID 结论: 触摸屏『{t.Name}』声明了 Width/Height → 可再加原始 HID 解码拿到接触尺寸");
-                else
-                    Log.Warn($"HID 结论: 触摸屏『{t.Name}』未声明 Width/Height → 设备不上报接触尺寸，软件层无法获取");
-            }
-        }
-
-        try
-        {
-            if (!string.IsNullOrEmpty(Log.LogDirectory))
-            {
-                string path = System.IO.Path.Combine(Log.LogDirectory, "hid_descriptors.txt");
-                var sb = new StringBuilder();
-                foreach (HidDescriptor.HidDeviceReport r in reports)
-                    sb.AppendLine($"== {r.Name} | {r.DescriptorLength}B | touch={r.IsTouchScreen} w={r.HasWidth} h={r.HasHeight}")
-                      .AppendLine(r.HexDump).AppendLine();
-                File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
-                Log.Info($"HID 描述符已导出: {path}");
-            }
-        }
-        catch (Exception ex)
-        {
-            Log.Warn("导出 HID 描述符失败: " + ex.Message);
-        }
-
-        if (touch.Count > 0 && EraserInfoText is not null)
-        {
-            HidDescriptor.HidDeviceReport t = touch[0];
-            EraserInfoText.Text = t.HasWidth && t.HasHeight
-                ? $"HID 诊断：触摸屏声明了 Width/Height（{t.DescriptorLength}B）→ 可尝试原始 HID 解码。"
-                : $"HID 诊断：触摸屏未声明 Width/Height（{t.DescriptorLength}B）→ 设备不上报接触尺寸。";
-        }
+            EraserInfoText.Text = "HID 诊断：未发现触摸屏 HID 设备。";
     }
 
     private void SetStatus(string text) => StatusText.Text = text;
