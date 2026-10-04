@@ -779,12 +779,16 @@ public partial class MainWindow : Window
         if (s.Source is "RawHID" or "HidSetup")
             _lastRawHidTicks = nowTicks;
 
-        // 当前步骤选定的接触来源（自适应 / 原始HID / WM_POINTER / WPF）
+        // 当前步骤选定的接触来源（自适应 / 原始HID·RawInput / 原始HID·SetupAPI / 软件HID / 软件WPF）
         int mode = _step == 4 ? _palmSourceMode : _fingerSourceMode;
         if (!Accept(mode, s, nowTicks))
             return;
 
-        double? area = s.AreaMm2;
+        // 软件（屏幕尺度）推算口径：软件HID 模式下用屏幕标定把计数推算成面积，不依赖驱动的 W/H 换算表；
+        // 推算不可用（无 X/Y 量程）时退回设备上报值，保证向导不卡死。
+        double? area = mode == 3
+            ? SoftwareHidScale.AreaMm2(s, _mmPerDiuX, _mmPerDiuY) ?? s.AreaMm2
+            : s.AreaMm2;
         double? press = s.Pressure01;
         if (area is null && press is null)
             return;

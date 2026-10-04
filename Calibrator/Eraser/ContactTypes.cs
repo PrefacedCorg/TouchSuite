@@ -1,3 +1,5 @@
+using System.Windows;
+
 namespace TouchErase.Calibrator.Eraser;
 
 /// <summary>
@@ -39,4 +41,54 @@ public static class SourceNames
         SourceMode.SoftwareWpf => "软件WPF（系统接触框 + 软件推算）",
         _ => "自适应（自动锁定）",
     };
+}
+
+/// <summary>
+/// 软件（屏幕尺度）推算 —— 「软件HID」模式的口径：
+/// 不用驱动自带的 W/H 物理量程换算表（厂商可能填错），而是用屏幕标定尺度直接换算原始计数：
+/// <para>W 毫米 = W 计数 ÷ X 轴逻辑量程 × 屏幕物理宽；H 毫米 = H 计数 ÷ Y 轴逻辑量程 × 屏幕物理高。</para>
+/// 与「原始HID」（驱动换算表口径）互为独立参照，两边差异大即说明驱动表有问题。
+/// </summary>
+public static class SoftwareHidScale
+{
+    /// <summary>屏幕物理宽/高（mm）：mm/DIU × 主屏 DIP 尺寸（与标定同口径：主屏物理像素 × mm/px）。</summary>
+    public static (double W, double H) ScreenMm(double mmPerDiuX, double mmPerDiuY)
+        => (mmPerDiuX * SystemParameters.PrimaryScreenWidth,
+            mmPerDiuY * SystemParameters.PrimaryScreenHeight);
+
+    /// <summary>一根接触的软件推算尺寸；计数或量程缺失返回 null。</summary>
+    public static (double? wMm, double? hMm) ContactMm(ContactRect c, int xLogMax, int yLogMax,
+        double screenWmm, double screenHmm)
+    {
+        double? w = c.WLogical > 0 ? c.WLogical / (double)xLogMax * screenWmm : null;
+        double? h = c.HLogical > 0 ? c.HLogical / (double)yLogMax * screenHmm : null;
+        return (w, h);
+    }
+
+    /// <summary>整帧样本的软件推算面积（mm²，Σ各指 W×H）；数据不足返回 null。</summary>
+    public static double? AreaMm2(TouchSample s, double mmPerDiuX, double mmPerDiuY)
+    {
+        if (s.XLogMax is not int xm || xm <= 0 || s.YLogMax is not int ym || ym <= 0)
+            return null;
+        if (mmPerDiuX <= 0 || mmPerDiuY <= 0)
+            return null;
+
+        (double sw, double sh) = ScreenMm(mmPerDiuX, mmPerDiuY);
+        IEnumerable<ContactRect> list = s.Contacts is { Count: > 0 } l
+            ? l
+            : new[] { new ContactRect(0, null, null, null, null, null, null, s.WidthLogical, s.HeightLogical) };
+
+        double sum = 0;
+        bool any = false;
+        foreach (ContactRect c in list)
+        {
+            (double? w, double? h) = ContactMm(c, xm, ym, sw, sh);
+            if (w is double wv && h is double hv)
+            {
+                sum += wv * hv;
+                any = true;
+            }
+        }
+        return any ? sum : null;
+    }
 }

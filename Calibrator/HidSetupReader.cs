@@ -1,5 +1,7 @@
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Threading;
 using Microsoft.Win32.SafeHandles;
 
 namespace TouchErase.Calibrator;
@@ -30,6 +32,7 @@ public sealed class HidSetupReader : IDisposable
     private CancellationTokenSource? _cts;
     private Thread? _thread;
     private SafeFileHandle? _handle;
+    private Dispatcher? _ui;   // Sample 必须切回 UI 线程再触发（OnSample 直接改界面元素，后台线程调会崩）
     private bool _disposed;
 
     // ================= interop =================
@@ -162,6 +165,7 @@ public sealed class HidSetupReader : IDisposable
     /// </summary>
     public void Start()
     {
+        _ui = Application.Current?.Dispatcher;
         var t = new Thread(() =>
         {
             try
@@ -185,7 +189,8 @@ public sealed class HidSetupReader : IDisposable
         };
         t.Start();
         t.Join(3000);   // 探测通常 <100ms；给它 3 秒，超时就让它在后台继续，不拖住向导
-        Log.Info($"[HID探测] 探测线程结束={!t.IsAlive}");    }
+        Log.Info($"[HID探测] 探测线程结束={!t.IsAlive}");
+    }
 
     private void StartCore()
     {
@@ -311,7 +316,13 @@ public sealed class HidSetupReader : IDisposable
                 {
                     TouchSample? s = ParseFrame(ctx, report, (int)read);
                     if (s is not null)
-                        Sample?.Invoke(s);
+                    {
+                        // ReadFile 阻塞在后台线程；样本必须切回 UI 线程再抛（OnSample 直接改界面元素）
+                        if (_ui is { HasShutdownStarted: false } d)
+                            d.Invoke(() => Sample?.Invoke(s));
+                        else
+                            Sample?.Invoke(s);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -338,7 +349,7 @@ public sealed class HidSetupReader : IDisposable
             var list = new List<ContactRect>();
             double? maxW = null, maxH = null, sum = null, maxP = null;
             double sx = 0, sy = 0, sw = 0;
-            int maxWLogical = 0;
+            int maxWLogical = 0, maxHLogical = 0;
 
             int n = Math.Min(ctx.LinkCollections, 64);
             for (int col = 1; col < n; col++)
@@ -379,6 +390,7 @@ public sealed class HidSetupReader : IDisposable
                     if (hh > (maxH ?? 0)) maxH = hh;
                 }
                 if (hasW && w > maxWLogical) maxWLogical = (int)w;
+                if (hasH && h > maxHLogical) maxHLogical = (int)h;
                 if (p01 is double pv && pv > (maxP ?? 0)) maxP = pv;
 
                 if (xn is double nx && yn is double ny)
@@ -403,8 +415,11 @@ public sealed class HidSetupReader : IDisposable
 
             return new TouchSample("HidSetup", maxW, maxH, maxP, detail,
                 PressureRaw: null, PressureRange: "",
-                WidthLogical: maxWLogical, HeightLogical: maxWLogical,
-                XNorm: cx, YNorm: cy, Contacts: list);
+                WidthLogical: maxWLogical, HeightLogical: maxHLogical,
+                XNorm: cx, YNorm: cy,
+                XLogMax: ctx.XLogMax > 0 ? ctx.XLogMax : null,
+                YLogMax: ctx.YLogMax > 0 ? ctx.YLogMax : null,
+                Contacts: list);
         }
 
         // 单指兜底：usage 全挂根集合
@@ -428,7 +443,9 @@ public sealed class HidSetupReader : IDisposable
             hasP2 ? (int)p2 : null, hasP2 ? $"{ctx.PLogMin}..{ctx.PLogMax}" : "",
             WidthLogical: (int)w2, HeightLogical: (int)h2,
             XNorm: ctx.XLogMax > 0 ? Math.Clamp((double)x2 / ctx.XLogMax, 0, 1) : null,
-            YNorm: ctx.YLogMax > 0 ? Math.Clamp((double)y2 / ctx.YLogMax, 0, 1) : null);
+            YNorm: ctx.YLogMax > 0 ? Math.Clamp((double)y2 / ctx.YLogMax, 0, 1) : null,
+            XLogMax: ctx.XLogMax > 0 ? ctx.XLogMax : null,
+            YLogMax: ctx.YLogMax > 0 ? ctx.YLogMax : null);
     }
 
     private double? ToMm(uint logical, int logMin, int logMax, int physMin, int physMax, int unitsExp, int units)

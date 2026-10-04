@@ -29,6 +29,7 @@ public sealed record TouchSample(string Source, double? WidthMm, double? HeightM
     double? ScreenPxX = null, double? ScreenPxY = null,
     Rect? DiuRect = null,
     int FrameId = 0, uint TimeMs = 0,
+    int? XLogMax = null, int? YLogMax = null,   // 软件（屏幕尺度）推算用：X/Y 轴逻辑量程上限；null/0 = 无法推算
     IReadOnlyList<ContactRect>? Contacts = null)
 {
     /// <summary>接触面积：带分指列表时 = 各指面积之和（手掌多接触不被拆散低估）；单指退化为 W×H。</summary>
@@ -426,7 +427,9 @@ public sealed class TouchInput : IDisposable
                 $"W={w}/{ctx.WLogMax} → {Precision.Fmt(wMm)} mm  H={h}/{ctx.HLogMax} → {Precision.Fmt(hMm)} mm  P={p}({Precision.Fmt(p01, 2)})",
                 hasP ? (int)p : null, hasP ? $"{ctx.PLogMin}..{ctx.PLogMax}" : "",
                 WidthLogical: (int)w, HeightLogical: (int)h,
-                XNorm: xn, YNorm: yn));
+                XNorm: xn, YNorm: yn,
+                XLogMax: ctx.XLogMax > 0 ? ctx.XLogMax : null,
+                YLogMax: ctx.YLogMax > 0 ? ctx.YLogMax : null));
         }
         finally
         {
@@ -544,7 +547,7 @@ public sealed class TouchInput : IDisposable
             return null;
 
         double? maxW = null, maxH = null, maxP = null, sum = null;
-        int maxWLogical = 0;
+        int maxWLogical = 0, maxHLogical = 0;
         double sx = 0, sy = 0, sw = 0;
         ContactInfo? pMax = null;
 
@@ -561,6 +564,7 @@ public sealed class TouchInput : IDisposable
                 if (h > (maxH ?? 0)) maxH = h;
             }
             if (k.WLogical > maxWLogical) maxWLogical = k.WLogical;
+            if (k.HLogical > maxHLogical) maxHLogical = k.HLogical;
             if (k.HasP && k.P01 is double pv && pv > (maxP ?? 0)) { maxP = pv; pMax = k; }
 
             if (k.HasPos)
@@ -593,8 +597,10 @@ public sealed class TouchInput : IDisposable
         return new TouchSample("RawHID", maxW, maxH, maxP, detail,
             PressureRaw: pMax is not null && pMax.HasP ? pMax.PRaw : null,
             PressureRange: pMax is not null && pMax.HasP ? $"{ctx.PLogMin}..{ctx.PLogMax}" : "",
-            WidthLogical: maxWLogical, HeightLogical: maxWLogical,
+            WidthLogical: maxWLogical, HeightLogical: maxHLogical,
             XNorm: xn, YNorm: yn,
+            XLogMax: ctx.XLogMax > 0 ? ctx.XLogMax : null,
+            YLogMax: ctx.YLogMax > 0 ? ctx.YLogMax : null,
             Contacts: list);
     }
 

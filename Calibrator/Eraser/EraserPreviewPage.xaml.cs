@@ -185,12 +185,13 @@ public partial class EraserPreviewPage : UserControl
         switch (s.Source)
         {
             // RawInput 与 SetupAPI 直读同属"设备上报真值"，只是分发到不同的 ContactSource，供仲裁区分。
+            // 软件（屏幕尺度）推算口径：软件HID 模式下用屏幕标定换算计数，不走驱动的 W/H 换算表。
             case "RawHID":
-                SubmitDriverContact(s, ContactSource.RawHid);
+                SubmitHidRoute(s, ContactSource.RawHid);
                 break;
 
             case "HidSetup":
-                SubmitDriverContact(s, ContactSource.HidSetup);
+                SubmitHidRoute(s, ContactSource.HidSetup);
                 break;
 
             case "STYLUS":
@@ -223,6 +224,15 @@ public partial class EraserPreviewPage : UserControl
         }
     }
 
+    /// <summary>原始HID 两条路的分发：软件HID 模式走屏幕尺度推算，其余模式走驱动换算表的设备上报值。</summary>
+    private void SubmitHidRoute(TouchSample s, ContactSource src)
+    {
+        if (Engine.Mode == SourceMode.SoftwareHid)
+            SubmitSoftwareHidContact(s, src);
+        else
+            SubmitDriverContact(s, src);
+    }
+
     /// <summary>设备上报真值（RawInput / SetupAPI 直读）的统一喂入：按分指列表逐根喂，无列表则用整体尺寸。</summary>
     private void SubmitDriverContact(TouchSample s, ContactSource src)
     {
@@ -252,6 +262,42 @@ public partial class EraserPreviewPage : UserControl
             new Rect(p0.X - wDiu / 2, p0.Y - hDiu / 2, wDiu, hDiu),
             applyThreshold: false,
             detail: $"W={s.WidthLogical} → {Precision.Fmt(w0)}×{Precision.Fmt(h0)} mm");
+    }
+
+    /// <summary>
+    /// 「软件HID」模式喂入：不用驱动的 W/H 换算表，用屏幕标定尺度把原始计数推算成尺寸
+    /// （W 按 X 轴尺度 = 屏宽/逻辑量程，H 按 Y 轴尺度 = 屏高/逻辑量程）。
+    /// 厂商把换算表填错的场景（如 LKS-238 把 Width 的物理量程错填成 Y 的）下，这是独立口径。
+    /// </summary>
+    private void SubmitSoftwareHidContact(TouchSample s, ContactSource src)
+    {
+        if (s.XLogMax is not int xm || xm <= 0 || s.YLogMax is not int ym || ym <= 0)
+            return;   // 设备没报 X/Y 逻辑量程 → 无法软件推算
+
+        (double screenWmm, double screenHmm) = SoftwareHidScale.ScreenMm(Engine.MmPerDiuX, Engine.MmPerDiuY);
+
+        void Feed(int id, int wLogical, int hLogical, double? xNorm, double? yNorm)
+        {
+            if (wLogical <= 0 || hLogical <= 0)
+                return;
+            double wMm = (double)wLogical / xm * screenWmm;
+            double hMm = (double)hLogical / ym * screenHmm;
+            Point ctr = ContactCenter(xNorm, yNorm, s);
+            Engine.Submit(src, id,
+                new Rect(ctr.X - wMm / Engine.MmPerDiuX / 2, ctr.Y - hMm / Engine.MmPerDiuY / 2,
+                         wMm / Engine.MmPerDiuX, hMm / Engine.MmPerDiuY),
+                applyThreshold: false,
+                detail: $"#{id} 软件推算 W={wLogical}/{xm}→{Precision.Fmt(wMm)}×{Precision.Fmt(hMm)} mm（屏尺度，非驱动表）");
+        }
+
+        if (s.Contacts is { Count: > 0 } list)
+        {
+            foreach (ContactRect c in list)
+                Feed(c.Id, c.WLogical, c.HLogical, c.XNorm, c.YNorm);
+            return;
+        }
+
+        Feed(0, s.WidthLogical, s.HeightLogical, s.XNorm, s.YNorm);
     }
 
     /// <summary>把一根接触的屏幕/归一化坐标换算成预览区内的坐标；拿不到就用中心。</summary>
