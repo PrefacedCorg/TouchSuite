@@ -21,7 +21,14 @@ public static class PointerProbe
 {
     // ---- 结构体 ----
 
-    [StructLayout(LayoutKind.Sequential)]
+    /// <summary>
+    /// 原生 tagPOINTER_DEVICE_INFO（winuser.h）。
+    /// 必须声明 CharSet=Unicode：productString 在原生里是 WCHAR[520]（1040 字节），
+    /// ByValTStr 的 SizeConst 是"字符数"，字节宽度由 CharSet 决定 —— 缺省 Ansi 时封送器只给
+    /// 520 字节缓冲，GetPointerDevices 却按 1040 字节写 → 每个设备越界写 520 字节 → 堆损坏
+    /// （0xc0000374，延迟检出，崩点在任意后续堆操作上）。
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct POINTER_DEVICE_INFO
     {
         public uint displayId;
@@ -30,7 +37,7 @@ public static class PointerProbe
         public IntPtr monitor;             // HMONITOR
         public uint startingCursorId;
         public ushort maxActiveContacts;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 520)]   // MAX_PATH
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 520)]   // POINTER_DEVICE_PRODUCT_STRING_MAX = 520 个 WCHAR
         public string productString;
     }
 
