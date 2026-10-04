@@ -45,6 +45,18 @@ public sealed class CalibrationResult
     public double? PressureThresholdTrim { get; set; }
     public double? PressureThresholdEffective { get; set; }
 
+    // ---- 第 7 步预览页的开关与系数（保存界面设置，供主程序按同一套参数工作）----
+    public bool? FollowSize { get; set; }
+    public bool? LockPalmSize { get; set; }
+    public bool? FollowPressure { get; set; }
+    public double? PressureGain { get; set; }
+    public bool? AreaThresholdEnabled { get; set; }
+    public bool? WritingUsesPressure { get; set; }
+    public double? WritingPressureGain { get; set; }
+    public bool? WritingFollowSize { get; set; }
+    public double? RatioTrim { get; set; }
+    public string? EraserShape { get; set; }
+
     /// <summary>默认保存到 exe 同级的 calibration.json；不可写则退回 %LOCALAPPDATA%。</summary>
     public static string DefaultPath()
     {
@@ -77,5 +89,20 @@ public sealed class CalibrationResult
             Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
         };
         File.WriteAllText(path, JsonSerializer.Serialize(this, options), Encoding.UTF8);
+    }
+
+    /// <summary>从 JSON 载入上次保存的标定；文件不存在或格式不对则返回 null。</summary>
+    public static CalibrationResult? Load(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+                return null;
+            return JsonSerializer.Deserialize<CalibrationResult>(File.ReadAllText(path, Encoding.UTF8));
+        }
+        catch
+        {
+            return null;
+        }
     }
 }

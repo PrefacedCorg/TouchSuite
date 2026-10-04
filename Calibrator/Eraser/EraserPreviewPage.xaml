@@ -5,13 +5,12 @@
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*" />
             <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
 
-        <!-- 左：预览区 -->
+        <!-- 左：预览区（触摸样本统一由宿主窗口的 TouchInput 聚合后经 SubmitSample 喂入，多指=整体一个框） -->
         <Grid Grid.Column="0">
-            <Border x:Name="Host" Background="#FF101010"
-                    TouchDown="OnHostTouchDown" TouchMove="OnHostTouchMove" TouchUp="OnHostTouchUp"
-                    MouseMove="OnHostMouseMove">
+            <Border x:Name="Host" Background="#FF101010">
                 <TextBlock Text="把手掌按在任意处：绿色擦除区会实时变成和接触面积一样大"
                            Foreground="#FF808080" HorizontalAlignment="Center" VerticalAlignment="Center"
                            TextWrapping="Wrap" TextAlignment="Center" FontSize="15" IsHitTestVisible="False" />
@@ -19,7 +18,7 @@
             <Canvas x:Name="Overlay" IsHitTestVisible="False" ClipToBounds="True" />
         </Grid>
 
-        <!-- 右：参数 -->
+        <!-- 中：来源 / 形状 / 自测 -->
         <Border Grid.Column="1" Width="340" Background="#FFF5F5F5" BorderBrush="#FFCCCCCC" BorderThickness="1,0,0,0">
             <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="12">
                 <StackPanel>
@@ -30,32 +29,13 @@
                     <TextBlock Text="接触来源：" Margin="0,6,0,0" Foreground="#FF444444" />
                     <ComboBox x:Name="SourceModeCombo" SelectedIndex="0" Margin="0,4,0,0" SelectionChanged="OnSourceModeChanged">
                         <ComboBoxItem Content="自适应（自动锁定）" />
-                        <ComboBoxItem Content="原始HID（设备上报）" />
-                        <ComboBoxItem Content="WPF TouchPoint.Bounds" />
+                        <ComboBoxItem Content="原始HID·RawInput（设备上报尺寸）" />
+                        <ComboBoxItem Content="原始HID·SetupAPI（设备上报尺寸）" />
+                        <ComboBoxItem Content="软件HID（HID 数据 + 软件推算）" />
+                        <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                     </ComboBox>
                     <TextBlock x:Name="SourceInfoText" Text="当前来源: 无" Margin="0,6,0,0" FontFamily="Consolas"
                                FontSize="11" Foreground="#FF0A5A9A" TextWrapping="Wrap" />
-
-                    <TextBlock x:Name="HidScaleText" Text="HID 计数标定: 未标定" Margin="0,6,0,0" FontFamily="Consolas"
-                               FontSize="11" Foreground="#FF0A5A9A" TextWrapping="Wrap" />
-                    <TextBlock Text="设备只给逻辑计数、不给物理单位时，用①的手掌面积标定「1 计数 = 多少 mm」"
-                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="0,2,0,0" />
-                    <Button Content="标定 HID 计数→mm（用①的手掌面积）" Margin="0,6,0,0" Padding="4,3"
-                            Click="OnCalibrateHidScale" />
-
-                    <TextBlock Text="无触摸硬件时自测（手动比例 + 注入模拟计数）" Margin="0,12,0,0" TextWrapping="Wrap"
-                               FontSize="11" Foreground="#FF888888" />
-                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
-                        <TextBlock Text="1 计数 =" VerticalAlignment="Center" />
-                        <TextBox x:Name="ScaleInput" Width="56" Text="0.5" Margin="4,0" VerticalContentAlignment="Center" />
-                        <TextBlock Text="mm" VerticalAlignment="Center" />
-                        <Button Content="应用比例" Margin="8,0,0,0" Padding="8,2" Click="OnApplyManualScale" />
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                        <TextBlock Text="模拟计数 =" VerticalAlignment="Center" />
-                        <TextBox x:Name="SimCountInput" Width="56" Text="200" Margin="4,0" VerticalContentAlignment="Center" />
-                        <Button Content="注入" Margin="8,0,0,0" Padding="8,2" Click="OnInjectSyntheticCount" />
-                    </StackPanel>
 
                     <TextBlock Text="擦除形状：" Margin="0,12,0,0" Foreground="#FF444444" />
                     <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
@@ -63,51 +43,100 @@
                         <RadioButton x:Name="ShapeCircle" Content="正圆（等面积）" GroupName="Shape" Margin="12,0,0,0" Checked="OnShapeChanged" />
                     </StackPanel>
 
-                    <GroupBox Header="倍率" Margin="0,12,0,0">
+                    <!-- 保存结果到文件（宿主窗口订阅 SaveRequested 落盘） -->
+                    <Border Height="1" Background="#FFCCCCCC" Margin="0,12,0,10" />
+                    <Button Content="保存结果到文件" Padding="14,5" HorizontalAlignment="Left"
+                            Click="OnSaveRequested" />
+                    <TextBlock x:Name="SavePathText" Margin="0,8,0,0" FontSize="11"
+                               Foreground="#FF888888" TextWrapping="Wrap" />
+
+                    <!-- 底部：HID 原始信息回显（驱动实际报了什么，全量列出） -->
+                    <Expander Header="HID 信息 / 面积对比（驱动上报原始值）" Margin="0,14,0,0" IsExpanded="True"
+                              Foreground="#FF1E1E1E">
+                        <Border Background="#FFEDEDED" BorderBrush="#FFCCCCCC" BorderThickness="1"
+                                Padding="8" Margin="0,6,0,0">
+                            <TextBlock x:Name="HidInfoText" FontFamily="Consolas" FontSize="11"
+                                       Foreground="#FF0A5A9A" TextWrapping="Wrap"
+                                       Text="在预览区按一下：顶部「面积对比」并排显示 原始HID Width×Height 与 WPF 接触框 的面积与偏差；下方列出驱动实际上报的状态 / 坐标 / 尺寸 / 接触ID / 手指数 / 压感 / 换算表。" />
+                        </Border>
+                    </Expander>
+                </StackPanel>
+            </ScrollViewer>
+        </Border>
+
+        <!-- 右：倍率 / 阈值 / 开关 / 预览信息（原中间列的下半部分） -->
+        <Border Grid.Column="2" Width="380" Background="#FFF5F5F5" BorderBrush="#FFCCCCCC" BorderThickness="1,0,0,0">
+            <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="12">
+                <StackPanel>
+                    <GroupBox Header="倍率设置    √(手掌描摹长 x 宽 ÷ 手掌按压面积)">
                         <StackPanel Margin="6">
-                            <TextBlock Text="自动 = √(手掌面积 a ÷ 本页按压峰值 b)，自动计算" TextWrapping="Wrap"
-                                       FontSize="11" Foreground="#FF888888" />
-                            <TextBlock x:Name="RatioText" Margin="0,4,0,0" FontFamily="Consolas" FontSize="12"
+                            <TextBlock x:Name="RatioText" FontFamily="Consolas" FontSize="12"
                                        Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="…" />
-                            <TextBlock Text="微调（在自动基础上再乘）" Margin="0,8,0,0" Foreground="#FF444444" />
+                            <TextBlock Text="微调（在自动基础上再乘）" Foreground="#FF444444" />
                             <Slider x:Name="RatioTrimSlider" Minimum="0.5" Maximum="1.5" Value="1"
                                     TickFrequency="0.01" ValueChanged="OnRatioTrimChanged" />
                         </StackPanel>
                     </GroupBox>
 
-                    <GroupBox Header="面积阈值（手掌擦 / 书写）" Margin="0,10,0,0">
+                    <GroupBox Header="面积阈值    手掌擦/书写 (手掌按压面积 + 手指按压面积) ÷ 2">
                         <StackPanel Margin="6">
-                            <TextBlock Text="由标定自动得出：(手掌按压 + 手指按压) ÷ 2" TextWrapping="Wrap"
-                                       FontSize="11" Foreground="#FF888888" />
-                            <TextBlock x:Name="AreaThresholdText" Margin="0,4,0,0" FontFamily="Consolas" FontSize="12"
+                            <TextBlock x:Name="AreaThresholdText" FontFamily="Consolas" FontSize="12"
                                        Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="—" />
-                            <TextBlock Text="微调" Margin="0,8,0,0" Foreground="#FF444444" />
+                            <TextBlock Text="微调" Foreground="#FF444444" />
                             <Slider x:Name="AreaTrimSlider" Minimum="0.5" Maximum="1.5" Value="1"
                                     TickFrequency="0.01" ValueChanged="OnAreaTrimChanged" />
                         </StackPanel>
                     </GroupBox>
 
-                    <GroupBox Header="压感阈值" Margin="0,10,0,0">
+                    <GroupBox Header="压感阈值    开启''手掌擦启用压感''后超过此数会放大" >
                         <StackPanel Margin="6">
-                            <TextBlock Text="由手掌按压时的压感自动得出" TextWrapping="Wrap"
-                                       FontSize="11" Foreground="#FF888888" />
-                            <TextBlock x:Name="PressureThresholdText" Margin="0,4,0,0" FontFamily="Consolas" FontSize="12"
+                            <TextBlock x:Name="PressureThresholdText" FontFamily="Consolas" FontSize="12"
                                        Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="—" />
-                            <TextBlock Text="微调" Margin="0,8,0,0" Foreground="#FF444444" />
+                            <TextBlock Text="微调" Foreground="#FF444444" />
                             <Slider x:Name="PressureTrimSlider" Minimum="0.5" Maximum="1.5" Value="1"
                                     TickFrequency="0.01" ValueChanged="OnPressureTrimChanged" />
                         </StackPanel>
                     </GroupBox>
 
-                    <CheckBox x:Name="FollowSizeCheck" Content="随接触尺寸变化（按多大擦多大）" IsChecked="True"
-                              Margin="0,10,0,0" Checked="OnFollowSizeChanged" Unchecked="OnFollowSizeChanged" />
-                    <CheckBox x:Name="FollowPressureCheck" Content="随压力变化（按多重擦多大）" IsChecked="False"
-                              Margin="0,6,0,0" Checked="OnFollowPressureChanged" Unchecked="OnFollowPressureChanged" />
-                    <CheckBox x:Name="AreaThresholdCheck" Content="启用面积阈值（关闭则永远手掌擦）" IsChecked="True"
+                    <CheckBox x:Name="LockPalmSizeCheck" Content="禁止手掌擦缩小（擦时只增不减）" IsChecked="False"
+                              Margin="0,10,0,0" Checked="OnLockPalmSizeChanged" Unchecked="OnLockPalmSizeChanged" />
+                    <TextBlock Text="勾上后：同一次按压内擦除区只增不减；且一旦判为手掌擦，面积掉到阈值以下也保持手掌擦，直到抬手。"
+                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
+
+                    <CheckBox x:Name="AreaThresholdCheck" Content="启用面积阈值控制 擦/写" IsChecked="True"
                               Margin="0,10,0,0" Checked="OnAreaThresholdChanged" Unchecked="OnAreaThresholdChanged" />
-                    <CheckBox x:Name="WritingPressureCheck" Content="书写启用压感（关闭则模拟 512/1024）" IsChecked="True"
-                              Margin="0,6,0,0" Checked="OnWritingPressureChanged" Unchecked="OnWritingPressureChanged" />
-                    <TextBlock x:Name="JudgeText" Margin="0,6,0,0" FontFamily="Consolas" FontSize="12"
+                    <TextBlock Text="关闭则一律按手掌擦（不再区分书写）。"
+                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
+
+                    <CheckBox x:Name="FollowSizeCheck" Content="手掌擦启用触摸尺寸跟随（按多大擦多大）" IsChecked="True"
+                              Margin="0,10,0,0" Checked="OnFollowSizeChanged" Unchecked="OnFollowSizeChanged" />
+                    <TextBlock Text="关闭则擦除区固定为手掌面积，不随接触大小变。"
+                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
+
+                    <CheckBox x:Name="WritingFollowSizeCheck" Content="书写启用触摸尺寸跟随" IsChecked="False"
+                              Margin="0,10,0,0" Checked="OnWritingFollowSizeChanged" Unchecked="OnWritingFollowSizeChanged" />
+                    <TextBlock Text="勾上后：书写点大小 = 基础点大小 × √(接触面积 ÷ 手掌按压面积) —— 接触越大多大，再叠加压感；关闭则书写点恒定（只随压感）。"
+                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
+
+                    <GroupBox Header="压感" Margin="0,10,0,0">
+                        <StackPanel Margin="6">
+                            <CheckBox x:Name="FollowPressureCheck" Content="手掌擦启用压感" IsChecked="False"
+                                      Checked="OnFollowPressureChanged" Unchecked="OnFollowPressureChanged" />
+                            <TextBlock x:Name="PressureGainText" Margin="12,4,0,0" FontFamily="Consolas" FontSize="11"
+                                       Foreground="#FF0A5A9A" Text="随压力倍数 ×1.00" />
+                            <Slider x:Name="PressureGainSlider" Minimum="0.5" Maximum="1.5" Value="1"
+                                    Margin="12,0,0,0" TickFrequency="0.01" ValueChanged="OnPressureGainChanged" />
+
+                            <CheckBox x:Name="WritingPressureCheck" Content="书写启用压感（关闭则模拟 512/1024）" IsChecked="True"
+                                      Margin="0,8,0,0" Checked="OnWritingPressureChanged" Unchecked="OnWritingPressureChanged" />
+                            <TextBlock x:Name="WritingGainText" Margin="12,4,0,0" FontFamily="Consolas" FontSize="11"
+                                       Foreground="#FF0A5A9A" Text="书写压感倍数 ×1.00" />
+                            <Slider x:Name="WritingGainSlider" Minimum="0" Maximum="2" Value="1"
+                                    Margin="12,0,0,0" TickFrequency="0.05" ValueChanged="OnWritingGainChanged" />
+                        </StackPanel>
+                    </GroupBox>
+
+                    <TextBlock x:Name="JudgeText" Margin="0,8,0,0" FontFamily="Consolas" FontSize="12"
                                Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="判定：—" />
                     <Button Content="清除预览" Margin="0,10,0,0" Padding="4,3" Click="OnClearPreview" />
 

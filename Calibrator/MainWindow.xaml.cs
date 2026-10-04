@@ -1,11 +1,10 @@
-using System.Text;
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Ink;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
-using System.Windows.Threading;
 using TouchErase.Calibrator.Eraser;
 
 namespace TouchErase.Calibrator;
@@ -24,7 +23,8 @@ public partial class MainWindow : Window
     };
 
     private readonly TouchInput _touch = new();
-    private readonly CalibrationResult _result = new();
+    private readonly HidSetupReader _hidSetup = new();
+    private CalibrationResult _result = new();
 
     private ScreenCalibration? _calib;
     private EdidSize _edid = new(0, 0);
@@ -39,13 +39,6 @@ public partial class MainWindow : Window
     private double _drawnLenDiu;
     private double _drawnMmPerPx;          // 画线推得的 mm/物理像素（未含微调）
     private Line? _userDrawLine, _progLine;
-
-    // 压感诊断
-    private double? _lastPressure01;
-    private int? _lastPressureRaw;
-    private string _lastPressureRange = "";
-    private string _lastPressureSource = "";
-    private double _pressureMin = double.MaxValue, _pressureMax = double.MinValue;
 
     // 手掌擦预览（整套在 Eraser/EraserPreviewPage + EraserEngine 里）
     private readonly List<EdidSize> _edidCandidates = new();
@@ -84,7 +77,10 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         Loaded += OnLoaded;
-        Closed += (_, _) => _touch.Dispose();
+        Closed += (_, _) => { _touch.Dispose(); _hidSetup.Dispose(); };
+
+        // 「保存结果到文件」按钮在预览页里（EraserPreviewPage.xaml），宿主只负责落盘
+        EraserPage.SaveRequested += OnSaveRequested;
 
         // 默认两项都判"准"（对应界面 RadioButton 的默认选中），首次标尺即按 EDID 原样
         _result.WidthRulerOk = true;
@@ -144,17 +140,118 @@ public partial class MainWindow : Window
         _touch.AttachFallback(FingerHost);
         _touch.AttachFallback(EraserPage.HostElement);
 
-        // 面积擦预览：状态回显到底部状态栏；标定结果同步给触摸层（原始HID 计数→mm）
+        // SetupAPI 直读触摸屏 HID：触摸屏（真实数字化器）在 RawInput 里不可见，
+        // 这里按 GUID_DEVINTERFACE_HID 直接打开设备读报告，拿到驱动上报的 Width/Height 真面积。
+        _hidSetup.Sample += OnSample;
+        _hidSetup.Start();
+        Log.Flush();   // 探测结果立即落盘：HID 直读是否成功是排查关键，别等退出才写
+
+        // 驱动声明的能力 / 换算表：喂给预览页底部的 HID 信息面板。
+        // 优先用 SetupAPI 真 HID 的声明（那才是触摸屏本体）；拿不到才退回 RawInput 的结果。
+        bool hidOk = _hidSetup.Found;
+        EraserPage.SetHidCapabilities(
+            hidOk ? _hidSetup.DeviceName : _touch.DeviceName,
+            _touch.MaxContactsDeclared,
+            _touch.LinkCollectionCount,
+            hidOk ? _hidSetup.DeclaresSize : _touch.HasWidthUsage,
+            hidOk ? _hidSetup.DeclaresSize : _touch.HasHeightUsage,
+            hidOk ? _hidSetup.DeclaresPressure : _touch.HasPressureUsage,
+            _touch.HasContactIdUsage, _touch.HasTipSwitchUsage,
+            hidOk ? _hidSetup.WScaleText : _touch.WScaleText,
+            hidOk ? _hidSetup.HScaleText : _touch.HScaleText,
+            _touch.UnreadUsages);
+
+        // WM_POINTER 设备属性探测：触摸屏（Digitizer）真身走这条路，RawInput 扫不到它。
+        // 这里把每个 Pointer 设备的全部 HID 属性列出来，判断它报不报接触尺寸 / 有没有换算表。
+        PointerProbe.Run();
+        Log.Info("Pointer 设备探测:\n" + PointerProbe.Report);
+        EraserPage.SetPointerProbe(PointerProbe.Report,
+            PointerProbe.TouchDeviceNames, PointerProbe.AnyDeclaresSize, PointerProbe.AnyDeclaresPressure);
+
+        // 面积擦预览：状态回显到底部状态栏
         EraserPage.Status += SetStatus;
-        EraserPage.Engine.Changed += SyncCountsScale;
 
-        _result.DeviceName = _touch.DeviceName;
-        Log.Info($"触摸屏: {_touch.DeviceName} | 声明接触尺寸={_touch.TouchDeclaresSize} | 声明压感={_touch.TouchDeclaresPressure}");
-        SetStatus(_touch.TouchDeclaresSize
-            ? $"触摸屏声明接触尺寸 ✓{( _touch.TouchDeclaresPressure ? "，支持压感 ✓" : "，无压感")}"
-            : "触摸屏未上报接触尺寸（可能拿不到面积）");
+        _result.DeviceName = hidOk ? _hidSetup.DeviceName : _touch.DeviceName;
+        Log.Info($"触摸屏(SetupAPI): {_hidSetup.DeviceName} | 找到={hidOk} | 声明接触尺寸={_hidSetup.DeclaresSize} | 声明压感={_hidSetup.DeclaresPressure}");
+        Log.Info($"触摸屏(RawInput): {_touch.DeviceName} | 声明接触尺寸={_touch.TouchDeclaresSize} | 声明压感={_touch.TouchDeclaresPressure}");
+        if (!string.IsNullOrEmpty(_hidSetup.DiagSummary))
+            Log.Info("HID(SetupAPI) 诊断: " + _hidSetup.DiagSummary);
+        if (!string.IsNullOrEmpty(_touch.DiagSummary))
+            Log.Info("触摸设备诊断:\n" + _touch.DiagSummary);
+        bool sizeOk = hidOk ? _hidSetup.DeclaresSize : _touch.TouchDeclaresSize;
+        bool pressOk = hidOk ? _hidSetup.DeclaresPressure : _touch.TouchDeclaresPressure;
+        SetStatus(hidOk
+            ? $"触摸屏 HID 直读成功：{_hidSetup.DeviceName}（{(sizeOk ? "上报接触尺寸 ✓" : "未报尺寸")}{(pressOk ? "，支持压感 ✓" : "，无压感")}）"
+            : sizeOk
+                ? $"触摸屏声明接触尺寸 ✓{(pressOk ? "，支持压感 ✓" : "，无压感")}"
+                : "触摸屏未上报接触尺寸（可能拿不到面积）");
 
-        ShowStep(0);
+        // 启动时若存在上次保存的标定，询问是否载入（载入则直接跳到结果页）
+        if (!TryLoadSaved())
+            ShowStep(0);
+    }
+
+    /// <summary>启动时若已保存过标定，弹窗询问是否载入；载入成功则跳到结果页并返回 true。</summary>
+    private bool TryLoadSaved()
+    {
+        string path = CalibrationResult.DefaultPath();
+        if (!File.Exists(path))
+            return false;
+
+        CalibrationResult? saved = CalibrationResult.Load(path);
+        string stamp = saved?.Timestamp is { Length: > 0 } ts ? ts : "（无时间戳）";
+        MessageBoxResult answer = MessageBox.Show(
+            $"检测到上次保存的标定：\n{path}\n保存时间：{stamp}\n\n是否载入？\n\n【是】载入并直接跳到结果页（可查看面积擦预览）\n【否】从第 1 步重新标定",
+            "TouchErase 校准向导 · 载入标定", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (answer != MessageBoxResult.Yes)
+        {
+            Log.Info("启动：用户选择重新标定（不载入)");
+            return false;
+        }
+
+        if (saved is null)
+        {
+            MessageBox.Show("载入失败：文件损坏或格式不正确。", "TouchErase 校准向导",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            Log.Warn($"启动载入失败（解析错误）: {path}");
+            return false;
+        }
+
+        ApplyLoaded(saved);
+        Log.Info($"启动载入已保存标定: {path}（{stamp}）");
+        ShowStep(6);
+        SetStatus("已载入上次保存的标定；要重来请点「上一步」回到前面的步骤，或直接在本页查看预览。");
+        return true;
+    }
+
+    /// <summary>把载入的标定灌回界面与校准状态（物理尺寸 / 手掌尺寸 / 阈值 / 微调）。</summary>
+    private void ApplyLoaded(CalibrationResult saved)
+    {
+        _result = saved;
+        _sizeSource = saved.SizeSource;
+        _edid = new EdidSize(saved.EdidWidthMm, saved.EdidHeightMm);
+        if (!_edidCandidates.Contains(_edid))
+            _edidCandidates.Add(_edid);
+
+        if (saved.PalmWidthCm > 0) PalmWidthInput.Text = Precision.Fmt(saved.PalmWidthCm);
+        if (saved.PalmHeightCm > 0) PalmHeightInput.Text = Precision.Fmt(saved.PalmHeightCm);
+
+        // 建立标尺用的 ScreenCalibration，然后用保存的 mm/px 覆盖（对角线 / 手画尺子时推不出来）
+        RebuildCalibration();
+        if (saved.MmPerPxX > 0 && saved.MmPerPxY > 0)
+        {
+            _result.MmPerPxX = saved.MmPerPxX;
+            _result.MmPerPxY = saved.MmPerPxY;
+            _mmPerDiuX = saved.MmPerPxX * _dpiScaleX;
+            _mmPerDiuY = saved.MmPerPxY * _dpiScaleY;
+        }
+
+        // 恢复第 7 步的阈值微调，保证「生效阈值」和保存时一致
+        EraserPage.ApplyTrims(saved.AreaThresholdTrim, saved.PressureThresholdTrim);
+        // 恢复预览页的开关/滑块/形状（老版本 JSON 无这些字段时保持默认）
+        EraserPage.ApplySettings(saved.FollowSize, saved.LockPalmSize, saved.FollowPressure, saved.PressureGain,
+            saved.AreaThresholdEnabled, saved.WritingUsesPressure, saved.WritingPressureGain,
+            saved.RatioTrim, saved.EraserShape, saved.WritingFollowSize);
     }
 
     private void UpdateDpi()
@@ -660,33 +757,26 @@ public partial class MainWindow : Window
             Log.Info($"样本[{StepTitles[_step]}] {Describe(s)}");
         }
 
-        // 压感诊断：实时压感有 ~60Hz，信息栏节流刷新才看得清
-        if (s.Pressure01 is double pv)
+        // 信息栏节流刷新（内容都是标定值；节流只为避免每帧刷）
+        if (nowTicks - _lastInfoBarTicks >= 300)
         {
-            _lastPressure01 = pv;
-            _lastPressureRaw = s.PressureRaw;
-            _lastPressureRange = s.PressureRange;
-            _lastPressureSource = s.Source;
-            if (pv < _pressureMin) _pressureMin = pv;
-            if (pv > _pressureMax) _pressureMax = pv;
-            if (nowTicks - _lastInfoBarTicks >= 300)
-            {
-                _lastInfoBarTicks = nowTicks;
-                RefreshInfoBar();
-            }
+            _lastInfoBarTicks = nowTicks;
+            RefreshInfoBar();
         }
 
         if (_step == 6)
         {
+            // 信息栏的「当前接触 / 当前压感」在最后一页也要更新（原来这一步提前 return，值永远为 —）
+            if (s.AreaMm2 is double la6) _liveAreaMm2 = la6;
+            if (s.Pressure01 is double lp6) _livePressure = lp6;
             EraserPage.SubmitSample(s);
-            SyncCountsScale();
             return;
         }
 
         if (_step != 4 && _step != 5)
             return;
 
-        if (s.Source == "RawHID")
+        if (s.Source is "RawHID" or "HidSetup")
             _lastRawHidTicks = nowTicks;
 
         // 当前步骤选定的接触来源（自适应 / 原始HID / WM_POINTER / WPF）
@@ -741,8 +831,9 @@ public partial class MainWindow : Window
     /// <summary>把原始来源名合并成"逻辑来源"（WPF 面积 与 Stylus 压感同属 WPF 通路）。</summary>
     private static string LogicalSource(string src) => src switch
     {
-        "RawHID" => "原始HID（设备上报）",
-        "WPF" or "STYLUS" => "WPF 通路（Touch 面积 + Stylus 压感）",
+        "HidSetup" => "原始HID·SetupAPI 直读（设备上报尺寸）",
+        "RawHID" => "原始HID·RawInput（设备上报尺寸）",
+        "WPF" or "STYLUS" => "软件WPF（系统接触框 + 软件推算）",
         _ => src.Length > 0 ? src : "—",
     };
 
@@ -752,23 +843,28 @@ public partial class MainWindow : Window
         if (mode != 0)
             return mode switch
             {
-                1 => "原始HID（设备上报）",
-                2 => "WPF 通路（Touch 面积 + Stylus 压感）",
+                1 => "原始HID·RawInput（设备上报尺寸）",
+                2 => "原始HID·SetupAPI 直读（设备上报尺寸）",
+                3 => "软件HID（HID 数据 + 软件推算）",
+                4 => "软件WPF（系统接触框 + 软件推算）",
                 _ => "—",
             };
         return active.Length > 0 ? LogicalSource(active) : "自适应：识别中…";
     }
 
-    /// <summary>该来源在当前选择下是否参与标定采样。</summary>
+    /// <summary>该来源在当前选择下是否参与标定采样。mode：0=自适应 1=RawInput 2=SetupAPI 3=软件HID 4=软件WPF。</summary>
     private bool Accept(int mode, TouchSample s, long now)
     {
         switch (mode)
         {
-            case 1: return s.Source == "RawHID";
-            case 2: return s.Source is "WPF" or "STYLUS";
+            case 1: return s.Source is "RawHID";
+            case 2: return s.Source is "HidSetup";
+            case 3: // 软件HID：RawInput 优先、SetupAPI 兜底
+                return s.Source is "RawHID" or "HidSetup";
+            case 4: return s.Source is "WPF" or "STYLUS";
             default: // 自适应：有原始HID 就用它；否则用 WPF 通路（Touch 面积 + Stylus 压感）
                 return now - _lastRawHidTicks <= 500
-                    ? s.Source == "RawHID"
+                    ? s.Source is "RawHID" or "HidSetup"
                     : s.Source is "WPF" or "STYLUS";
         }
     }
@@ -825,10 +921,11 @@ public partial class MainWindow : Window
     private static string Describe(TouchSample s)
     {
         string area = s.AreaMm2 is double a ? Precision.Fmt(a, 0) + " mm²" : "无尺寸";
+        string multi = s.Contacts is { Count: > 1 } cs ? $"（{cs.Count} 指）" : "";
         string p = s.Pressure01 is double v ? $"，压感 {Precision.Fmt(v, 2)}" : "";
         if (s.PressureRaw is int raw)
             p += $"（原生 {raw} / {s.PressureRange}）";
-        return $"[{s.Source}] {area}{p}";
+        return $"[{s.Source}]{multi} {area}{p}";
     }
 
     private static string FmtArea(double? a) => a is double v ? Precision.Fmt(v, 0) + " mm²" : "—";
@@ -882,36 +979,20 @@ public partial class MainWindow : Window
         Log.Info($"标定结果: 手掌={FmtArea(_result.PalmContactAreaMm2)} 手指={FmtArea(_result.FingerContactAreaMm2)} "
                  + $"→ 面积阈值={FmtArea(_result.ThresholdAreaMm2)} 压感阈值={(_result.PressureThreshold is double prv ? Precision.Fmt(prv, 2) : "无")}");
 
-        var sb = new StringBuilder();
-        sb.Append($"推算方式: {_result.SizeMode}    分辨率: {_result.ResX}×{_result.ResY}\n");
-        sb.Append($"物理尺寸: {_result.EdidWidthMm}×{_result.EdidHeightMm} mm（来源: {_result.SizeSource}"
-            + (_result.DiagonalInch is double di ? $"，{di:0.#} 英寸" : "") + $")    mm/px: {Precision.Fmt(_result.MmPerPxX)}×{Precision.Fmt(_result.MmPerPxY)}\n");
-        sb.Append($"横10cm准: {(_result.WidthRulerOk ? "是" : "否")}    竖10cm准: {(_result.HeightRulerOk ? "是" : "否")}\n");
-        sb.Append($"手掌尺寸: {Precision.Fmt(_result.PalmWidthCm)} × {Precision.Fmt(_result.PalmHeightCm)} cm = {Precision.Fmt(_result.PalmAreaCm2)} cm²\n");
-        sb.Append($"手掌按压面积: {FmtArea(_result.PalmContactAreaMm2)}{FmtPressure(_result.PalmPressure)}\n");
-        sb.Append($"手指按压面积: {FmtArea(_result.FingerContactAreaMm2)}{FmtPressure(_result.FingerPressure)}\n");
-        sb.Append($"★ 手掌擦 / 书写 判定阈值（面积）= (手掌 + 手指) / 2 = {FmtArea(_result.ThresholdAreaMm2)}\n");
-        sb.Append($"★ 压感阈值 = {(_result.PressureThreshold is double pt ? Precision.Fmt(pt, 2) : "无压感 / 未采到")}");
-        sb.Append("    ← 以上为自动值；可在第 7 步「倍率 / 面积阈值 / 压感阈值」框里用滑块微调，保存时取微调后的生效值");
-        ResultText.Text = sb.ToString();
-
         RefreshInfoBar();
         SyncEraserPage();
     }
 
-    /// <summary>把标定结果喂给面积擦预览页，并把「计数→mm」同步给触摸层。</summary>
+    /// <summary>把标定结果喂给面积擦预览页。</summary>
     private void SyncEraserPage()
     {
         double aspect = _result.PalmHeightCm > 0 ? _result.PalmWidthCm / _result.PalmHeightCm : 0;
         EraserPage.Setup(_mmPerDiuX, _mmPerDiuY, _result.PalmAreaCm2, aspect,
-            _result.ThresholdAreaMm2 ?? 0, _result.PressureThreshold);
-        _touch.CountsToMmScale = EraserPage.Engine.CountsToMmScale;
+            _result.ThresholdAreaMm2 ?? 0, _result.PressureThreshold,
+            _result.PalmContactAreaMm2 ?? 0);
     }
 
-    private void SyncCountsScale()
-        => _touch.CountsToMmScale = EraserPage.Engine.CountsToMmScale;
-
-    private void OnSave(object sender, RoutedEventArgs e)
+    private void OnSaveRequested()
     {
         try
         {
@@ -922,15 +1003,29 @@ public partial class MainWindow : Window
             _result.PressureThresholdTrim = eng.PressureThresholdTrim;
             _result.PressureThresholdEffective = eng.PressureThresholdBase is double ? eng.EffectivePressureThreshold : null;
 
+            // 预览页的开关/滑块/形状：保存界面设置，供主程序按同一套参数工作
+            var set = EraserPage.SettingsSnapshot;
+            _result.FollowSize = set.FollowSize;
+            _result.LockPalmSize = set.LockPalmSize;
+            _result.FollowPressure = set.FollowPressure;
+            _result.PressureGain = set.PressureGain;
+            _result.AreaThresholdEnabled = set.AreaThresholdEnabled;
+            _result.WritingUsesPressure = set.WritingUsesPressure;
+            _result.WritingPressureGain = set.WritingPressureGain;
+            _result.WritingFollowSize = set.WritingFollowSize;
+            _result.RatioTrim = set.RatioTrim;
+            _result.EraserShape = set.Shape;
+
             string path = CalibrationResult.DefaultPath();
             _result.Save(path);
-            SavePathText.Text = "已保存到：" + path;
+            EraserPage.SavePathNotice = "已保存到：" + path;
             SetStatus("结果已保存。");
-            Log.Info($"结果已保存: {path}");
+            Log.Info($"结果已保存: {path}（随尺寸={set.FollowSize} 锁定={set.LockPalmSize} 随压力={set.FollowPressure} "
+                     + $"面积阈值开关={set.AreaThresholdEnabled} 书写压感={set.WritingUsesPressure} 形状={set.Shape}）");
         }
         catch (Exception ex)
         {
-            SavePathText.Text = "保存失败：" + ex.Message;
+            EraserPage.SavePathNotice = "保存失败：" + ex.Message;
             SetStatus("保存失败。");
             Log.Error("结果保存失败: " + ex);
         }
@@ -946,35 +1041,25 @@ public partial class MainWindow : Window
             return;
         }
 
-        var sb = new StringBuilder();
-        sb.Append($"EDID 物理: {_calib.Edid.WidthMm} × {_calib.Edid.HeightMm} mm（来源: {_sizeSource}）    分辨率: {_calib.ResX} × {_calib.ResY}    推算方式: {_result.SizeMode}");
-        if (_edidCandidates.Count > 1)
-            sb.Append($"    在用显示器 EDID 候选 {_edidCandidates.Count} 块: {string.Join(" / ", _edidCandidates.Select(c => $"{c.WidthMm}×{c.HeightMm}"))}");
-        sb.Append('\n');
-        sb.Append($"mm/px: {Precision.Fmt(_calib.MmPerPxX)} × {Precision.Fmt(_calib.MmPerPxY)}    屏幕物理: {_calib.ScreenWidthMm:0.0} × {_calib.ScreenHeightMm:0.0} mm");
-        sb.Append($"    横10cm: {Yes(_result.WidthRulerOk)}    竖10cm: {Yes(_result.HeightRulerOk)}\n");
-
-        sb.Append($"手掌: {Precision.Fmt(_result.PalmWidthCm)} × {Precision.Fmt(_result.PalmHeightCm)} cm = {Precision.Fmt(_result.PalmAreaCm2)} cm²");
-        if (_result.PalmContactAreaMm2 is double pa) sb.Append($"    手掌按压: {Precision.Fmt(pa, 0)} mm²{FmtPressure(_result.PalmPressure)}");
-        if (_result.FingerContactAreaMm2 is double fa) sb.Append($"    手指按压: {Precision.Fmt(fa, 0)} mm²{FmtPressure(_result.FingerPressure)}");
-        if (_result.ThresholdAreaMm2 is double th) sb.Append($"    ★阈值: {Precision.Fmt(th, 0)} mm²");
-
-        // 压感诊断（判断"压感一直是 1"是设备还是映射问题）
-        if (_lastPressure01 is double lp)
-        {
-            string rng = _pressureMin == _pressureMax
-                ? $"恒定 {Precision.Fmt(_pressureMin, 2)}（原生值不随力度变化 → 该设备压感是示性/饱和的，非真实压感）"
-                : $"范围 {Precision.Fmt(_pressureMin, 2)} ~ {Precision.Fmt(_pressureMax, 2)}（随力度变化 → 压感可用）";
-            sb.Append($"\n压感: 原生 {(_lastPressureRaw?.ToString() ?? "—")} / {(_lastPressureRange == "" ? "—" : _lastPressureRange)}"
-                      + $" → {Precision.Fmt(lp, 2)}  [{_lastPressureSource}]    {rng}");
-        }
-        else
-        {
-            sb.Append("\n压感: 未采到（该设备/来源可能不支持压感）");
-        }
-
-        InfoBar.Text = sb.ToString();
+        InfoBar.Text =
+            // ① 屏幕：物理尺寸 / 来源 / 分辨率
+            $"显示屏尺寸：{_calib.ScreenWidthMm:0.0}毫米 × {_calib.ScreenHeightMm:0.0}毫米"
+            + $"    来源：{_sizeSource}：{_calib.Edid.WidthMm}毫米 × {_calib.Edid.HeightMm}毫米"
+            + $"    分辨率：{_calib.ResX}像素 × {_calib.ResY}像素\n"
+            // ② 推算方式 / 毫米每像素
+            + $"推算方式：横{Yes(_result.WidthRulerOk)} 竖{Yes(_result.HeightRulerOk)} {_result.SizeMode}"
+            + $"    毫米/像素：{Precision.Fmt(_calib.MmPerPxX)} × {Precision.Fmt(_calib.MmPerPxY)}\n"
+            // ③ 手掌 / 按压
+            + $"手掌描摹：宽{Precision.Fmt(_result.PalmWidthCm)} 高{Precision.Fmt(_result.PalmHeightCm)} 面积{Precision.Fmt(_result.PalmAreaCm2)}cm²"
+            + $"    手掌按压：面积{FmtArea(_result.PalmContactAreaMm2)} 压感{FmtPressureVal(_result.PalmPressure)}"
+            + $"    手指按压：面积{FmtArea(_result.FingerContactAreaMm2)} 压感{FmtPressureVal(_result.FingerPressure)}\n"
+            // ④ 阈值 + 当前实时值
+            + $"面积阈值：{FmtArea(_result.ThresholdAreaMm2)}"
+            + $"    当前接触：{(_liveAreaMm2 is double la ? Precision.Fmt(la, 1) + " mm²" : "—")}"
+            + $"    当前压感：{(_livePressure is double lp ? Precision.Fmt(lp, 2) : "—")}";
     }
+
+    private static string FmtPressureVal(double? p) => p is double v ? Precision.Fmt(v, 2) : "—";
 
     private static string Yes(bool b) => b ? "准" : "不准";
 

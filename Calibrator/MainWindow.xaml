@@ -164,8 +164,10 @@
                             <ComboBox x:Name="PalmSourceCombo" SelectedIndex="0" Margin="0,2,0,0"
                                       SelectionChanged="OnPalmSourceModeChanged">
                                 <ComboBoxItem Content="自适应（自动锁定）" />
-                                <ComboBoxItem Content="原始HID（设备上报）" />
-                                <ComboBoxItem Content="WPF（Touch 面积 + Stylus 压感）" />
+                                <ComboBoxItem Content="原始HID·RawInput（设备上报尺寸）" />
+                                <ComboBoxItem Content="原始HID·SetupAPI 直读（设备上报尺寸）" />
+                                <ComboBoxItem Content="软件HID（HID 数据 + 软件推算）" />
+                                <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                             </ComboBox>
                             <TextBlock x:Name="PalmSourceInfoText" FontFamily="Consolas" FontSize="11"
                                        Margin="0,4,0,0" Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="当前生效：—" />
@@ -197,8 +199,10 @@
                             <ComboBox x:Name="FingerSourceCombo" SelectedIndex="0" Margin="0,2,0,0"
                                       SelectionChanged="OnFingerSourceModeChanged">
                                 <ComboBoxItem Content="自适应（自动锁定）" />
-                                <ComboBoxItem Content="原始HID（设备上报）" />
-                                <ComboBoxItem Content="WPF（Touch 面积 + Stylus 压感）" />
+                                <ComboBoxItem Content="原始HID·RawInput（设备上报尺寸）" />
+                                <ComboBoxItem Content="原始HID·SetupAPI 直读（设备上报尺寸）" />
+                                <ComboBoxItem Content="软件HID（HID 数据 + 软件推算）" />
+                                <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                             </ComboBox>
                             <TextBlock x:Name="FingerSourceInfoText" FontFamily="Consolas" FontSize="11"
                                        Margin="0,4,0,0" Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="当前生效：—" />
@@ -212,22 +216,7 @@
 
             <!-- ⑦ 结果 + 面积擦预览（整套搬自原程序第③页） -->
             <Grid x:Name="Step6" Visibility="Collapsed">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="360" />
-                </Grid.ColumnDefinitions>
-
-                <e:EraserPreviewPage x:Name="EraserPage" Grid.Column="0" Margin="0,0,12,0" />
-
-                <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto">
-                    <StackPanel>
-                        <TextBlock Text="校准完成" FontSize="18" FontWeight="Bold" />
-                        <TextBlock x:Name="ResultText" FontFamily="Consolas" FontSize="12" Margin="0,12,0,0"
-                                   TextWrapping="Wrap" Foreground="#FF0A7A3A" />
-                        <Button Content="保存结果到文件" Margin="0,16,0,0" Padding="14,5" HorizontalAlignment="Left" Click="OnSave" />
-                        <TextBlock x:Name="SavePathText" Margin="0,8,0,0" FontSize="11" Foreground="#FF888888" TextWrapping="Wrap" />
-                    </StackPanel>
-                </ScrollViewer>
+                <e:EraserPreviewPage x:Name="EraserPage" />
             </Grid>
 
         </Grid>
