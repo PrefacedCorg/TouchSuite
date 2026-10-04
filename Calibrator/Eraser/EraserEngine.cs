@@ -17,7 +17,7 @@ public sealed class EraserEngine
     public const double MinContactMm = 0.1;       // 小于此物理尺寸视为"驱动未上报有效接触面积"（真手指/手掌远大于此，0.1 只为滤掉近 0 的占位值）
 
     private static readonly ContactSource[] PriorityOrder =
-        { ContactSource.RawHid, ContactSource.HidSetup, ContactSource.Wpf };
+        { ContactSource.Wpf };
 
     // ================= 由外部喂入 =================
 
@@ -235,37 +235,21 @@ public sealed class EraserEngine
             _tracks.Clear(); // 换来源就重置滤波，避免不同量纲互相污染
         }
 
-        // 原始HID（RawInput / SetupAPI 直读）= 设备直报的真值，不套 mm 阈值；其余（含软件HID/软件WPF）都用屏幕尺度过滤退化值
-        bool rawHid = eff is ContactSource.RawHid or ContactSource.HidSetup;
-        UpdateFromContact(contactId, rectDiu, applyThreshold: !rawHid);
+        // WPF 接触框是软件量纲（DIP），统一套 mm 阈值过滤退化值
+        UpdateFromContact(contactId, rectDiu, applyThreshold: true);
         Raise();
     }
 
     private bool IsUsable(ContactSource s, long now)
         => _state.TryGetValue(s, out var st) && st.Eligible && now - st.Time <= SourceFreshMs;
 
-    /// <summary>软件HID 模式下的数据源：RawInput 有货就用它，否则退回 SetupAPI 直读；都没有则 None。</summary>
-    private ContactSource PreferredHid(long now)
-    {
-        if (IsUsable(ContactSource.RawHid, now))
-            return ContactSource.RawHid;
-        if (IsUsable(ContactSource.HidSetup, now))
-            return ContactSource.HidSetup;
-        return ContactSource.None;
-    }
-
     /// <summary>手动指定则只认那一路；自适应则稳定识别后锁定。</summary>
     private ContactSource ResolveSource(long now)
     {
         if (Mode != SourceMode.Auto)
         {
-            // 软件HID 的数据源仍是 HID（RawInput 优先、SetupAPI 直读兜底），尺寸按软件推算；
-            // 软件WPF 走 WPF 框；RawInput / HidSetup 各自只认自己那一路真值。
             ContactSource want = Mode switch
             {
-                SourceMode.RawInput => ContactSource.RawHid,
-                SourceMode.HidSetup => ContactSource.HidSetup,
-                SourceMode.SoftwareHid => PreferredHid(now),
                 SourceMode.SoftwareWpf => ContactSource.Wpf,
                 _ => ContactSource.None,
             };

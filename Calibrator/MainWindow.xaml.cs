@@ -23,7 +23,6 @@ public partial class MainWindow : Window
     };
 
     private readonly TouchInput _touch = new();
-    private readonly HidSetupReader _hidSetup = new();
     private CalibrationResult _result = new();
 
     private ScreenCalibration? _calib;
@@ -65,9 +64,8 @@ public partial class MainWindow : Window
     private long _lastInfoBarTicks;     // 信息栏刷新节流（实时压感 60Hz，节流后才看得清）
     private double? _liveAreaMm2;       // 手掌/手指实时接触面积（来自 WPF Touch）
     private double? _livePressure;      // 手掌/手指实时压感（来自 WPF Stylus）
-    private int _palmSourceMode;        // 手掌：0=自适应 1=原始HID 2=WPF
+    private int _palmSourceMode;        // 手掌：0=自适应 1=软件WPF
     private int _fingerSourceMode;      // 手指：同上
-    private long _lastRawHidTicks;      // 原始HID 最近一次样本时刻（自适应判优用）
     private long _lastPressTicks;       // 上一次收到样本的时刻（判"抬手"用）
     private const long PressGapMs = 350;   // 静默超过此时长视为抬手，下一次样本算新的一次按压
     private string _palmActiveSource = "";     // 手掌当前实际生效的原始来源
@@ -77,7 +75,7 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         Loaded += OnLoaded;
-        Closed += (_, _) => { _touch.Dispose(); _hidSetup.Dispose(); };
+        Closed += (_, _) => _touch.Dispose();
 
         // 「保存结果到文件」按钮在预览页里（EraserPreviewPage.xaml），宿主只负责落盘
         EraserPage.SaveRequested += OnSaveRequested;
@@ -140,51 +138,12 @@ public partial class MainWindow : Window
         _touch.AttachFallback(FingerHost);
         _touch.AttachFallback(EraserPage.HostElement);
 
-        // SetupAPI 直读触摸屏 HID：触摸屏（真实数字化器）在 RawInput 里不可见，
-        // 这里按 GUID_DEVINTERFACE_HID 直接打开设备读报告，拿到驱动上报的 Width/Height 真面积。
-        _hidSetup.Sample += OnSample;
-        _hidSetup.Start();
-        Log.Flush();   // 探测结果立即落盘：HID 直读是否成功是排查关键，别等退出才写
-
-        // 驱动声明的能力 / 换算表：喂给预览页底部的 HID 信息面板。
-        // 优先用 SetupAPI 真 HID 的声明（那才是触摸屏本体）；拿不到才退回 RawInput 的结果。
-        bool hidOk = _hidSetup.Found;
-        EraserPage.SetHidCapabilities(
-            hidOk ? _hidSetup.DeviceName : _touch.DeviceName,
-            _touch.MaxContactsDeclared,
-            _touch.LinkCollectionCount,
-            hidOk ? _hidSetup.DeclaresSize : _touch.HasWidthUsage,
-            hidOk ? _hidSetup.DeclaresSize : _touch.HasHeightUsage,
-            hidOk ? _hidSetup.DeclaresPressure : _touch.HasPressureUsage,
-            _touch.HasContactIdUsage, _touch.HasTipSwitchUsage,
-            hidOk ? _hidSetup.WScaleText : _touch.WScaleText,
-            hidOk ? _hidSetup.HScaleText : _touch.HScaleText,
-            _touch.UnreadUsages);
-
-        // WM_POINTER 设备属性探测：触摸屏（Digitizer）真身走这条路，RawInput 扫不到它。
-        // 这里把每个 Pointer 设备的全部 HID 属性列出来，判断它报不报接触尺寸 / 有没有换算表。
-        PointerProbe.Run();
-        Log.Info("Pointer 设备探测:\n" + PointerProbe.Report);
-        EraserPage.SetPointerProbe(PointerProbe.Report,
-            PointerProbe.TouchDeviceNames, PointerProbe.AnyDeclaresSize, PointerProbe.AnyDeclaresPressure);
-
         // 面积擦预览：状态回显到底部状态栏
         EraserPage.Status += SetStatus;
 
-        _result.DeviceName = hidOk ? _hidSetup.DeviceName : _touch.DeviceName;
-        Log.Info($"触摸屏(SetupAPI): {_hidSetup.DeviceName} | 找到={hidOk} | 声明接触尺寸={_hidSetup.DeclaresSize} | 声明压感={_hidSetup.DeclaresPressure}");
-        Log.Info($"触摸屏(RawInput): {_touch.DeviceName} | 声明接触尺寸={_touch.TouchDeclaresSize} | 声明压感={_touch.TouchDeclaresPressure}");
-        if (!string.IsNullOrEmpty(_hidSetup.DiagSummary))
-            Log.Info("HID(SetupAPI) 诊断: " + _hidSetup.DiagSummary);
-        if (!string.IsNullOrEmpty(_touch.DiagSummary))
-            Log.Info("触摸设备诊断:\n" + _touch.DiagSummary);
-        bool sizeOk = hidOk ? _hidSetup.DeclaresSize : _touch.TouchDeclaresSize;
-        bool pressOk = hidOk ? _hidSetup.DeclaresPressure : _touch.TouchDeclaresPressure;
-        SetStatus(hidOk
-            ? $"触摸屏 HID 直读成功：{_hidSetup.DeviceName}（{(sizeOk ? "上报接触尺寸 ✓" : "未报尺寸")}{(pressOk ? "，支持压感 ✓" : "，无压感")}）"
-            : sizeOk
-                ? $"触摸屏声明接触尺寸 ✓{(pressOk ? "，支持压感 ✓" : "，无压感")}"
-                : "触摸屏未上报接触尺寸（可能拿不到面积）");
+        _result.DeviceName = "WPF 触摸通路";
+        Log.Info("接触来源：WPF TouchPoint.Bounds（面积）+ Stylus PressureFactor（压感）");
+        SetStatus("触摸来源：WPF 接触框 + 压感（按一下预览区即可看到面积）");
 
         // 启动时若存在上次保存的标定，询问是否载入（载入则直接跳到结果页）
         if (!TryLoadSaved())
@@ -776,19 +735,12 @@ public partial class MainWindow : Window
         if (_step != 4 && _step != 5)
             return;
 
-        if (s.Source is "RawHID" or "HidSetup")
-            _lastRawHidTicks = nowTicks;
-
-        // 当前步骤选定的接触来源（自适应 / 原始HID·RawInput / 原始HID·SetupAPI / 软件HID / 软件WPF）
+        // 当前步骤选定的接触来源（自适应 / 软件WPF）
         int mode = _step == 4 ? _palmSourceMode : _fingerSourceMode;
         if (!Accept(mode, s, nowTicks))
             return;
 
-        // 软件（屏幕尺度）推算口径：软件HID 模式下用屏幕标定把计数推算成面积，不依赖驱动的 W/H 换算表；
-        // 推算不可用（无 X/Y 量程）时退回设备上报值，保证向导不卡死。
-        double? area = mode == 3
-            ? SoftwareHidScale.AreaMm2(s, _mmPerDiuX, _mmPerDiuY) ?? s.AreaMm2
-            : s.AreaMm2;
+        double? area = s.AreaMm2;
         double? press = s.Pressure01;
         if (area is null && press is null)
             return;
@@ -835,8 +787,6 @@ public partial class MainWindow : Window
     /// <summary>把原始来源名合并成"逻辑来源"（WPF 面积 与 Stylus 压感同属 WPF 通路）。</summary>
     private static string LogicalSource(string src) => src switch
     {
-        "HidSetup" => "原始HID·SetupAPI 直读（设备上报尺寸）",
-        "RawHID" => "原始HID·RawInput（设备上报尺寸）",
         "WPF" or "STYLUS" => "软件WPF（系统接触框 + 软件推算）",
         _ => src.Length > 0 ? src : "—",
     };
@@ -847,30 +797,19 @@ public partial class MainWindow : Window
         if (mode != 0)
             return mode switch
             {
-                1 => "原始HID·RawInput（设备上报尺寸）",
-                2 => "原始HID·SetupAPI 直读（设备上报尺寸）",
-                3 => "软件HID（HID 数据 + 软件推算）",
-                4 => "软件WPF（系统接触框 + 软件推算）",
+                1 => "软件WPF（系统接触框 + 软件推算）",
                 _ => "—",
             };
         return active.Length > 0 ? LogicalSource(active) : "自适应：识别中…";
     }
 
-    /// <summary>该来源在当前选择下是否参与标定采样。mode：0=自适应 1=RawInput 2=SetupAPI 3=软件HID 4=软件WPF。</summary>
+    /// <summary>该来源在当前选择下是否参与标定采样。mode：0=自适应 1=软件WPF。</summary>
     private bool Accept(int mode, TouchSample s, long now)
     {
-        switch (mode)
-        {
-            case 1: return s.Source is "RawHID";
-            case 2: return s.Source is "HidSetup";
-            case 3: // 软件HID：RawInput 优先、SetupAPI 兜底
-                return s.Source is "RawHID" or "HidSetup";
-            case 4: return s.Source is "WPF" or "STYLUS";
-            default: // 自适应：有原始HID 就用它；否则用 WPF 通路（Touch 面积 + Stylus 压感）
-                return now - _lastRawHidTicks <= 500
-                    ? s.Source is "RawHID" or "HidSetup"
-                    : s.Source is "WPF" or "STYLUS";
-        }
+        _ = mode;
+        _ = now;
+        // 当前只有 WPF 通路：Touch 面积 + Stylus 压感都收
+        return s.Source is "WPF" or "STYLUS";
     }
 
     private void OnPalmSourceModeChanged(object sender, SelectionChangedEventArgs e)

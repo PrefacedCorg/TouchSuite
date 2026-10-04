@@ -45,7 +45,7 @@ public static class Log
                     _writer = new StreamWriter(
                         new FileStream(_filePath, FileMode.Create, FileAccess.Write, FileShare.Read),
                         new UTF8Encoding(false))
-                    { AutoFlush = true };
+                    { AutoFlush = false };
                     break;
                 }
                 catch

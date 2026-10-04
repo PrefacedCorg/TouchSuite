@@ -29,9 +29,6 @@
                     <TextBlock Text="接触来源：" Margin="0,6,0,0" Foreground="#FF444444" />
                     <ComboBox x:Name="SourceModeCombo" SelectedIndex="0" Margin="0,4,0,0" SelectionChanged="OnSourceModeChanged">
                         <ComboBoxItem Content="自适应（自动锁定）" />
-                        <ComboBoxItem Content="原始HID·RawInput（设备上报尺寸）" />
-                        <ComboBoxItem Content="原始HID·SetupAPI（设备上报尺寸）" />
-                        <ComboBoxItem Content="软件HID（HID 数据 + 软件推算）" />
                         <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                     </ComboBox>
                     <TextBlock x:Name="SourceInfoText" Text="当前来源: 无" Margin="0,6,0,0" FontFamily="Consolas"
@@ -51,13 +48,13 @@
                                Foreground="#FF888888" TextWrapping="Wrap" />
 
                     <!-- 底部：HID 原始信息回显（驱动实际报了什么，全量列出） -->
-                    <Expander Header="HID 信息 / 面积对比（驱动上报原始值）" Margin="0,14,0,0" IsExpanded="True"
+                    <Expander Header="触摸信息（WPF 接触框原始值）" Margin="0,14,0,0" IsExpanded="True"
                               Foreground="#FF1E1E1E">
                         <Border Background="#FFEDEDED" BorderBrush="#FFCCCCCC" BorderThickness="1"
                                 Padding="8" Margin="0,6,0,0">
                             <TextBlock x:Name="HidInfoText" FontFamily="Consolas" FontSize="11"
                                        Foreground="#FF0A5A9A" TextWrapping="Wrap"
-                                       Text="在预览区按一下：顶部「面积对比」并排显示 原始HID Width×Height 与 WPF 接触框 的面积与偏差；下方列出驱动实际上报的状态 / 坐标 / 尺寸 / 接触ID / 手指数 / 压感 / 换算表。" />
+                                       Text="在预览区按一下：列出当前触摸样本的来源 / 状态 / 坐标 / 尺寸 / 手指数 / 压感 / 分指明细。" />
                         </Border>
                     </Expander>
                 </StackPanel>

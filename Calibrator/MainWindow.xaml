@@ -164,9 +164,6 @@
                             <ComboBox x:Name="PalmSourceCombo" SelectedIndex="0" Margin="0,2,0,0"
                                       SelectionChanged="OnPalmSourceModeChanged">
                                 <ComboBoxItem Content="自适应（自动锁定）" />
-                                <ComboBoxItem Content="原始HID·RawInput（设备上报尺寸）" />
-                                <ComboBoxItem Content="原始HID·SetupAPI 直读（设备上报尺寸）" />
-                                <ComboBoxItem Content="软件HID（HID 数据 + 软件推算）" />
                                 <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                             </ComboBox>
                             <TextBlock x:Name="PalmSourceInfoText" FontFamily="Consolas" FontSize="11"
@@ -199,9 +196,6 @@
                             <ComboBox x:Name="FingerSourceCombo" SelectedIndex="0" Margin="0,2,0,0"
                                       SelectionChanged="OnFingerSourceModeChanged">
                                 <ComboBoxItem Content="自适应（自动锁定）" />
-                                <ComboBoxItem Content="原始HID·RawInput（设备上报尺寸）" />
-                                <ComboBoxItem Content="原始HID·SetupAPI 直读（设备上报尺寸）" />
-                                <ComboBoxItem Content="软件HID（HID 数据 + 软件推算）" />
                                 <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                             </ComboBox>
                             <TextBlock x:Name="FingerSourceInfoText" FontFamily="Consolas" FontSize="11"
