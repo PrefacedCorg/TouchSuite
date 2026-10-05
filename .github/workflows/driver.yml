@@ -1,0 +1,32 @@
+name: driver
+
+# 驱动编译较重（首次要拉约 1.5GB 的 WDK NuGet 包），故不随 push 自动跑，改为手动触发。
+# 产物是未签名的 TouchBridgeVhid.sys；签名 / 安装（build.ps1 的 stampinf + inf2cat +
+# signtool + devcon）需要本地管理员与测试签名模式，不在 CI 里做。
+on:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    name: 虚拟触摸屏驱动（编译）
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore WDK packages
+        run: nuget restore driver/packages.config -PackagesDirectory driver/packages
+
+      - name: Compile driver
+        shell: cmd
+        run: driver\build-cl.cmd
+
+      - name: Upload .sys
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchBridgeVhid-sys
+          path: driver/x64/Release/TouchBridgeVhid.sys
+          if-no-files-found: error

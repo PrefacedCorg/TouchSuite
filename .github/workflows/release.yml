@@ -17,9 +17,35 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: windows-latest
+  # 先统一解析版本号，供后面各 job 复用
+  prepare:
+    name: 解析版本号
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          v="$(echo -n "${{ inputs.version }}" | tr -d '[:space:]')"
+          if [ -z "$v" ]; then
+            v="$(grep -oP '(?<=<Version>)[^<]+' src/TouchSuite.App/TouchSuite.App.csproj | head -n1)"
+          fi
+          if [ -z "$v" ]; then
+            echo "无法解析版本号" >&2
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "release version = $v"
+
+  windows:
+    name: Windows 发布（App / Receiver）
+    needs: prepare
+    runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,52 +55,90 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Resolve version
-        id: ver
-        shell: pwsh
-        run: |
-          $v = "${{ inputs.version }}".Trim()
-          if (-not $v) {
-            $m = Select-String -Path src/TouchSuite.App/TouchSuite.App.csproj -Pattern '<Version>([^<]+)</Version>'
-            $v = $m.Matches[0].Groups[1].Value
-          }
-          "version=$v" >> $env:GITHUB_OUTPUT
-          "zip=TouchSuite-v$v-win-x64.zip" >> $env:GITHUB_OUTPUT
-          Write-Host "release version = $v"
-
-      - name: Restore
-        run: dotnet restore src/TouchSuite.App/TouchSuite.App.csproj
-
-      - name: Build
-        run: dotnet build src/TouchSuite.App/TouchSuite.App.csproj -c Release --no-restore
-
-      - name: Publish (self-contained, single file, win-x64)
+      - name: Publish TouchSuite.App（自包含单文件 win-x64）
         run: >
           dotnet publish src/TouchSuite.App/TouchSuite.App.csproj -c Release -r win-x64
           --self-contained true
           -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true
           -p:DebugType=none
-          -p:Version=${{ steps.ver.outputs.version }}
-          -o publish
+          -p:Version=${{ needs.prepare.outputs.version }}
+          -o publish/app
+
+      - name: Publish TouchSuite.Receiver（自包含单文件 win-x64）
+        run: >
+          dotnet publish src/TouchSuite.Receiver/TouchSuite.Receiver.csproj -c Release -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=none
+          -p:Version=${{ needs.prepare.outputs.version }}
+          -o publish/receiver
 
       - name: Zip
         shell: pwsh
-        run: Compress-Archive -Path publish/* -DestinationPath "${{ steps.ver.outputs.zip }}" -Force
+        run: |
+          Compress-Archive -Path publish/app/* -DestinationPath "TouchSuite-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
+          Compress-Archive -Path publish/receiver/* -DestinationPath "TouchSuite.Receiver-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
 
-      - name: Upload artifact
+      - name: Upload zips
         uses: actions/upload-artifact@v4
         with:
-          name: TouchSuite-v${{ steps.ver.outputs.version }}-win-x64
-          path: ${{ steps.ver.outputs.zip }}
+          name: windows-zips
+          path: |
+            TouchSuite-v${{ needs.prepare.outputs.version }}-win-x64.zip
+            TouchSuite.Receiver-v${{ needs.prepare.outputs.version }}-win-x64.zip
           if-no-files-found: error
+
+  android:
+    name: Android 发布（APK）
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 仓内未配置 release 签名，故出 debug 签名包（可直接安装）。
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk "TouchSuite-v${{ needs.prepare.outputs.version }}-android.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: TouchSuite-v${{ needs.prepare.outputs.version }}-android.apk
+          if-no-files-found: error
+
+  publish:
+    name: 创建 GitHub Release
+    needs: [ prepare, windows, android ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.ver.outputs.version }}
-          name: TouchSuite v${{ steps.ver.outputs.version }}
-          files: ${{ steps.ver.outputs.zip }}
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: TouchSuite v${{ needs.prepare.outputs.version }}
+          files: |
+            artifacts/windows-zips/*.zip
+            artifacts/android-apk/*.apk
           generate_release_notes: true
           prerelease: ${{ inputs.prerelease }}
           fail_on_unmatched_files: true
