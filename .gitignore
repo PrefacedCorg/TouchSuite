@@ -26,6 +26,7 @@ android/.idea/
 # 驱动（WDK NuGet 包与构建产物）
 driver/packages/
 driver/x64/
+driver/pkg/
 driver/*.zip
 *.cer
 

@@ -1,8 +1,9 @@
 name: driver
 
 # 只在 driver/ 目录有改动时触发（或手动触发）。首次要拉约 1.5GB 的 WDK NuGet 包，较慢。
-# 产物是未签名的 TouchBridgeVhid.sys；签名 / 安装（build.ps1 的 stampinf + inf2cat +
-# signtool + devcon）需要本地管理员与测试签名模式，不在 CI 里做。
+# 产物是一个「自包含安装包」zip：TouchBridgeVhid.sys / .inf / .cat + 测试证书 .cer +
+# devcon.exe + install.ps1，目标机（管理员 + 测试签名模式）解压后跑 install.ps1 即可，
+# 不需要本机装 VS / WDK。
 on:
   push:
     branches: [ main ]
@@ -21,8 +22,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  compile:
-    name: 虚拟触摸屏驱动（编译）
+  package:
+    name: 虚拟触摸屏驱动（编译 + 打包）
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -38,9 +39,66 @@ jobs:
         shell: cmd
         run: driver\build-cl.cmd
 
-      - name: Upload .sys
+      - name: 生成 inf/cat、测试签名、组装安装包
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $here = 'driver'
+          $out  = Join-Path $here 'x64\Release'
+
+          # WDK 包版本从 packages.config 读，别到处硬编码
+          [xml]$pc = Get-Content (Join-Path $here 'packages.config')
+          $wdkVer = ($pc.packages.package | Where-Object { $_.id -eq 'Microsoft.Windows.WDK.x64' }).version
+          $w = Join-Path $here "packages\Microsoft.Windows.WDK.x64.$wdkVer"
+          $s = Join-Path $here "packages\Microsoft.Windows.SDK.CPP.$wdkVer"
+
+          $stampinf = Join-Path $w 'c\bin\10.0.28000.0\x64\stampinf.exe'
+          $inf2cat  = Join-Path $w 'c\bin\10.0.28000.0\x86\Inf2Cat.exe'
+          $signtool = Join-Path $s 'c\bin\10.0.28000.0\x64\signtool.exe'
+          $devcon   = Join-Path $w 'c\tools\10.0.28000.0\x64\devcon.exe'
+          foreach ($t in @($stampinf, $inf2cat, $signtool, $devcon)) {
+            if (-not (Test-Path $t)) { throw "包内缺少工具：$t" }
+          }
+
+          $sys = Join-Path $out 'TouchBridgeVhid.sys'
+          if (-not (Test-Path $sys)) { throw "未生成 $sys" }
+
+          # ---- stampinf：.inx -> .inf（覆盖 DriverVer，保证版本递增）----
+          $infSrc = Join-Path $here 'TouchBridgeVhid.inx'
+          $inf    = Join-Path $out 'TouchBridgeVhid.inf'
+          Copy-Item $infSrc $inf -Force
+          $ver = '1.0.{0}.{1}' -f (Get-Date).DayOfYear, (Get-Date -Format 'HHmm')
+          & $stampinf -f $inf -a 'x64' -k '1.15' -d '*' -v $ver
+          if ($LASTEXITCODE -ne 0) { throw "stampinf 失败（$LASTEXITCODE）" }
+
+          # ---- inf2cat：生成 .cat ----
+          & $inf2cat /driver:$out /os:10_X64
+          if ($LASTEXITCODE -ne 0) { throw "inf2cat 失败（$LASTEXITCODE）" }
+          $cat = Join-Path $out 'TouchBridgeVhid.cat'
+          if (-not (Test-Path $cat)) { throw "inf2cat 未生成 $cat" }
+
+          # ---- 测试证书 + 签名（runner 是管理员，可用 LocalMachine 存储）----
+          $certName = 'TouchBridgeTest'
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=$certName" `
+              -CertStoreLocation Cert:\LocalMachine\My
+          $cer = Join-Path $out "$certName.cer"
+          Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+
+          & $signtool sign /v /fd SHA256 /sm /s My /n $certName $sys
+          if ($LASTEXITCODE -ne 0) { throw 'sys 签名失败' }
+          & $signtool sign /v /fd SHA256 /sm /s My /n $certName $cat
+          if ($LASTEXITCODE -ne 0) { throw 'cat 签名失败' }
+
+          # ---- 组装安装包 ----
+          $pkg = Join-Path $here 'pkg'
+          if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
+          New-Item -ItemType Directory -Path $pkg | Out-Null
+          Copy-Item -Path $sys, $inf, $cat, $cer, $devcon, (Join-Path $here 'install.ps1') -Destination $pkg
+          Compress-Archive -Path (Join-Path $pkg '*') -DestinationPath (Join-Path $here 'TouchBridgeVhid-driver.zip') -Force
+
+      - name: Upload driver package
         uses: actions/upload-artifact@v4
         with:
-          name: TouchBridgeVhid-sys
-          path: driver/x64/Release/TouchBridgeVhid.sys
+          name: TouchBridgeVhid-driver
+          path: driver/TouchBridgeVhid-driver.zip
           if-no-files-found: error
