@@ -20,7 +20,9 @@ on:
   workflow_call:
 
 concurrency:
-  group: driver-${{ github.ref }}
+  # 带上 github.workflow：被 release.yml 调用时该值是 "release"，独立 push 触发时是 "driver"，
+  # 两者分组不同，避免 cancel-in-progress 让发版那次把自动那次（或反之）取消掉
+  group: driver-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
