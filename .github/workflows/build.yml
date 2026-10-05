@@ -20,7 +20,7 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Restore
-        run: dotnet restore src/TouchErase/TouchErase.csproj
+        run: dotnet restore src/TouchSuite.App/TouchSuite.App.csproj
 
       - name: Build
-        run: dotnet build src/TouchErase/TouchErase.csproj -c Release --no-restore
+        run: dotnet build src/TouchSuite.App/TouchSuite.App.csproj -c Release --no-restore

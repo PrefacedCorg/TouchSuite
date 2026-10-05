@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（不带 v，如 1.0.0）。留空则读取 TouchErase.csproj 的 <Version>'
+        description: '版本号（不带 v，如 1.0.0）。留空则读取 TouchSuite.App.csproj 的 <Version>'
         required: false
         type: string
       prerelease:
@@ -35,22 +35,22 @@ jobs:
         run: |
           $v = "${{ inputs.version }}".Trim()
           if (-not $v) {
-            $m = Select-String -Path src/TouchErase/TouchErase.csproj -Pattern '<Version>([^<]+)</Version>'
+            $m = Select-String -Path src/TouchSuite.App/TouchSuite.App.csproj -Pattern '<Version>([^<]+)</Version>'
             $v = $m.Matches[0].Groups[1].Value
           }
           "version=$v" >> $env:GITHUB_OUTPUT
-          "zip=TouchErase-v$v-win-x64.zip" >> $env:GITHUB_OUTPUT
+          "zip=TouchSuite-v$v-win-x64.zip" >> $env:GITHUB_OUTPUT
           Write-Host "release version = $v"
 
       - name: Restore
-        run: dotnet restore src/TouchErase/TouchErase.csproj
+        run: dotnet restore src/TouchSuite.App/TouchSuite.App.csproj
 
       - name: Build
-        run: dotnet build src/TouchErase/TouchErase.csproj -c Release --no-restore
+        run: dotnet build src/TouchSuite.App/TouchSuite.App.csproj -c Release --no-restore
 
       - name: Publish (self-contained, single file, win-x64)
         run: >
-          dotnet publish src/TouchErase/TouchErase.csproj -c Release -r win-x64
+          dotnet publish src/TouchSuite.App/TouchSuite.App.csproj -c Release -r win-x64
           --self-contained true
           -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true
@@ -65,7 +65,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TouchErase-v${{ steps.ver.outputs.version }}-win-x64
+          name: TouchSuite-v${{ steps.ver.outputs.version }}-win-x64
           path: ${{ steps.ver.outputs.zip }}
           if-no-files-found: error
 
@@ -73,7 +73,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.ver.outputs.version }}
-          name: TouchErase v${{ steps.ver.outputs.version }}
+          name: TouchSuite v${{ steps.ver.outputs.version }}
           files: ${{ steps.ver.outputs.zip }}
           generate_release_notes: true
           prerelease: ${{ inputs.prerelease }}

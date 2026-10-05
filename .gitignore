@@ -8,23 +8,23 @@ release/
 logs/
 
 # 发布压缩包
-TouchErase-*.zip
+TouchSuite-*.zip
 
 # 产物目录（编译时自动复制 APK 到这里）
 dist/
 
 # Android / Gradle
-src/TouchBridge.Android/.gradle/
-src/TouchBridge.Android/build/
-src/TouchBridge.Android/app/build/
-src/TouchBridge.Android/local.properties
-src/TouchBridge.Android/.idea/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
 *.apk
 *.aab
 
 # 驱动（WDK NuGet 包与构建产物）
 packages/
-src/TouchBridge.Driver/x64/
+driver/x64/
 *.cer
 
 # IDE / OS / 用户文件
