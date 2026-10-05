@@ -13,6 +13,27 @@ on:
         type: boolean
         default: false
 
+      app:
+        description: '① TouchSuite.App（WPF 主程序，win-x64 单文件）'
+        type: boolean
+        default: true
+      app_old:
+        description: '② TouchSuite.App.old（旧主项目）'
+        type: boolean
+        default: false
+      receiver:
+        description: '③ TouchSuite.Receiver（TouchBridge 接收端）'
+        type: boolean
+        default: true
+      android:
+        description: '④ Android APK（debug 签名）'
+        type: boolean
+        default: true
+      driver:
+        description: '⑤ 虚拟触摸屏驱动（自包含安装包）'
+        type: boolean
+        default: false
+
 permissions:
   contents: write
 
@@ -42,8 +63,10 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "release version = $v"
 
-  windows:
-    name: Windows 发布（App / Receiver）
+  # ---- ① TouchSuite.App ----
+  app:
+    name: TouchSuite.App
+    if: ${{ inputs.app }}
     needs: prepare
     runs-on: windows-latest
     steps:
@@ -55,7 +78,7 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Publish TouchSuite.App（自包含单文件 win-x64）
+      - name: Publish（自包含单文件 win-x64）
         run: >
           dotnet publish src/TouchSuite.App/TouchSuite.App.csproj -c Release -r win-x64
           --self-contained true
@@ -65,7 +88,69 @@ jobs:
           -p:Version=${{ needs.prepare.outputs.version }}
           -o publish/app
 
-      - name: Publish TouchSuite.Receiver（自包含单文件 win-x64）
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path publish/app/* -DestinationPath "TouchSuite-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rel-app
+          path: TouchSuite-v${{ needs.prepare.outputs.version }}-win-x64.zip
+          if-no-files-found: error
+
+  # ---- ② TouchSuite.App.old ----
+  app_old:
+    name: TouchSuite.App.old
+    if: ${{ inputs.app_old }}
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish（自包含单文件 win-x64）
+        run: >
+          dotnet publish src/TouchSuite.App.old/TouchSuite.App.old.csproj -c Release -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=none
+          -p:Version=${{ needs.prepare.outputs.version }}
+          -o publish/app-old
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path publish/app-old/* -DestinationPath "TouchSuite.App.old-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rel-app-old
+          path: TouchSuite.App.old-v${{ needs.prepare.outputs.version }}-win-x64.zip
+          if-no-files-found: error
+
+  # ---- ③ TouchSuite.Receiver ----
+  receiver:
+    name: TouchSuite.Receiver
+    if: ${{ inputs.receiver }}
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish（自包含单文件 win-x64）
         run: >
           dotnet publish src/TouchSuite.Receiver/TouchSuite.Receiver.csproj -c Release -r win-x64
           --self-contained true
@@ -77,21 +162,19 @@ jobs:
 
       - name: Zip
         shell: pwsh
-        run: |
-          Compress-Archive -Path publish/app/* -DestinationPath "TouchSuite-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
-          Compress-Archive -Path publish/receiver/* -DestinationPath "TouchSuite.Receiver-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
+        run: Compress-Archive -Path publish/receiver/* -DestinationPath "TouchSuite.Receiver-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
 
-      - name: Upload zips
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: windows-zips
-          path: |
-            TouchSuite-v${{ needs.prepare.outputs.version }}-win-x64.zip
-            TouchSuite.Receiver-v${{ needs.prepare.outputs.version }}-win-x64.zip
+          name: rel-receiver
+          path: TouchSuite.Receiver-v${{ needs.prepare.outputs.version }}-win-x64.zip
           if-no-files-found: error
 
+  # ---- ④ Android ----
   android:
-    name: Android 发布（APK）
+    name: Android（APK）
+    if: ${{ inputs.android }}
     needs: prepare
     runs-on: ubuntu-latest
     steps:
@@ -114,16 +197,25 @@ jobs:
       - name: Rename APK
         run: cp android/app/build/outputs/apk/debug/app-debug.apk "TouchSuite-v${{ needs.prepare.outputs.version }}-android.apk"
 
-      - name: Upload APK
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: android-apk
+          name: rel-android
           path: TouchSuite-v${{ needs.prepare.outputs.version }}-android.apk
           if-no-files-found: error
 
+  # ---- ⑤ 驱动（复用 driver.yml，产出 TouchBridgeVhid-driver.zip）----
+  driver:
+    name: 驱动（自包含安装包）
+    if: ${{ inputs.driver }}
+    uses: ./.github/workflows/driver.yml
+
+  # ---- 汇总发布 ----
   publish:
     name: 创建 GitHub Release
-    needs: [ prepare, windows, android ]
+    needs: [ prepare, app, app_old, receiver, android, driver ]
+    # 有组件被跳过（未勾选）时也要跑，故用 always()
+    if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -131,14 +223,23 @@ jobs:
         with:
           path: artifacts
 
+      - name: 校验产物
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(artifacts/*/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::没有任何产物，请至少勾选一个组件"
+            exit 1
+          fi
+          echo "将发布以下文件："
+          printf '  %s\n' "${files[@]}"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: TouchSuite v${{ needs.prepare.outputs.version }}
-          files: |
-            artifacts/windows-zips/*.zip
-            artifacts/android-apk/*.apk
+          files: artifacts/*/*
           generate_release_notes: true
           prerelease: ${{ inputs.prerelease }}
-          fail_on_unmatched_files: true

@@ -16,6 +16,8 @@ on:
       - 'driver/**'
       - '.github/workflows/driver.yml'
   workflow_dispatch:
+  # 供 release.yml 复用（发版时勾选驱动即调用本工作流）
+  workflow_call:
 
 concurrency:
   group: driver-${{ github.ref }}

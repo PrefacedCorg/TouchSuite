@@ -1,4 +1,4 @@
-# TouchBridge 虚拟触摸屏驱动 —— 安装脚本（随包自包含，无需 VS / WDK）
+﻿# TouchBridge 虚拟触摸屏驱动 —— 安装脚本（随包自包含，无需 VS / WDK）
 #
 # 用法（必须以【管理员】身份运行 PowerShell）：
 #     powershell -ExecutionPolicy Bypass -File .\install.ps1
