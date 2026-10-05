@@ -17,14 +17,16 @@ dist/
 android/.gradle/
 android/build/
 android/app/build/
+android/.kotlin/
 android/local.properties
 android/.idea/
 *.apk
 *.aab
 
 # 驱动（WDK NuGet 包与构建产物）
-packages/
+driver/packages/
 driver/x64/
+driver/*.zip
 *.cer
 
 # IDE / OS / 用户文件
