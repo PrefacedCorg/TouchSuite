@@ -29,8 +29,12 @@ on:
         description: '④ Android APK（debug 签名）'
         type: boolean
         default: true
+      hidump:
+        description: '⑤ TouchSuite.HidDump（HID 能力/报告描述符查看工具，win-x64 单文件）'
+        type: boolean
+        default: false
       driver:
-        description: '⑤ 虚拟触摸屏驱动（自包含安装包）'
+        description: '⑥ 虚拟触摸屏驱动（自包含安装包）'
         type: boolean
         default: false
 
@@ -204,7 +208,43 @@ jobs:
           path: TouchSuite-v${{ needs.prepare.outputs.version }}-android.apk
           if-no-files-found: error
 
-  # ---- ⑤ 驱动（复用 driver.yml，产出 TouchBridgeVhid-driver.zip）----
+  # ---- ⑤ TouchSuite.HidDump ----
+  hidump:
+    name: TouchSuite.HidDump
+    if: ${{ inputs.hidump }}
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish（自包含单文件 win-x64）
+        run: >
+          dotnet publish src/TouchSuite.HidDump/TouchSuite.HidDump.csproj -c Release -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=none
+          -p:Version=${{ needs.prepare.outputs.version }}
+          -o publish/hidump
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path publish/hidump/* -DestinationPath "TouchSuite.HidDump-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rel-hidump
+          path: TouchSuite.HidDump-v${{ needs.prepare.outputs.version }}-win-x64.zip
+          if-no-files-found: error
+
+  # ---- ⑥ 驱动（复用 driver.yml，产出 TouchBridgeVhid-driver.zip）----
   driver:
     name: 驱动（自包含安装包）
     if: ${{ inputs.driver }}
@@ -213,7 +253,7 @@ jobs:
   # ---- 汇总发布 ----
   publish:
     name: 创建 GitHub Release
-    needs: [ prepare, app, app_old, receiver, android, driver ]
+    needs: [ prepare, app, app_old, receiver, android, hidump, driver ]
     # 有组件被跳过（未勾选）时也要跑，故用 always()
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest

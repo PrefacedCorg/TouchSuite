@@ -142,12 +142,18 @@ class TouchSurfaceView(context: Context) : View(context) {
         }
         if (b <= 0f) b = a
 
-        // 把旋转椭圆折算成轴对齐包围盒（Windows 的 rcContact 是轴对齐矩形）
+        // 把旋转椭圆折算成轴对齐包围盒（Windows 的 rcContact 是轴对齐矩形）。
+        // Android 约定（MotionEvent.PointerCoords.orientation 文档）：
+        //   TouchMajor = 长轴，orientation=0 时「长轴朝上」→ 即竖直(Y)方向尺寸；
+        //   TouchMinor = 短轴 → 水平(X)方向尺寸；orientation 是相对竖直方向的顺时针夹角。
+        // 因此 水平(X) 半径用 minor×cosθ / major×sinθ，竖直(Y) 半径用 major×cosθ / minor×sinθ。
+        // ⚠ 之前两行写反了 → 上报的 0x48 宽度 / 0x49 高度互换（圆接触看不出来，手指或手掌
+        //   的长短轴差异大时很明显）。
         val theta = event.getOrientation(i)
         val ct = cos(theta)
         val st = sin(theta)
-        val halfW = sqrt((a * ct) * (a * ct) + (b * st) * (b * st))
-        val halfH = sqrt((a * st) * (a * st) + (b * ct) * (b * ct))
+        val halfW = sqrt((b * ct) * (b * ct) + (a * st) * (a * st))   // 水平(X)方向半径
+        val halfH = sqrt((a * ct) * (a * ct) + (b * st) * (b * st))   // 竖直(Y)方向半径
 
         val nw = ((2f * halfW) / w).coerceIn(0f, 1f)
         val nh = ((2f * halfH) / h).coerceIn(0f, 1f)

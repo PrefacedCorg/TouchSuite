@@ -7,6 +7,7 @@ on:
       - 'src/TouchSuite.App/**'
       - 'src/TouchSuite.App.old/**'
       - 'src/TouchSuite.Receiver/**'
+      - 'src/TouchSuite.HidDump/**'
       - 'android/**'
       - '.github/workflows/build.yml'
   pull_request:
@@ -15,6 +16,7 @@ on:
       - 'src/TouchSuite.App/**'
       - 'src/TouchSuite.App.old/**'
       - 'src/TouchSuite.Receiver/**'
+      - 'src/TouchSuite.HidDump/**'
       - 'android/**'
       - '.github/workflows/build.yml'
 
@@ -31,6 +33,7 @@ jobs:
       app: ${{ steps.filter.outputs.app }}
       app_old: ${{ steps.filter.outputs.app_old }}
       receiver: ${{ steps.filter.outputs.receiver }}
+      hidump: ${{ steps.filter.outputs.hidump }}
       android: ${{ steps.filter.outputs.android }}
     steps:
       - name: Checkout
@@ -47,6 +50,8 @@ jobs:
               - 'src/TouchSuite.App.old/**'
             receiver:
               - 'src/TouchSuite.Receiver/**'
+            hidump:
+              - 'src/TouchSuite.HidDump/**'
             android:
               - 'android/**'
 
@@ -126,6 +131,32 @@ jobs:
         with:
           name: TouchSuite.Receiver
           path: src/TouchSuite.Receiver/bin/Release/net9.0-windows/
+          if-no-files-found: error
+
+  hidump:
+    name: TouchSuite.HidDump
+    needs: changes
+    if: needs.changes.outputs.hidump == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore & Build
+        run: |
+          dotnet restore src/TouchSuite.HidDump/TouchSuite.HidDump.csproj
+          dotnet build src/TouchSuite.HidDump/TouchSuite.HidDump.csproj -c Release --no-restore
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchSuite.HidDump
+          path: src/TouchSuite.HidDump/bin/Release/net10.0-windows/
           if-no-files-found: error
 
   android:

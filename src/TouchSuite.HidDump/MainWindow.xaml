@@ -1,0 +1,58 @@
+<Window x:Class="TouchSuite.HidDump.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="TouchSuite HidDump —— 触摸屏 HID 查看器"
+        Height="760" Width="1180" WindowStartupLocation="CenterScreen">
+    <DockPanel>
+        <!-- 顶部：设备选择 + 产品信息 -->
+        <Border DockPanel.Dock="Top" Background="#FFF2F4F7" Padding="10,8">
+            <StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="设备：" VerticalAlignment="Center"/>
+                    <ComboBox x:Name="DeviceCombo" Width="640" SelectionChanged="OnDevicePicked"/>
+                    <Button Content="重新扫描" Margin="10,0,0,0" Padding="10,3" Click="OnRescan"/>
+                    <CheckBox x:Name="RealPosCheck" Content="红圈按真实屏幕位置（1:1）" IsChecked="True"
+                              Margin="14,0,0,0" VerticalAlignment="Center"
+                              Checked="OnRealPosChanged" Unchecked="OnRealPosChanged"/>
+                </StackPanel>
+                <TextBlock x:Name="ProductText" Margin="0,4,0,0" FontSize="12" Foreground="#FF666666" TextTrimming="CharacterEllipsis"/>
+            </StackPanel>
+        </Border>
+
+        <!-- 底部：帧计数 + 最新报文 -->
+        <Border DockPanel.Dock="Bottom" Background="#FFF2F4F7" Padding="10,5">
+            <TextBlock x:Name="StatusText" FontSize="12" Foreground="#FF444444" TextTrimming="CharacterEllipsis"/>
+        </Border>
+
+        <Grid Margin="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="500"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- 左：触摸框（灰框 = 整屏缩放示意；红圈 = 设备上报接触框，按屏幕比例落位；蓝点 = WPF 触摸位置） -->
+            <Border x:Name="TouchHost" Grid.Column="0" Background="#FF101418" ClipToBounds="True"
+                    TouchDown="OnTouchDown" TouchMove="OnTouchMove" TouchUp="OnTouchUp"
+                    MouseLeftButtonDown="OnMouseDown" MouseMove="OnMouseMove" MouseLeftButtonUp="OnMouseUp"
+                    SizeChanged="OnTouchHostSizeChanged">
+                <Grid>
+                    <Canvas x:Name="RawCanvas" IsHitTestVisible="False"/>
+                    <Canvas x:Name="TouchCanvas" IsHitTestVisible="False"/>
+                    <TextBlock x:Name="TouchHint"
+                               Text="在这块区域上触摸 / 手掌按压（触摸屏设备选中时生效）&#x0a;灰框 = 整屏缩放示意，红圈落在框里的真实屏幕位置&#x0a;蓝点 = WPF 触摸位置（本面板内的实际坐标）"
+                               Foreground="#FF6B6F7A" FontSize="14" TextAlignment="Center"
+                               HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False"/>
+                </Grid>
+            </Border>
+
+            <GridSplitter Grid.Column="1" Width="4" Background="#FFD9DDE3" HorizontalAlignment="Stretch"/>
+
+            <!-- 右：表格（页/Link 合并；列宽全 Auto，段/图例/描述符在表格外，不撑列宽；
+                 各段表格用 SharedSizeGroup 共享 Auto 列宽保持对齐；超宽横向滚动） -->
+            <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" Padding="10,4">
+                <StackPanel x:Name="Rows" Grid.IsSharedSizeScope="True" HorizontalAlignment="Left"/>
+            </ScrollViewer>
+        </Grid>
+    </DockPanel>
+</Window>

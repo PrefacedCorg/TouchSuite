@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>TouchSuite.HidDump</RootNamespace>
+    <AssemblyName>TouchSuite.HidDump</AssemblyName>
+    <Version>1.1.0</Version>
+    <Product>TouchSuite HidDump</Product>
+  </PropertyGroup>
+
+</Project>

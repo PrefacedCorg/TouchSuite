@@ -92,6 +92,9 @@ internal sealed class VhidSender : ITouchSink, IDisposable
     private static extern bool CloseHandle(IntPtr handle);
 
     private readonly Dictionary<byte, TouchPointData> _active = new();
+    // 平板指针 id → 它在本设备上占用的固定 HID 槽位（按下时分配，抬起时释放）。
+    // 驱动上报的 Contact Identifier 就是槽位号，所以槽位必须在一根手指的整个生命周期内保持不变。
+    private readonly Dictionary<byte, int> _slotOf = new();
     private long _submitCount;
     private readonly double _screenWidthMm;
     private readonly double _pressureMax;
@@ -144,13 +147,27 @@ internal sealed class VhidSender : ITouchSink, IDisposable
         if (_device == InvalidHandle)
             return;
 
-        // 维护"当前仍按下的触点"集合
+        // 维护"当前仍按下的触点"集合，并为每个指针分配一个在按下→抬起期间固定不变的 HID 槽位。
+        // HID 并行模式下 Windows 靠 Contact Identifier(0x51) 跨帧识别同一根手指，而驱动上报的
+        // 标识符 = 触点所在槽位号。若槽位随 Dictionary 枚举顺序漂移，多指就会互相"抢"槽位/ID，
+        // 表现为同一根手指在两点之间来回闪跳。
         foreach (TouchPointData p in frame.Points)
         {
             if (p.State == Protocol.StateUp)
+            {
                 _active.Remove(p.Id);
+                _slotOf.Remove(p.Id);
+            }
             else
+            {
                 _active[p.Id] = p;
+                if (!_slotOf.ContainsKey(p.Id))
+                {
+                    int slot = AllocSlot();
+                    if (slot >= 0)
+                        _slotOf[p.Id] = slot;
+                }
+            }
         }
 
         var vf = new VhidFrame { Count = 0, Contacts = new VhidContact[MaxContacts] };
@@ -158,6 +175,7 @@ internal sealed class VhidSender : ITouchSink, IDisposable
             vf.Contacts[i] = default;
 
         int n = 0;
+        string first = "无活动点";
         // 每像素对应的物理毫米：优先用 --screen-mm ÷ 映射区像素宽；未指定则按 96DPI 估。
         double mmPerPx = _screenWidthMm > 0 && mapper.RegionWidth > 0
             ? _screenWidthMm / mapper.RegionWidth
@@ -165,8 +183,9 @@ internal sealed class VhidSender : ITouchSink, IDisposable
 
         foreach (KeyValuePair<byte, TouchPointData> kv in _active)
         {
-            if (n >= _maxContacts)
-                break;
+            // 按分配到的固定槽位落位（而不是按枚举顺序），保证槽位号 = 稳定的 Contact Identifier。
+            if (!_slotOf.TryGetValue(kv.Key, out int slot) || slot < 0 || slot >= MaxContacts)
+                continue;
             TouchPointData p = kv.Value;
 
             mapper.MapToUnit15(p.X, p.Y, out ushort ux, out ushort uy);
@@ -174,16 +193,21 @@ internal sealed class VhidSender : ITouchSink, IDisposable
             double wMm = cw * mmPerPx;
             double hMm = ch * mmPerPx;
 
-            vf.Contacts[n] = new VhidContact
+            vf.Contacts[slot] = new VhidContact
             {
                 Flags = FlagTip | FlagInRange,
-                Id = p.Id,
+                Id = (uint)slot,
                 X = ux,
                 Y = uy,
                 WidthMm100 = (uint)Math.Clamp(Math.Round(wMm * 100.0), 0, 32767),
                 HeightMm100 = (uint)Math.Clamp(Math.Round(hMm * 100.0), 0, 32767),
                 Pressure = (uint)Math.Clamp(Math.Round(MapPressure(p.Pressure)), 0, 1024),
             };
+            if (n == 0)
+            {
+                first = $"槽{slot} X={ux} Y={uy} W={vf.Contacts[slot].WidthMm100} "
+                    + $"H={vf.Contacts[slot].HeightMm100} P={vf.Contacts[slot].Pressure}";
+            }
             n++;
         }
         vf.Count = (uint)n;
@@ -212,9 +236,6 @@ internal sealed class VhidSender : ITouchSink, IDisposable
                 _debugText = $"虚拟HID：{ActiveCount} 点，累计 {InjectedFrames} 帧";
                 if (_submitCount <= 50 || _submitCount % 100 == 0)
                 {
-                    string first = n > 0
-                        ? $"首点 id={vf.Contacts[0].Id} X={vf.Contacts[0].X} Y={vf.Contacts[0].Y} W={vf.Contacts[0].WidthMm100} H={vf.Contacts[0].HeightMm100} P={vf.Contacts[0].Pressure}"
-                        : "无活动点";
                     Log.Write($"[Vhid] submit#{_submitCount} 收到点={frame.Points.Length} 上报={n} {first} → IOCTL OK{diagText}");
                 }
             }
@@ -248,10 +269,31 @@ internal sealed class VhidSender : ITouchSink, IDisposable
         return Math.Round(_pressureFloor + p01 * (1024.0 - _pressureFloor));
     }
 
+    /// <summary>分配一个当前未被占用的 HID 槽位（0.._maxContacts-1）；无空闲则返回 -1。</summary>
+    private int AllocSlot()
+    {
+        for (int s = 0; s < _maxContacts; s++)
+        {
+            bool used = false;
+            foreach (int v in _slotOf.Values)
+            {
+                if (v == s)
+                {
+                    used = true;
+                    break;
+                }
+            }
+            if (!used)
+                return s;
+        }
+        return -1;
+    }
+
     /// <summary>抬手：发一帧 Count=0，Windows 认为所有接触都已离开。</summary>
     public void ReleaseAll(bool canceled = false)
     {
         _active.Clear();
+        _slotOf.Clear();
         if (_device == InvalidHandle)
             return;
 

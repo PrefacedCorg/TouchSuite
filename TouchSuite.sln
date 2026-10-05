@@ -1,4 +1,5 @@
-﻿Microsoft Visual Studio Solution File, Format Version 12.00
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.10.35013.160
 MinimumVisualStudioVersion = 10.0.40219.1
@@ -19,6 +20,8 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TouchSuite.App.old", "src\TouchSuite.App.old\TouchSuite.App.old.csproj", "{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TouchSuite.Receiver", "src\TouchSuite.Receiver\TouchSuite.Receiver.csproj", "{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TouchSuite.HidDump", "src\TouchSuite.HidDump\TouchSuite.HidDump.csproj", "{70899134-B935-4795-8DA4-09D6AD8D94B5}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -66,6 +69,18 @@ Global
 		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Release|x64.Build.0 = Release|Any CPU
 		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Release|x86.ActiveCfg = Release|Any CPU
 		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Release|x86.Build.0 = Release|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Debug|x64.Build.0 = Debug|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Debug|x86.Build.0 = Debug|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Release|x64.ActiveCfg = Release|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Release|x64.Build.0 = Release|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Release|x86.ActiveCfg = Release|Any CPU
+		{70899134-B935-4795-8DA4-09D6AD8D94B5}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -74,5 +89,6 @@ Global
 		{26389930-C467-4037-8826-14BBBA8369BC} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{70899134-B935-4795-8DA4-09D6AD8D94B5} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 	EndGlobalSection
 EndGlobal

@@ -46,7 +46,7 @@ internal static class Program
             return RunSelfTest(monitors);
 
         Log.Write($"===== 启动 ===== args=[{string.Join(' ', args)}]");
-        Log.Write($"模式={(opt.Vhid ? "VirtualHID(VHF)" : "user32 合成指针")}  显示器#{monitorIndex} {monitor.Width}x{monitor.Height}  端口={opt.Port}  screen-mm={opt.ScreenMm}  max-contacts={opt.MaxContacts}");
+        Log.Write($"模式={(opt.Vhid ? "VirtualHID(VHF)" : "user32 合成指针")}  显示器#{monitorIndex} {monitor.Width}x{monitor.Height}  端口={opt.Port}  screen-mm={opt.ScreenMm}  max-contacts={opt.MaxContacts}  宽高互换={opt.SwapContactWh}");
 
         // 落地方式：默认 user32 合成指针注入；--vhid 则改为喂给虚拟 HID 触摸屏驱动。
         ITouchSink injector = opt.Vhid
@@ -232,6 +232,17 @@ internal static class Program
                     if (parseFail <= 5 || parseFail % 100 == 0)
                         Log.Write($"帧解析失败 ×{parseFail}（长度={payload.Length} 类型=0x{payload[0]:X2}）");
                     continue;
+                }
+
+                // 兼容旧版 APK：旧版把 TouchMajor 当水平半径，导致 W/H 互换（新版已修）
+                if (opt.SwapContactWh)
+                {
+                    for (int pi = 0; pi < frame.Points.Length; pi++)
+                    {
+                        TouchPointData q = frame.Points[pi];
+                        frame.Points[pi] = new TouchPointData(q.Id, q.State, q.ToolType, q.X, q.Y,
+                            q.Pressure, q.Size, q.ContactH, q.ContactW, q.OrientationDeg);
+                    }
                 }
 
                 injector.Apply(frame, mapper);
@@ -502,6 +513,12 @@ internal sealed class Options
     public bool Vhid;
     /// <summary>目标屏幕物理宽度（mm）。用于把接触尺寸换算成毫米（0 = 按 96DPI 估算）。</summary>
     public double ScreenMm;
+    /// <summary>
+    /// 兼容开关：把平板上报的 ContactW/ContactH 互换后再注入。
+    /// 用于仍装着「旧版 APK」的平板 —— 旧版把 Android 的 TouchMajor（竖直长轴）当成了水平半径，
+    /// 导致 0x48 宽度 / 0x49 高度 互换；新版 APK 已修正，无需此开关。
+    /// </summary>
+    public bool SwapContactWh;
     public bool Help;
 
     public static Options Parse(string[] args)
@@ -601,6 +618,9 @@ internal sealed class Options
                     o.ScreenMm = double.Parse(Next());
                     if (o.ScreenMm < 0) throw new ArgumentException("--screen-mm 不能为负");
                     break;
+                case "--swap-contact-wh":
+                    o.SwapContactWh = true;
+                    break;
                 case "--contact-area":
                     o.ContactArea = Next().ToLowerInvariant() switch
                     {
@@ -643,6 +663,8 @@ internal sealed class Options
               --no-inject           只算不注入（不碰桌面，用于核对坐标/面积/压力）
               --vhid                 改用本仓库的虚拟 HID 触摸屏驱动（VHF）而非 user32 合成指针
               --screen-mm <mm>       目标屏幕物理宽度（毫米），用于把接触尺寸换算成毫米（默认按 96DPI 估）
+              --swap-contact-wh      兼容旧版 APK：把平板报的接触宽/高互换后再注入（旧版把 Android
+                                     TouchMajor 当水平半径，导致 0x48/0x49 互换；新版 APK 已修正）
               -h, --help             显示本帮助
             """);
     }
