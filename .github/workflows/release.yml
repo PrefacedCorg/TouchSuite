@@ -1,6 +1,11 @@
 name: release
 
 on:
+  # 推 tag（形如 v1.0.0 / v1.1.0-beta.1）也直接发版：版本号取自 tag，
+  # 组件按固定组合出（app / receiver / android / hidump；App.old 与驱动仍走手动勾选）
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       version:
@@ -42,12 +47,19 @@ permissions:
   contents: write
 
 jobs:
-  # 先统一解析版本号，供后面各 job 复用
+  # 统一解析版本号与本次要出的组件，供后面各 job 复用
   prepare:
-    name: 解析版本号
+    name: 解析版本号 / 组件
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      prerelease: ${{ steps.ver.outputs.prerelease }}
+      app: ${{ steps.ver.outputs.app }}
+      app_old: ${{ steps.ver.outputs.app_old }}
+      receiver: ${{ steps.ver.outputs.receiver }}
+      android: ${{ steps.ver.outputs.android }}
+      hidump: ${{ steps.ver.outputs.hidump }}
+      driver: ${{ steps.ver.outputs.driver }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,8 +67,21 @@ jobs:
       - name: Resolve version
         id: ver
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_APP: ${{ inputs.app }}
+          INPUT_APP_OLD: ${{ inputs.app_old }}
+          INPUT_RECEIVER: ${{ inputs.receiver }}
+          INPUT_ANDROID: ${{ inputs.android }}
+          INPUT_HIDUMP: ${{ inputs.hidump }}
+          INPUT_DRIVER: ${{ inputs.driver }}
         run: |
-          v="$(echo -n "${{ inputs.version }}" | tr -d '[:space:]')"
+          # 版本号优先级：手动输入 > tag 名（去掉 v 前缀）> TouchSuite.App.csproj 的 <Version>
+          v="$(echo -n "$INPUT_VERSION" | tr -d '[:space:]')"
+          if [ -z "$v" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            v="${GITHUB_REF_NAME#v}"
+          fi
           if [ -z "$v" ]; then
             v="$(grep -oP '(?<=<Version>)[^<]+' src/TouchSuite.App/TouchSuite.App.csproj | head -n1)"
           fi
@@ -67,10 +92,34 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "release version = $v"
 
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            # 手动触发：完全按勾选项
+            for pair in "app:$INPUT_APP" "app_old:$INPUT_APP_OLD" "receiver:$INPUT_RECEIVER" \
+                        "android:$INPUT_ANDROID" "hidump:$INPUT_HIDUMP" "driver:$INPUT_DRIVER"; do
+              echo "${pair%%:*}=${pair#*:}" >> "$GITHUB_OUTPUT"
+            done
+            echo "prerelease=$INPUT_PRERELEASE" >> "$GITHUB_OUTPUT"
+          else
+            # tag 推送：固定组合全出；已弃用的 App.old 与需测试签名的驱动不自动出
+            echo "app=true" >> "$GITHUB_OUTPUT"
+            echo "app_old=false" >> "$GITHUB_OUTPUT"
+            echo "receiver=true" >> "$GITHUB_OUTPUT"
+            echo "android=true" >> "$GITHUB_OUTPUT"
+            echo "hidump=true" >> "$GITHUB_OUTPUT"
+            echo "driver=false" >> "$GITHUB_OUTPUT"
+            # 版本号带连字符（如 1.1.0-beta.1）视为预发布
+            if [ "${v#*-}" != "$v" ]; then
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+          echo "本次组件：$(grep -E '^(app|app_old|receiver|android|hidump|driver)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
+
   # ---- ① TouchSuite.App ----
   app:
     name: TouchSuite.App
-    if: ${{ inputs.app }}
+    if: ${{ needs.prepare.outputs.app == 'true' }}
     needs: prepare
     runs-on: windows-latest
     steps:
@@ -106,7 +155,7 @@ jobs:
   # ---- ② TouchSuite.App.old ----
   app_old:
     name: TouchSuite.App.old
-    if: ${{ inputs.app_old }}
+    if: ${{ needs.prepare.outputs.app_old == 'true' }}
     needs: prepare
     runs-on: windows-latest
     steps:
@@ -142,7 +191,7 @@ jobs:
   # ---- ③ TouchSuite.Receiver ----
   receiver:
     name: TouchSuite.Receiver
-    if: ${{ inputs.receiver }}
+    if: ${{ needs.prepare.outputs.receiver == 'true' }}
     needs: prepare
     runs-on: windows-latest
     steps:
@@ -178,7 +227,7 @@ jobs:
   # ---- ④ Android ----
   android:
     name: Android（APK）
-    if: ${{ inputs.android }}
+    if: ${{ needs.prepare.outputs.android == 'true' }}
     needs: prepare
     runs-on: ubuntu-latest
     steps:
@@ -211,7 +260,7 @@ jobs:
   # ---- ⑤ TouchSuite.HidDump ----
   hidump:
     name: TouchSuite.HidDump
-    if: ${{ inputs.hidump }}
+    if: ${{ needs.prepare.outputs.hidump == 'true' }}
     needs: prepare
     runs-on: windows-latest
     steps:
@@ -247,7 +296,7 @@ jobs:
   # ---- ⑥ 驱动（复用 driver.yml，产出 TouchBridgeVhid-driver.zip）----
   driver:
     name: 驱动（自包含安装包）
-    if: ${{ inputs.driver }}
+    if: ${{ needs.prepare.outputs.driver == 'true' }}
     uses: ./.github/workflows/driver.yml
 
   # ---- 汇总发布 ----
@@ -282,4 +331,4 @@ jobs:
           name: TouchSuite v${{ needs.prepare.outputs.version }}
           files: artifacts/*/*
           generate_release_notes: true
-          prerelease: ${{ inputs.prerelease }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}

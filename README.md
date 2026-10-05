@@ -17,6 +17,7 @@
 | [src/TouchSuite.Receiver](src/TouchSuite.Receiver) | Windows 接收端（控制台，.NET 9） | 收平板触摸帧并注入桌面；`--vhid` 时喂给虚拟 HID 触摸屏驱动 |
 | [android/](android) | 安卓端 App | 把平板触摸面通过网络发给 PC |
 | [driver/](driver) | 虚拟 HID 触摸屏驱动（VHF，C） | 装上后 Windows 才认成"真的触摸屏"，接触面积/压感才有意义 |
+| [src/TouchSuite.HidDump](src/TouchSuite.HidDump) | 触摸屏 HID 查看工具（WPF，.NET 10） | 左边触摸框、右边表格：列出全部 HID usage（页/usage/Link/范围/Report Count）并实时显示当前值；可选设备、看原始报告描述符逐项、带诊断日志 |
 | [src/TouchSuite.App.old](src/TouchSuite.App.old) | 旧主项目（历史 Demo） | 之前的手掌擦 Demo，一般不用；其 `README.md`/`TESTING.md` 内容仍是旧名 TouchErase |
 
 > 为什么需要驱动：`user32` 合成指针注入的触摸**不带接触面积**，也基本不吃压感。要让应用看到真实的面积/压感，得走虚拟 HID 触摸屏（`--vhid`）。
@@ -68,6 +69,7 @@
 | `--no-inject` | 只算不注入（不碰桌面，用于核对坐标/面积/压力） |
 | `--vhid` | 改用本仓库的虚拟 HID 触摸屏驱动（VHF）而非 user32 合成指针 |
 | `--screen-mm <mm>` | 目标屏幕物理宽度（毫米），用于把接触尺寸换算成毫米（默认按 96DPI 估） |
+| `--swap-contact-wh` | 兼容旧版 APK：把平板上报的接触宽/高互换后再注入（旧版把 Android TouchMajor 当水平半径，导致 0x48/0x49 互换；新版 APK 已修正） |
 | `-h`, `--help` | 显示帮助 |
 
 ### 常用组合
@@ -200,14 +202,16 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 | 目标 | 命令 |
 |---|---|
-| C#（3 个项目） | `dotnet build TouchSuite.sln -c Release` |
+| C#（4 个项目） | `dotnet build TouchSuite.sln -c Release` |
 | 安卓 APK | `cd android && gradlew assembleDebug`（产物复制到 `dist/`） |
 | 驱动 | `driver\build.ps1`（管理员） |
 
 发布用 GitHub Actions：
 
 - **build.yml**：push / PR 到 `main` 时**按改动目录**触发对应构建（改哪个目录编哪个）。
-- **release.yml**：手动触发，可**勾选**要打包的 5 个组件（App / App.old / Receiver / 安卓 / 驱动），汇总后创建 Release。
+- **release.yml**：两种触发方式 ——
+  - **推 tag**（`v1.0.0`、`v1.1.0-beta.1`）：自动发版，版本号取自 tag，固定出 App / Receiver / 安卓 / HidDump；tag 带 `-` 自动标记为 Pre-release（App.old 与驱动仍走手动勾选）。
+  - **手动触发**：可**勾选** 6 个组件（App / App.old / Receiver / 安卓 / HidDump / 驱动），版本号优先用手动输入，留空则回退到 tag 名 > `TouchSuite.App.csproj` 的 `<Version>`。
 - **driver.yml**：`driver/` 有改动时自动跑，也可手动触发。
 
 ## 环境要求
