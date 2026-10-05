@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>TouchErase</RootNamespace>
+    <AssemblyName>TouchErase</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <Version>1.0.0</Version>
+    <Product>TouchErase 手掌擦矫正 Demo</Product>
+  </PropertyGroup>
+
+  <!-- 校准向导是同级子目录下的独立项目，必须排除出本项目，否则默认通配会把它一起编进来 -->
+  <ItemGroup>
+    <Compile Remove="Calibrator/**" />
+    <Page Remove="Calibrator/**" />
+    <ApplicationDefinition Remove="Calibrator/**" />
+    <Resource Remove="Calibrator/**" />
+    <None Remove="Calibrator/**" />
+  </ItemGroup>
+
+</Project>
