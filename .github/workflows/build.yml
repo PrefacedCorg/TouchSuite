@@ -69,6 +69,13 @@ jobs:
           dotnet restore src/TouchSuite.App/TouchSuite.App.csproj
           dotnet build src/TouchSuite.App/TouchSuite.App.csproj -c Release --no-restore
 
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchSuite.App
+          path: src/TouchSuite.App/bin/Release/net10.0-windows/
+          if-no-files-found: error
+
   app_old:
     name: TouchSuite.App.old
     needs: changes
@@ -88,6 +95,13 @@ jobs:
           dotnet restore src/TouchSuite.App.old/TouchSuite.App.old.csproj
           dotnet build src/TouchSuite.App.old/TouchSuite.App.old.csproj -c Release --no-restore
 
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchSuite.App.old
+          path: src/TouchSuite.App.old/bin/Release/net10.0-windows/
+          if-no-files-found: error
+
   receiver:
     name: TouchSuite.Receiver
     needs: changes
@@ -106,6 +120,13 @@ jobs:
         run: |
           dotnet restore src/TouchSuite.Receiver/TouchSuite.Receiver.csproj
           dotnet build src/TouchSuite.Receiver/TouchSuite.Receiver.csproj -c Release --no-restore
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchSuite.Receiver
+          path: src/TouchSuite.Receiver/bin/Release/net9.0-windows/
+          if-no-files-found: error
 
   android:
     name: Android（APK）
@@ -134,7 +155,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: TouchSuite-android-debug
-          path: |
-            android/app/build/outputs/apk/debug/app-debug.apk
-            dist/TouchBridge-debug.apk
+          # dist/ 下的是 gradle 的 copyDebugApk 任务复制出来的同一份 APK，只取它一份即可
+          path: dist/TouchBridge-debug.apk
           if-no-files-found: error
