@@ -122,17 +122,10 @@ public partial class EraserPreviewPage : UserControl
     /// <summary>最近一次喂入的样本（抬手后仍显示最后看到的值）。</summary>
     private TouchSample? _lastSample;
 
-    /// <summary>最近一次「WPF 通路」样本，用于面积对比栏的 WPF 侧。</summary>
-    private TouchSample? _lastWpfSample;
-
     /// <summary>把一次触摸样本按来源换算成预览区坐标后交给引擎（多指=逐根各喂一次，各画各的框）。</summary>
     public void SubmitSample(TouchSample s)
     {
         _lastSample = s;
-
-        // 按通路各留一份最近样本，供「面积对比」栏显示。
-        if (s.Source is "WPF")
-            _lastWpfSample = s;
 
         if (Engine.MmPerDiuX <= 0 || Engine.MmPerDiuY <= 0)
             return;
@@ -142,6 +135,13 @@ public partial class EraserPreviewPage : UserControl
 
         switch (s.Source)
         {
+            case "RawHID":
+                {
+                    // 位置与尺寸都用 HID 自己的（归一化 Xn/Yn → 虚拟桌面 → 预览区局部坐标）
+                    SubmitHidRect(s.WidthMm, s.HeightMm, s.XNorm, s.YNorm);
+                    break;
+                }
+
             case "STYLUS":
                 {
                     // 只有压感、没有尺寸：让引擎按最新压力重算并重画（"随压力变化"模式靠这条实时生效）
@@ -172,18 +172,45 @@ public partial class EraserPreviewPage : UserControl
         }
     }
 
-    // ================= 参数控件 =================
+    private Point HostCenter => new(Host.ActualWidth / 2, Host.ActualHeight / 2);
 
-    private void OnSourceModeChanged(object sender, SelectionChangedEventArgs e)
+    /// <summary>把 HID 的尺寸 + 归一化坐标合成一个原始HID 矩形喂给引擎（id 固定 0：HID 是单触点）。
+    /// Xn/Yn 为数字化器归一化坐标 → 虚拟桌面 DIP → 预览区局部坐标（与主程序同一套换算法）。</summary>
+    private void SubmitHidRect(double? wMm, double? hMm, double? xn, double? yn)
     {
-        if (SourceModeCombo is null)
-            return; // XAML 解析期提前触发
-        Engine.SetMode(SourceModeCombo.SelectedIndex switch
+        if (wMm is not double wv || hMm is not double hv || Engine.MmPerDiuX <= 0 || Engine.MmPerDiuY <= 0)
+            return;
+        double wDiu = wv / Engine.MmPerDiuX;
+        double hDiu = hv / Engine.MmPerDiuY;
+
+        Point center;
+        if (xn is double x && yn is double y)
         {
-            1 => SourceMode.SoftwareWpf,
-            _ => SourceMode.Auto,
-        });
+            DpiScale dpi = VisualTreeHelper.GetDpi(this);
+            Point hostOrigin = Host.PointToScreen(new Point(0, 0));   // 设备像素
+            double screenDipX = SystemParameters.VirtualScreenLeft + Math.Clamp(x, 0, 1) * SystemParameters.VirtualScreenWidth;
+            double screenDipY = SystemParameters.VirtualScreenTop + Math.Clamp(y, 0, 1) * SystemParameters.VirtualScreenHeight;
+            center = new Point(screenDipX - hostOrigin.X / dpi.DpiScaleX,
+                               screenDipY - hostOrigin.Y / dpi.DpiScaleY);
+        }
+        else
+        {
+            center = HostCenter;
+        }
+
+        // 夹取到预览区内，避免坐标异常时把擦除区画到看不见的地方
+        if (Host.ActualWidth > 0)
+            center.X = Math.Clamp(center.X, 0, Host.ActualWidth);
+        if (Host.ActualHeight > 0)
+            center.Y = Math.Clamp(center.Y, 0, Host.ActualHeight);
+
+        Engine.Submit(ContactSource.RawHid, 0,
+            new Rect(center.X - wDiu / 2, center.Y - hDiu / 2, wDiu, hDiu),
+            applyThreshold: false,
+            detail: $"HID {Precision.Fmt(wv)}×{Precision.Fmt(hv)} mm");
     }
+
+    // ================= 参数控件 =================
 
     private void OnShapeChanged(object sender, RoutedEventArgs e)
     {

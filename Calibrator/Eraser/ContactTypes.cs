@@ -3,10 +3,11 @@ using System.Windows;
 namespace TouchErase.Calibrator.Eraser;
 
 /// <summary>
-/// 接触尺寸的来源。当前只保留 WPF 一路（虚拟/远程 HID 通路已整体移除）。
+/// 接触尺寸的来源（两路）：
+/// <para>RawHid = RawInput（WM_INPUT）解出的设备上报尺寸（mm 真值，面积=W×H）；</para>
 /// <para>Wpf = 系统的 TouchPoint.Bounds 接触框（软件量纲，需 mm/DIP 折算）。</para>
 /// </summary>
-public enum ContactSource { None, Wpf }
+public enum ContactSource { None, Wpf, RawHid }
 
 /// <summary>
 /// 来源选择（用户下拉）。当前只保留 WPF 一路 + 自适应。
@@ -22,6 +23,7 @@ public static class SourceNames
 {
     public static string Of(ContactSource s) => s switch
     {
+        ContactSource.RawHid => "原始HID（设备上报）",
         ContactSource.Wpf => "WPF（系统接触框）",
         _ => "无",
     };

@@ -17,7 +17,7 @@ public sealed class EraserEngine
     public const double MinContactMm = 0.1;       // 小于此物理尺寸视为"驱动未上报有效接触面积"（真手指/手掌远大于此，0.1 只为滤掉近 0 的占位值）
 
     private static readonly ContactSource[] PriorityOrder =
-        { ContactSource.Wpf };
+        { ContactSource.RawHid, ContactSource.Wpf };
 
     // ================= 由外部喂入 =================
 
@@ -229,14 +229,22 @@ public sealed class EraserEngine
             return;
         }
 
+        // 只有"生效来源"的样本才写尺寸轨道：同一次按下 HID 与 WPF 两路都会出帧，
+        // 若都写，尺寸/位置会在两路之间来回跳、甚至各画一个框。非生效来源只更新状态后返回。
+        if (src != eff)
+        {
+            Raise();
+            return;
+        }
+
         if (eff != _active)
         {
             _active = eff;
             _tracks.Clear(); // 换来源就重置滤波，避免不同量纲互相污染
         }
 
-        // WPF 接触框是软件量纲（DIP），统一套 mm 阈值过滤退化值
-        UpdateFromContact(contactId, rectDiu, applyThreshold: true);
+        // 原始HID = 设备上报的真值，不套 mm 阈值；WPF 接触框是软件量纲（DIP），套阈值过滤退化值
+        UpdateFromContact(contactId, rectDiu, applyThreshold);
         Raise();
     }
 

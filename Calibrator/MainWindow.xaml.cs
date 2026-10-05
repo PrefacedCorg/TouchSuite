@@ -3,6 +3,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Ink;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using TouchErase.Calibrator.Eraser;
@@ -64,12 +65,14 @@ public partial class MainWindow : Window
     private long _lastInfoBarTicks;     // 信息栏刷新节流（实时压感 60Hz，节流后才看得清）
     private double? _liveAreaMm2;       // 手掌/手指实时接触面积（来自 WPF Touch）
     private double? _livePressure;      // 手掌/手指实时压感（来自 WPF Stylus）
-    private int _palmSourceMode;        // 手掌：0=自适应 1=软件WPF
-    private int _fingerSourceMode;      // 手指：同上
     private long _lastPressTicks;       // 上一次收到样本的时刻（判"抬手"用）
     private const long PressGapMs = 350;   // 静默超过此时长视为抬手，下一次样本算新的一次按压
-    private string _palmActiveSource = "";     // 手掌当前实际生效的原始来源
-    private string _fingerActiveSource = "";   // 手指当前实际生效的原始来源
+
+    // 原始HID（RawInput）：设备上报的接触尺寸→面积 + 压感；映射表只读展示
+    private IntPtr _hwnd;
+    private List<HidReader.HidDeviceInfo> _hidDevices = new();
+    private long _lastHidLogTicks;
+    private long _lastHidTicks;         // 最近一次有效原始HID 样本时刻（HID 新鲜时忽略 WPF 面积，避免打架）
 
     public MainWindow()
     {
@@ -91,6 +94,81 @@ public partial class MainWindow : Window
             Color = Color.FromRgb(0x22, 0x66, 0xCC),
             FitToCurve = true,
         };
+    }
+
+    // ================= 原始HID（RawInput）=================
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        _hwnd = new WindowInteropHelper(this).Handle;
+        if (PresentationSource.FromVisual(this) is HwndSource src)
+            src.AddHook(WndProc);
+
+        _hidDevices = HidReader.Scan();
+        bool ok = HidReader.Register(_hwnd);
+        Log.Info($"原始HID 触摸注册 = {ok}；HID 设备 {_hidDevices.Count} 个（触摸类 {_hidDevices.Count(d => d.IsTouchScreen)} 个）");
+        foreach (HidReader.HidDeviceInfo d in _hidDevices.Where(d => d.IsTouchScreen))
+            Log.Info($"HID(raw): {d.DeviceName} | W={d.HasWidth} H={d.HasHeight} P={d.HasPressure} | 宽:{d.WidthDetail} 高:{d.HeightDetail} 压感:{d.PressureDetail} | {d.XYDetail}");
+    }
+
+    private const int WM_INPUT = 0x00FF;
+
+    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg == WM_INPUT)
+        {
+            HidReader.WmInputResult r = HidReader.TryHandleWmInput(lParam, out HidReader.RawTouchSample? sample);
+
+            // 句柄不在能力表（设备中途重枚举）→ 节流重扫一次再解
+            if (r == HidReader.WmInputResult.UnknownDevice && HidReader.TryBeginAutoRescan())
+            {
+                _hidDevices = HidReader.Scan();
+                HidReader.TryHandleWmInput(lParam, out sample);
+            }
+
+            if (sample is not null)
+                HandleHidSample(sample);
+        }
+        return IntPtr.Zero;
+    }
+
+    /// <summary>原始HID 样本：只取「接触尺寸→面积」与「压感」，封装成 TouchSample 走同一条处理链。</summary>
+    private void HandleHidSample(HidReader.RawTouchSample s)
+    {
+        if (s.WidthMm is not double w || s.HeightMm is not double h)
+            return;   // 没尺寸的帧不带面积（空槽位/占位值）
+
+        long now = Environment.TickCount64;
+        _lastHidTicks = now;
+        if (now - _lastHidLogTicks >= 100)
+        {
+            _lastHidLogTicks = now;
+            Log.Info($"原始HID: 设备={ShortName(s.DeviceName)} W={s.WidthLogical}({Precision.Fmt(w)}mm) H={s.HeightLogical}({Precision.Fmt(h)}mm)"
+                     + $" X={s.XLogical}/{s.XLogMax}({Precision.Fmt(s.XNorm, 4)}) Y={s.YLogical}/{s.YLogMax}({Precision.Fmt(s.YNorm, 4)})"
+                     + $" 面积={Precision.Fmt(w * h, 0)}mm² 压感={Precision.Fmt(s.Pressure01, 3)} raw=[{s.Hex}]");
+        }
+
+        OnSample(new TouchSample("RawHID", s.WidthMm, s.HeightMm, s.Pressure01,
+            Detail: $"W={s.WidthLogical} H={s.HeightLogical} raw=[{s.Hex}]",
+            WidthLogical: s.WidthLogical, HeightLogical: s.HeightLogical,
+            XNorm: s.XNorm, YNorm: s.YNorm));
+    }
+
+    /// <summary>原始HID 设备换算表（映射表）文字，只读展示。</summary>
+    private string HidTableText()
+    {
+        List<HidReader.HidDeviceInfo> touch = _hidDevices.Where(d => d.IsTouchScreen).ToList();
+        if (touch.Count == 0)
+            return "原始HID 映射表：（未发现触摸类 HID 设备）";
+        return "原始HID 映射表：" + string.Join("",
+            touch.Select(d => $"\n  {ShortName(d.DeviceName)}：宽 [{d.WidthDetail}]；高 [{d.HeightDetail}]；压感 [{d.PressureDetail}]；X/Y [{d.XYDetail}]"));
+    }
+
+    private static string ShortName(string path)
+    {
+        string[] parts = path.Split('#');
+        return parts.Length >= 3 ? $"{parts[1]} #{parts[2]}" : path;
     }
 
     // ================= 生命周期 =================
@@ -141,9 +219,9 @@ public partial class MainWindow : Window
         // 面积擦预览：状态回显到底部状态栏
         EraserPage.Status += SetStatus;
 
-        _result.DeviceName = "WPF 触摸通路";
-        Log.Info("接触来源：WPF TouchPoint.Bounds（面积）+ Stylus PressureFactor（压感）");
-        SetStatus("触摸来源：WPF 接触框 + 压感（按一下预览区即可看到面积）");
+        _result.DeviceName = "WPF + 原始HID";
+        Log.Info("接触来源：原始HID（RawInput WM_INPUT：W×H 面积 + TipPressure 压感）+ WPF TouchPoint.Bounds/Stylus 兜底");
+        SetStatus("触摸来源：原始HID 优先（设备上报 mm），WPF 兜底；按一下预览区即可看到面积");
 
         // 启动时若存在上次保存的标定，询问是否载入（载入则直接跳到结果页）
         if (!TryLoadSaved())
@@ -571,11 +649,6 @@ public partial class MainWindow : Window
         else if (step == 3)
             RecomputePalmSize();   // 进入手掌尺寸步时按当前输入框重算
 
-        if (step == 4 && PalmSourceInfoText is not null)
-            PalmSourceInfoText.Text = "当前生效：" + EffectiveSourceLabel(_palmSourceMode, _palmActiveSource);
-        else if (step == 5 && FingerSourceInfoText is not null)
-            FingerSourceInfoText.Text = "当前生效：" + EffectiveSourceLabel(_fingerSourceMode, _fingerActiveSource);
-
         Log.Info($"进入 {StepTitles[step]}");
     }
 
@@ -735,9 +808,7 @@ public partial class MainWindow : Window
         if (_step != 4 && _step != 5)
             return;
 
-        // 当前步骤选定的接触来源（自适应 / 软件WPF）
-        int mode = _step == 4 ? _palmSourceMode : _fingerSourceMode;
-        if (!Accept(mode, s, nowTicks))
+        if (!Accept(s))
             return;
 
         double? area = s.AreaMm2;
@@ -759,11 +830,8 @@ public partial class MainWindow : Window
                 _palmPeakAreaMm2 = null;
                 _palmPeakPressure = null;
             }
-            _palmActiveSource = s.Source;
             if (area is double a && a > (_palmPeakAreaMm2 ?? 0)) _palmPeakAreaMm2 = a;
             if (press is double p && p > (_palmPeakPressure ?? 0)) _palmPeakPressure = p;
-            if (PalmSourceInfoText is not null)
-                PalmSourceInfoText.Text = "当前生效：" + EffectiveSourceLabel(_palmSourceMode, _palmActiveSource);
             PalmLiveText.Text = LiveText();
             RefreshPalmPeakText();
         }
@@ -774,62 +842,24 @@ public partial class MainWindow : Window
                 _fingerPeakAreaMm2 = null;
                 _fingerPeakPressure = null;
             }
-            _fingerActiveSource = s.Source;
             if (area is double a && a > (_fingerPeakAreaMm2 ?? 0)) _fingerPeakAreaMm2 = a;
             if (press is double p && p > (_fingerPeakPressure ?? 0)) _fingerPeakPressure = p;
-            if (FingerSourceInfoText is not null)
-                FingerSourceInfoText.Text = "当前生效：" + EffectiveSourceLabel(_fingerSourceMode, _fingerActiveSource);
             FingerLiveText.Text = LiveText();
             RefreshFingerPeakText();
         }
     }
 
-    /// <summary>把原始来源名合并成"逻辑来源"（WPF 面积 与 Stylus 压感同属 WPF 通路）。</summary>
-    private static string LogicalSource(string src) => src switch
+    /// <summary>
+    /// 该样本是否参与标定采样。原始HID 与 WPF 会同时出帧，故 HID 新鲜时忽略 WPF 的面积，
+    /// 避免两路面积互相打架；Stylus 只带压感、不参与面积，始终放行。
+    /// </summary>
+    private bool Accept(TouchSample s)
     {
-        "WPF" or "STYLUS" => "软件WPF（系统接触框 + 软件推算）",
-        _ => src.Length > 0 ? src : "—",
-    };
-
-    /// <summary>「当前生效」一行的文字：自适应下显示实际锁定的来源，手动模式下显示所选来源。</summary>
-    private static string EffectiveSourceLabel(int mode, string active)
-    {
-        if (mode != 0)
-            return mode switch
-            {
-                1 => "软件WPF（系统接触框 + 软件推算）",
-                _ => "—",
-            };
-        return active.Length > 0 ? LogicalSource(active) : "自适应：识别中…";
-    }
-
-    /// <summary>该来源在当前选择下是否参与标定采样。mode：0=自适应 1=软件WPF。</summary>
-    private bool Accept(int mode, TouchSample s, long now)
-    {
-        _ = mode;
-        _ = now;
-        // 当前只有 WPF 通路：Touch 面积 + Stylus 压感都收
-        return s.Source is "WPF" or "STYLUS";
-    }
-
-    private void OnPalmSourceModeChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (PalmSourceCombo is null)
-            return;
-        _palmSourceMode = Math.Max(0, PalmSourceCombo.SelectedIndex);
-        _palmActiveSource = "";
-        if (PalmSourceInfoText is not null)
-            PalmSourceInfoText.Text = "当前生效：" + EffectiveSourceLabel(_palmSourceMode, "");
-    }
-
-    private void OnFingerSourceModeChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (FingerSourceCombo is null)
-            return;
-        _fingerSourceMode = Math.Max(0, FingerSourceCombo.SelectedIndex);
-        _fingerActiveSource = "";
-        if (FingerSourceInfoText is not null)
-            FingerSourceInfoText.Text = "当前生效：" + EffectiveSourceLabel(_fingerSourceMode, "");
+        if (s.Source is "RawHID" or "STYLUS")
+            return true;
+        if (s.Source != "WPF")
+            return false;
+        return Environment.TickCount64 - _lastHidTicks > EraserEngine.SourceFreshMs;
     }
 
     /// <summary>「实时：」一行的文字：面积（WPF Touch）与压感（WPF Stylus）分别显示当前值。</summary>
@@ -999,7 +1029,9 @@ public partial class MainWindow : Window
             // ④ 阈值 + 当前实时值
             + $"面积阈值：{FmtArea(_result.ThresholdAreaMm2)}"
             + $"    当前接触：{(_liveAreaMm2 is double la ? Precision.Fmt(la, 1) + " mm²" : "—")}"
-            + $"    当前压感：{(_livePressure is double lp ? Precision.Fmt(lp, 2) : "—")}";
+            + $"    当前压感：{(_livePressure is double lp ? Precision.Fmt(lp, 2) : "—")}\n"
+            // ⑤ 原始HID 映射表（设备换算表，只读展示）
+            + HidTableText();
     }
 
     private static string FmtPressureVal(double? p) => p is double v ? Precision.Fmt(v, 2) : "—";
