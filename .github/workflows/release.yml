@@ -35,7 +35,7 @@ jobs:
         run: |
           $v = "${{ inputs.version }}".Trim()
           if (-not $v) {
-            $m = Select-String -Path TouchErase.csproj -Pattern '<Version>([^<]+)</Version>'
+            $m = Select-String -Path src/TouchErase/TouchErase.csproj -Pattern '<Version>([^<]+)</Version>'
             $v = $m.Matches[0].Groups[1].Value
           }
           "version=$v" >> $env:GITHUB_OUTPUT
@@ -43,14 +43,14 @@ jobs:
           Write-Host "release version = $v"
 
       - name: Restore
-        run: dotnet restore TouchErase.csproj
+        run: dotnet restore src/TouchErase/TouchErase.csproj
 
       - name: Build
-        run: dotnet build TouchErase.csproj -c Release --no-restore
+        run: dotnet build src/TouchErase/TouchErase.csproj -c Release --no-restore
 
       - name: Publish (self-contained, single file, win-x64)
         run: >
-          dotnet publish TouchErase.csproj -c Release -r win-x64
+          dotnet publish src/TouchErase/TouchErase.csproj -c Release -r win-x64
           --self-contained true
           -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true

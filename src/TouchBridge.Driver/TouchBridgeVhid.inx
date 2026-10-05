@@ -1,0 +1,72 @@
+; TouchBridgeVhid.inx —— TouchBridge 虚拟触摸屏（VHF）驱动的安装信息（.inx 模板）
+;
+; 说明：WDK 构建会先用 stampinf 把本文件戳成 TouchBridgeVhid.inf（替换 DriverVer），
+;       再由 inf2cat 生成 TouchBridgeVhid.cat。不要手改生成的 .inf / .cat。
+;
+; 架构与 Uu 远程 的 uuycinput.inf 一致：
+;   - 根枚举设备（ROOT\TouchBridgeVhid），驱动内用 VHF API 创建虚拟 HID 触摸屏
+;   - LowerFilters = "vhf"（虚拟 HID 框架）
+;
+; 安装（管理员）：devcon install TouchBridgeVhid.inf ROOT\TouchBridgeVhid
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderString%
+DriverVer   = 10/05/2026,1.0.0.0
+CatalogFile = TouchBridgeVhid.cat
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderString% = TouchBridge,NTamd64.10.0...16299
+
+[ControlFlags]
+ExcludeFromSelect = *
+
+[TouchBridge.NTamd64.10.0...16299]
+%DeviceDesc% = TouchBridgeVhid_Inst, ROOT\TouchBridgeVhid
+
+[TouchBridgeVhid_Inst.NT]
+CopyFiles = TouchBridgeVhid_CopyFiles
+
+[TouchBridgeVhid_Inst.NT.HW]
+AddReg = TouchBridgeVhid_AddReg
+
+[TouchBridgeVhid_AddReg]
+HKR,,"LowerFilters",0x00010000,"vhf"
+
+[TouchBridgeVhid_Inst.NT.Services]
+AddService = TouchBridgeVhid,%SPSVCINST_ASSOCSERVICE%,TouchBridgeVhid_Service
+
+[TouchBridgeVhid_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1                  ; SERVICE_KERNEL_DRIVER
+StartType     = 3                  ; SERVICE_DEMAND_START
+ErrorControl  = 1                  ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\TouchBridgeVhid.sys
+
+[TouchBridgeVhid_Inst.NT.Wdf]
+KmdfService = TouchBridgeVhid,TouchBridgeVhid_wdfsect
+
+[TouchBridgeVhid_wdfsect]
+KmdfLibraryVersion = 1.15
+
+[TouchBridgeVhid_CopyFiles]
+TouchBridgeVhid.sys
+
+[SourceDisksNames]
+1 = %DiskDesc%,,,
+
+[SourceDisksFiles]
+TouchBridgeVhid.sys = 1
+
+[DestinationDirs]
+TouchBridgeVhid_CopyFiles = 12     ; %SystemRoot%\System32\drivers
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ProviderString = "TouchBridge"
+DeviceDesc     = "TouchBridge Virtual Touch Screen (VHF)"
+ServiceDesc    = "TouchBridge Virtual Touch Screen Service"
+DiskDesc       = "TouchBridge Virtual Touch Screen Install Disk"

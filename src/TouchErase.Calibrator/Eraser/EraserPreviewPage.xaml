@@ -26,8 +26,21 @@
                     <TextBlock Text="读驱动上报的接触矩形 → 实时画出等大的擦除区（按多大，擦多大）"
                                TextWrapping="Wrap" Foreground="#FF666666" Margin="0,4,0,0" />
 
-                    <TextBlock Text="接触来源：软件WPF（系统接触框 + 软件推算）" Margin="0,6,0,0"
-                               Foreground="#FF444444" TextWrapping="Wrap" />
+                    <TextBlock Text="接触来源：" Margin="0,6,0,0" Foreground="#FF444444" />
+                    <ComboBox x:Name="SourceModeCombo" SelectedIndex="0" Margin="0,4,0,0"
+                              SelectionChanged="OnSourceModeChanged">
+                        <ComboBoxItem Content="自适应（自动锁定）" />
+                        <ComboBoxItem Content="原始HID（设备上报尺寸）" />
+                        <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
+                    </ComboBox>
+                    <StackPanel x:Name="HidMmPanel" Margin="0,4,0,0" Visibility="Collapsed">
+                        <TextBlock Text="HID mm 来源：" Foreground="#FF444444" />
+                        <ComboBox x:Name="HidMmCombo" SelectedIndex="0" Margin="0,2,0,0"
+                                  SelectionChanged="OnHidMmChanged">
+                            <ComboBoxItem Content="映射表上报（设备声明 mm）" />
+                            <ComboBoxItem Content="校准时取得（按屏幕标定换算）" />
+                        </ComboBox>
+                    </StackPanel>
                     <TextBlock x:Name="SourceInfoText" Text="当前来源: 无" Margin="0,6,0,0" FontFamily="Consolas"
                                FontSize="11" Foreground="#FF0A5A9A" TextWrapping="Wrap" />
 

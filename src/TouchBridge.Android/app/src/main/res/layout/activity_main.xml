@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="TouchBridge"
+            android:textSize="26sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:layout_marginBottom="20dp"
+            android:text="把平板的触摸（位置 / 接触面积 / 压感）实时转发到 Windows"
+            android:textSize="14sp" />
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="电脑 IP 地址（IPv4 或 IPv6）">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/hostInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="text"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:hint="端口">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/portInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="22dp"
+            android:background="#33000000" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="18dp"
+            android:text="模拟连接（调试用）"
+            android:textSize="17sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="不接管真实触摸：持续把屏幕正中的一个接触点发给电脑。压力 prs、面积 size 用滑块拖动，抖动 px、左右偏移可手填，改完立即生效。此模式不显示覆盖层，也不需要悬浮窗权限。"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/simPressureLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="压力 prs"
+            android:textSize="14sp" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/simPressureSlider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:stepSize="0.1"
+            android:value="7"
+            android:valueFrom="0"
+            android:valueTo="20" />
+
+        <TextView
+            android:id="@+id/simSizeLabel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="接触面积 size"
+            android:textSize="14sp" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/simSizeSlider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:stepSize="10"
+            android:value="400"
+            android:valueFrom="0"
+            android:valueTo="1000" />
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:hint="左右偏移 px（正 = 右，负 = 左）">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/simOffsetXInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="numberSigned"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:hint="抖动 px（±，0 = 固定）">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/simJitterInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:maxLines="1" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/simulateButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="开始模拟"
+            style="@style/Widget.Material3.Button.OutlinedButton" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="22dp"
+            android:background="#33000000" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/grantButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="授予「显示在其他应用上层」权限" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/startButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="开始转发" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/stopButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="停止转发"
+            style="@style/Widget.Material3.Button.OutlinedButton" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="状态：未运行"
+            android:textSize="14sp" />
+
+        <TextView
+            android:id="@+id/hintText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:lineSpacingExtra="4dp"
+            android:text="使用步骤：\n1. 在电脑上运行 TouchBridge.Receiver（默认监听 9000 端口，IPv6/IPv4 双栈）。\n2. 手机与电脑连到同一个 WiFi。\n3. 填写电脑 IP 与端口，授予悬浮窗权限后点「开始转发」。\n4. 开始后平板会全屏接管触摸，点右上角「停止转发」或通知栏按钮结束。\n\n关于 IPv6：电脑端启动时会列出本机可填的 IPv4 / IPv6 地址，复制其中一个填进来即可。IPv6 可以直接填地址（也可带方括号），程序会优先尝试 IPv4，失败再尝试 IPv6；`fe80::` 链路本地地址一般不用填。\n\n说明：接触面积与压感取决于平板硬件是否上报；若设备不报接触尺寸，可在电脑端用 --contact-fallback 指定回退直径。"
+            android:textSize="13sp" />
+    </LinearLayout>
+</ScrollView>

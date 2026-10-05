@@ -31,6 +31,10 @@ public sealed class EraserEngine
     // ================= 设置（界面绑定） =================
 
     public SourceMode Mode { get; private set; } = SourceMode.Auto;
+
+    /// <summary>HID 模式下接触尺寸（mm）的来源：映射表上报 / 校准时取得。</summary>
+    public HidMmSource HidMmSource { get; private set; } = HidMmSource.Mapped;
+
     public EraserShape Shape { get; set; } = EraserShape.Rectangle;
 
     /// <summary>随接触尺寸变化（按多大擦多大）：擦除面积 = 接触面积 × 倍率²；关闭则固定为手掌面积。</summary>
@@ -176,6 +180,15 @@ public sealed class EraserEngine
         Raise();
     }
 
+    /// <summary>HID mm 来源（映射表 / 校准）；切换后重置滤波，避免两套量纲互相污染。</summary>
+    public void SetHidMmSource(HidMmSource src)
+    {
+        HidMmSource = src;
+        Log.Info($"HID mm 来源 = {src}");
+        _tracks.Clear();
+        Raise();
+    }
+
     // ================= 统一入口：三路来源仲裁 =================
 
     /// <summary>提交一根接触的矩形（DIU）。contactId 标识是哪根手指（WPF=TouchDevice.Id，HID=contact id），
@@ -258,6 +271,7 @@ public sealed class EraserEngine
         {
             ContactSource want = Mode switch
             {
+                SourceMode.RawHid => ContactSource.RawHid,
                 SourceMode.SoftwareWpf => ContactSource.Wpf,
                 _ => ContactSource.None,
             };

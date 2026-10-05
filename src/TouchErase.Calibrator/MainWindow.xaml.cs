@@ -74,6 +74,11 @@ public partial class MainWindow : Window
     private long _lastHidLogTicks;
     private long _lastHidTicks;         // 最近一次有效原始HID 样本时刻（HID 新鲜时忽略 WPF 面积，避免打架）
 
+    // 来源下拉
+    private bool _suppressSourceUi;     // 同步多个下拉时抑制 SelectionChanged 回环
+    private string _palmActiveSource = "";     // 手掌当前实际生效的原始来源
+    private string _fingerActiveSource = "";   // 手指当前实际生效的原始来源
+
     public MainWindow()
     {
         InitializeComponent();
@@ -82,6 +87,9 @@ public partial class MainWindow : Window
 
         // 「保存结果到文件」按钮在预览页里（EraserPreviewPage.xaml），宿主只负责落盘
         EraserPage.SaveRequested += OnSaveRequested;
+
+        // 预览页的来源下拉改动 → 同步本窗口第 5/6 步的两个下拉
+        EraserPage.SourceSelectionChanged += SyncSourceUi;
 
         // 默认两项都判"准"（对应界面 RadioButton 的默认选中），首次标尺即按 EDID 原样
         _result.WidthRulerOk = true;
@@ -152,7 +160,8 @@ public partial class MainWindow : Window
         OnSample(new TouchSample("RawHID", s.WidthMm, s.HeightMm, s.Pressure01,
             Detail: $"W={s.WidthLogical} H={s.HeightLogical} raw=[{s.Hex}]",
             WidthLogical: s.WidthLogical, HeightLogical: s.HeightLogical,
-            XNorm: s.XNorm, YNorm: s.YNorm));
+            XNorm: s.XNorm, YNorm: s.YNorm,
+            XLogMax: s.XLogMax, YLogMax: s.YLogMax));
     }
 
     /// <summary>原始HID 设备换算表（映射表）文字，只读展示。</summary>
@@ -170,6 +179,71 @@ public partial class MainWindow : Window
         string[] parts = path.Split('#');
         return parts.Length >= 3 ? $"{parts[1]} #{parts[2]}" : path;
     }
+
+    // ================= 来源下拉 =================
+
+    private void OnPalmSourceModeChanged(object sender, SelectionChangedEventArgs e)
+        => ApplySourceUi(((ComboBox)sender).SelectedIndex, null);
+
+    private void OnFingerSourceModeChanged(object sender, SelectionChangedEventArgs e)
+        => ApplySourceUi(((ComboBox)sender).SelectedIndex, null);
+
+    private void OnPalmHidMmChanged(object sender, SelectionChangedEventArgs e)
+        => ApplySourceUi(null, ((ComboBox)sender).SelectedIndex);
+
+    private void OnFingerHidMmChanged(object sender, SelectionChangedEventArgs e)
+        => ApplySourceUi(null, ((ComboBox)sender).SelectedIndex);
+
+    /// <summary>把某个下拉的改动落实到引擎，再把所有下拉同步成引擎当前状态。</summary>
+    private void ApplySourceUi(int? modeIndex, int? mmIndex)
+    {
+        if (_suppressSourceUi || !IsLoaded || EraserPage is null)
+            return;
+        if (modeIndex is int mi)
+            EraserPage.Engine.SetMode((SourceMode)Math.Clamp(mi, 0, 2));
+        if (mmIndex is int hi)
+            EraserPage.Engine.SetHidMmSource((HidMmSource)Math.Clamp(hi, 0, 1));
+        SyncSourceUi();
+    }
+
+    /// <summary>按引擎当前来源状态刷新三处下拉与 HID mm 面板可见性。</summary>
+    private void SyncSourceUi()
+    {
+        if (PalmSourceCombo is null || EraserPage is null)
+            return;
+
+        SourceMode mode = EraserPage.Engine.Mode;
+        HidMmSource mm = EraserPage.Engine.HidMmSource;
+        Visibility hidVis = mode == SourceMode.RawHid ? Visibility.Visible : Visibility.Collapsed;
+
+        _suppressSourceUi = true;
+        if (FingerSourceCombo is not null) FingerSourceCombo.SelectedIndex = (int)mode;
+        PalmSourceCombo.SelectedIndex = (int)mode;
+        if (PalmHidMmCombo is not null) PalmHidMmCombo.SelectedIndex = (int)mm;
+        if (FingerHidMmCombo is not null) FingerHidMmCombo.SelectedIndex = (int)mm;
+        if (PalmHidMmPanel is not null) PalmHidMmPanel.Visibility = hidVis;
+        if (FingerHidMmPanel is not null) FingerHidMmPanel.Visibility = hidVis;
+        _suppressSourceUi = false;
+
+        EraserPage.SyncSourceSelection(mode, mm);
+        UpdateSourceInfoText();
+    }
+
+    /// <summary>第 5/6 步「当前生效」：显示当前实际生效的来源。</summary>
+    private void UpdateSourceInfoText()
+    {
+        if (PalmSourceInfoText is not null)
+            PalmSourceInfoText.Text = "当前生效：" + ActiveLabel(_palmActiveSource);
+        if (FingerSourceInfoText is not null)
+            FingerSourceInfoText.Text = "当前生效：" + ActiveLabel(_fingerActiveSource);
+    }
+
+    private static string ActiveLabel(string src) => src switch
+    {
+        "RawHID" => SourceNames.Of(ContactSource.RawHid),
+        "WPF" or "STYLUS" => SourceNames.Of(ContactSource.Wpf),
+        _ => "—",
+    };
 
     // ================= 生命周期 =================
 
@@ -221,7 +295,9 @@ public partial class MainWindow : Window
 
         _result.DeviceName = "WPF + 原始HID";
         Log.Info("接触来源：原始HID（RawInput WM_INPUT：W×H 面积 + TipPressure 压感）+ WPF TouchPoint.Bounds/Stylus 兜底");
-        SetStatus("触摸来源：原始HID 优先（设备上报 mm），WPF 兜底；按一下预览区即可看到面积");
+        SetStatus("触摸来源：可在第 5/6 步下拉里选「自适应 / 原始HID / 软件WPF」；HID 还可选 mm 来源（映射表 / 校准）");
+
+        SyncSourceUi();
 
         // 启动时若存在上次保存的标定，询问是否载入（载入则直接跳到结果页）
         if (!TryLoadSaved())
@@ -799,7 +875,7 @@ public partial class MainWindow : Window
         if (_step == 6)
         {
             // 信息栏的「当前接触 / 当前压感」在最后一页也要更新（原来这一步提前 return，值永远为 —）
-            if (s.AreaMm2 is double la6) _liveAreaMm2 = la6;
+            if (SampleArea(s) is double la6) _liveAreaMm2 = la6;
             if (s.Pressure01 is double lp6) _livePressure = lp6;
             EraserPage.SubmitSample(s);
             return;
@@ -811,7 +887,7 @@ public partial class MainWindow : Window
         if (!Accept(s))
             return;
 
-        double? area = s.AreaMm2;
+        double? area = SampleArea(s);
         double? press = s.Pressure01;
         if (area is null && press is null)
             return;
@@ -830,10 +906,12 @@ public partial class MainWindow : Window
                 _palmPeakAreaMm2 = null;
                 _palmPeakPressure = null;
             }
+            _palmActiveSource = s.Source;
             if (area is double a && a > (_palmPeakAreaMm2 ?? 0)) _palmPeakAreaMm2 = a;
             if (press is double p && p > (_palmPeakPressure ?? 0)) _palmPeakPressure = p;
             PalmLiveText.Text = LiveText();
             RefreshPalmPeakText();
+            UpdateSourceInfoText();
         }
         else
         {
@@ -842,24 +920,44 @@ public partial class MainWindow : Window
                 _fingerPeakAreaMm2 = null;
                 _fingerPeakPressure = null;
             }
+            _fingerActiveSource = s.Source;
             if (area is double a && a > (_fingerPeakAreaMm2 ?? 0)) _fingerPeakAreaMm2 = a;
             if (press is double p && p > (_fingerPeakPressure ?? 0)) _fingerPeakPressure = p;
             FingerLiveText.Text = LiveText();
             RefreshFingerPeakText();
+            UpdateSourceInfoText();
         }
     }
 
+    /// <summary>样本的接触面积（mm²）：原始HID 按当前「HID mm 来源」取（映射表 / 校准），其余用样本自带。</summary>
+    private double? SampleArea(TouchSample s)
+    {
+        if (s.Source != "RawHID" || EraserPage is null)
+            return s.AreaMm2;
+        (double? w, double? h) = HidScale.ContactMm(s, EraserPage.Engine.HidMmSource, _mmPerDiuX, _mmPerDiuY);
+        return w is double wv && h is double hv ? wv * hv : null;
+    }
+
     /// <summary>
-    /// 该样本是否参与标定采样。原始HID 与 WPF 会同时出帧，故 HID 新鲜时忽略 WPF 的面积，
-    /// 避免两路面积互相打架；Stylus 只带压感、不参与面积，始终放行。
+    /// 该样本是否参与标定采样。Stylus 只带压感、不参与面积，始终放行；
+    /// 手动指定来源时只认那一路；自适应时 HID 新鲜就忽略 WPF 的面积，避免两路面积互相打架。
     /// </summary>
     private bool Accept(TouchSample s)
     {
-        if (s.Source is "RawHID" or "STYLUS")
+        if (s.Source == "STYLUS")
             return true;
-        if (s.Source != "WPF")
-            return false;
-        return Environment.TickCount64 - _lastHidTicks > EraserEngine.SourceFreshMs;
+
+        SourceMode mode = EraserPage?.Engine.Mode ?? SourceMode.Auto;
+        if (mode == SourceMode.RawHid)
+            return s.Source == "RawHID";
+        if (mode == SourceMode.SoftwareWpf)
+            return s.Source == "WPF";
+
+        if (s.Source == "RawHID")
+            return true;
+        if (s.Source == "WPF")
+            return Environment.TickCount64 - _lastHidTicks > EraserEngine.SourceFreshMs;
+        return false;
     }
 
     /// <summary>「实时：」一行的文字：面积（WPF Touch）与压感（WPF Stylus）分别显示当前值。</summary>

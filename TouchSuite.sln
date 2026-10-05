@@ -1,0 +1,79 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.10.35013.160
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "TouchBridge.Driver", "TouchBridge.Driver", "{3F2A7C41-9D6B-4E27-A8C5-1B7E9D2F4A60}"
+	ProjectSection(SolutionItems) = preProject
+		src\TouchBridge.Driver\build.ps1 = src\TouchBridge.Driver\build.ps1
+		src\TouchBridge.Driver\build-cl.cmd = src\TouchBridge.Driver\build-cl.cmd
+		src\TouchBridge.Driver\TouchBridgeVhid.c = src\TouchBridge.Driver\TouchBridgeVhid.c
+		src\TouchBridge.Driver\TouchBridgeVhid.inx = src\TouchBridge.Driver\TouchBridgeVhid.inx
+		src\TouchBridge.Driver\TouchBridgeVhidPublic.h = src\TouchBridge.Driver\TouchBridgeVhidPublic.h
+		src\TouchBridge.Driver\packages.config = src\TouchBridge.Driver\packages.config
+	EndProjectSection
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{827E0CD3-B72D-47B6-A68D-7590B98EB39B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TouchErase", "src\TouchErase\TouchErase.csproj", "{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TouchErase.Calibrator", "src\TouchErase.Calibrator\TouchErase.Calibrator.csproj", "{26389930-C467-4037-8826-14BBBA8369BC}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TouchBridge.Receiver", "src\TouchBridge.Receiver\TouchBridge.Receiver.csproj", "{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Debug|x64.Build.0 = Debug|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Debug|x86.Build.0 = Debug|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Release|x64.ActiveCfg = Release|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Release|x64.Build.0 = Release|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Release|x86.ActiveCfg = Release|Any CPU
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942}.Release|x86.Build.0 = Release|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Debug|x64.Build.0 = Debug|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Debug|x86.Build.0 = Debug|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Release|x64.ActiveCfg = Release|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Release|x64.Build.0 = Release|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Release|x86.ActiveCfg = Release|Any CPU
+		{26389930-C467-4037-8826-14BBBA8369BC}.Release|x86.Build.0 = Release|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Debug|x64.Build.0 = Debug|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Debug|x86.Build.0 = Debug|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Release|x64.ActiveCfg = Release|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Release|x64.Build.0 = Release|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Release|x86.ActiveCfg = Release|Any CPU
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106}.Release|x86.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{3C0EB318-AC93-4F16-A3C3-A8DEAC93E942} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{26389930-C467-4037-8826-14BBBA8369BC} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{A7F86304-E0D8-43B9-9FD4-D1D5E2A10106} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+	EndGlobalSection
+EndGlobal

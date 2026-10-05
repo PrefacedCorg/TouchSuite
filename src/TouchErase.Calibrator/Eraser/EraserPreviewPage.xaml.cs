@@ -117,6 +117,43 @@ public partial class EraserPreviewPage : UserControl
             Engine.AreaThresholdEnabled, Engine.WritingUsesPressure, Engine.WritingPressureGain,
             Engine.RatioTrim, Engine.Shape.ToString(), Engine.WritingFollowSize);
 
+    // ================= 来源下拉 =================
+
+    /// <summary>用户在预览页改了来源下拉时触发（宿主窗口据此同步自己的下拉）。</summary>
+    public event Action? SourceSelectionChanged;
+
+    private bool _suppressSourceUi;
+
+    /// <summary>按引擎当前来源状态刷新预览页下拉（宿主同步用；不会反向触发 <see cref="SourceSelectionChanged"/>）。</summary>
+    public void SyncSourceSelection(SourceMode mode, HidMmSource hidMm)
+    {
+        if (SourceModeCombo is null)
+            return;
+        _suppressSourceUi = true;
+        SourceModeCombo.SelectedIndex = (int)mode;
+        HidMmCombo.SelectedIndex = (int)hidMm;
+        HidMmPanel.Visibility = mode == SourceMode.RawHid ? Visibility.Visible : Visibility.Collapsed;
+        _suppressSourceUi = false;
+    }
+
+    private void OnSourceModeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressSourceUi || SourceModeCombo is null)
+            return;
+        Engine.SetMode((SourceMode)Math.Clamp(SourceModeCombo.SelectedIndex, 0, 2));
+        if (HidMmPanel is not null)
+            HidMmPanel.Visibility = Engine.Mode == SourceMode.RawHid ? Visibility.Visible : Visibility.Collapsed;
+        SourceSelectionChanged?.Invoke();
+    }
+
+    private void OnHidMmChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressSourceUi || HidMmCombo is null)
+            return;
+        Engine.SetHidMmSource((HidMmSource)Math.Clamp(HidMmCombo.SelectedIndex, 0, 1));
+        SourceSelectionChanged?.Invoke();
+    }
+
     // ================= 触摸样本 → 引擎 =================
 
     /// <summary>最近一次喂入的样本（抬手后仍显示最后看到的值）。</summary>
@@ -138,7 +175,7 @@ public partial class EraserPreviewPage : UserControl
             case "RawHID":
                 {
                     // 位置与尺寸都用 HID 自己的（归一化 Xn/Yn → 虚拟桌面 → 预览区局部坐标）
-                    SubmitHidRect(s.WidthMm, s.HeightMm, s.XNorm, s.YNorm);
+                    SubmitHidRect(s);
                     break;
                 }
 
@@ -175,16 +212,18 @@ public partial class EraserPreviewPage : UserControl
     private Point HostCenter => new(Host.ActualWidth / 2, Host.ActualHeight / 2);
 
     /// <summary>把 HID 的尺寸 + 归一化坐标合成一个原始HID 矩形喂给引擎（id 固定 0：HID 是单触点）。
-    /// Xn/Yn 为数字化器归一化坐标 → 虚拟桌面 DIP → 预览区局部坐标（与主程序同一套换算法）。</summary>
-    private void SubmitHidRect(double? wMm, double? hMm, double? xn, double? yn)
+    /// 尺寸按当前「HID mm 来源」取（映射表上报 / 校准时取得）；Xn/Yn 为数字化器归一化坐标 →
+    /// 虚拟桌面 DIP → 预览区局部坐标（与主程序同一套换算法）。</summary>
+    private void SubmitHidRect(TouchSample s)
     {
+        (double? wMm, double? hMm) = HidScale.ContactMm(s, Engine.HidMmSource, Engine.MmPerDiuX, Engine.MmPerDiuY);
         if (wMm is not double wv || hMm is not double hv || Engine.MmPerDiuX <= 0 || Engine.MmPerDiuY <= 0)
             return;
         double wDiu = wv / Engine.MmPerDiuX;
         double hDiu = hv / Engine.MmPerDiuY;
 
         Point center;
-        if (xn is double x && yn is double y)
+        if (s.XNorm is double x && s.YNorm is double y)
         {
             DpiScale dpi = VisualTreeHelper.GetDpi(this);
             Point hostOrigin = Host.PointToScreen(new Point(0, 0));   // 设备像素
@@ -207,7 +246,7 @@ public partial class EraserPreviewPage : UserControl
         Engine.Submit(ContactSource.RawHid, 0,
             new Rect(center.X - wDiu / 2, center.Y - hDiu / 2, wDiu, hDiu),
             applyThreshold: false,
-            detail: $"HID {Precision.Fmt(wv)}×{Precision.Fmt(hv)} mm");
+            detail: $"HID（{SourceNames.OfHidMm(Engine.HidMmSource)}） {Precision.Fmt(wv)}×{Precision.Fmt(hv)} mm");
     }
 
     // ================= 参数控件 =================

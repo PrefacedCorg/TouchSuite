@@ -15,13 +15,6 @@
     <Product>TouchErase 手掌擦矫正 Demo</Product>
   </PropertyGroup>
 
-  <!-- 校准向导是同级子目录下的独立项目，必须排除出本项目，否则默认通配会把它一起编进来 -->
-  <ItemGroup>
-    <Compile Remove="Calibrator/**" />
-    <Page Remove="Calibrator/**" />
-    <ApplicationDefinition Remove="Calibrator/**" />
-    <Resource Remove="Calibrator/**" />
-    <None Remove="Calibrator/**" />
-  </ItemGroup>
+  <!-- 校准向导已提为同级项目（src/TouchErase.Calibrator），不在本项目目录下，默认通配不会编进来 -->
 
 </Project>
