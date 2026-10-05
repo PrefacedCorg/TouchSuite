@@ -3,16 +3,57 @@ name: build
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'src/TouchSuite.App/**'
+      - 'src/TouchSuite.App.old/**'
+      - 'src/TouchSuite.Receiver/**'
+      - 'android/**'
+      - '.github/workflows/build.yml'
   pull_request:
     branches: [ main ]
+    paths:
+      - 'src/TouchSuite.App/**'
+      - 'src/TouchSuite.App.old/**'
+      - 'src/TouchSuite.Receiver/**'
+      - 'android/**'
+      - '.github/workflows/build.yml'
 
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  dotnet:
-    name: .NET（WPF / 控制台）
+  # 先判断本次改动落在哪些目录，后面的 job 各取所需、按需构建
+  changes:
+    name: 检测改动目录
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.filter.outputs.app }}
+      app_old: ${{ steps.filter.outputs.app_old }}
+      receiver: ${{ steps.filter.outputs.receiver }}
+      android: ${{ steps.filter.outputs.android }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Paths filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            app:
+              - 'src/TouchSuite.App/**'
+            app_old:
+              - 'src/TouchSuite.App.old/**'
+            receiver:
+              - 'src/TouchSuite.Receiver/**'
+            android:
+              - 'android/**'
+
+  app:
+    name: TouchSuite.App
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -23,14 +64,53 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Restore
-        run: dotnet restore TouchSuite.sln
+      - name: Restore & Build
+        run: |
+          dotnet restore src/TouchSuite.App/TouchSuite.App.csproj
+          dotnet build src/TouchSuite.App/TouchSuite.App.csproj -c Release --no-restore
 
-      - name: Build
-        run: dotnet build TouchSuite.sln -c Release --no-restore
+  app_old:
+    name: TouchSuite.App.old
+    needs: changes
+    if: needs.changes.outputs.app_old == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore & Build
+        run: |
+          dotnet restore src/TouchSuite.App.old/TouchSuite.App.old.csproj
+          dotnet build src/TouchSuite.App.old/TouchSuite.App.old.csproj -c Release --no-restore
+
+  receiver:
+    name: TouchSuite.Receiver
+    needs: changes
+    if: needs.changes.outputs.receiver == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore & Build
+        run: |
+          dotnet restore src/TouchSuite.Receiver/TouchSuite.Receiver.csproj
+          dotnet build src/TouchSuite.Receiver/TouchSuite.Receiver.csproj -c Release --no-restore
 
   android:
     name: Android（APK）
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
