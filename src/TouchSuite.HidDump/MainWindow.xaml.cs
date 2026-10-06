@@ -21,19 +21,30 @@ public partial class MainWindow : Window
     private const int MouseDotKey = -1;
 
     private List<HidApi.HidDevice> _devices = new();
+    /// <summary>下拉框里实际列出的设备（按「显示非触摸设备」过滤后），索引与 DeviceCombo 一一对应。</summary>
+    private readonly List<HidApi.HidDevice> _comboDevices = new();
     private HidApi.HidDevice? _selected;
     private readonly Dictionary<IntPtr, HidApi.HidDevice> _byHandle = new();
     private bool _suppressCombo;
     private long _lastRescanTicks;
 
     private readonly List<LiveRow> _rows = new();
+    private readonly List<string> _reportLines = new();              // 导出报告用的文本（与界面同步）
+    private readonly Dictionary<LiveRow, int> _reportIndex = new();   // 实时行 → 报告里对应的行号
     private bool _dirty;
     private long _frames;
     private string _lastHex = "";
     private int _lastHexLen;
 
-    // 可视化参考 cap（构建表格时找到的首个）
-    private HidApi.ValueCap? _capX, _capY, _capW, _capH, _capId;
+    // 左侧可视化：每个 Link（触点槽位）各一套参照 cap（支持多指）
+    private sealed class LinkCaps
+    {
+        public ushort Link;
+        public HidApi.ValueCap? X, Y, W, H, Id, Az;   // Az = 0x0D:0x3F 方位角
+        public HidApi.ButtonCap? Tip;                 // 0x0D:0x42 笔尖接触
+    }
+
+    private readonly Dictionary<ushort, LinkCaps> _visLinks = new();
 
     private sealed class RawContact
     {
@@ -41,7 +52,16 @@ public partial class MainWindow : Window
         public required double Yn;
         public double? Wn;
         public double? Hn;
+        public double? AzDeg;      // HID Azimuth：绕 Z 轴逆时针，0 = 竖直向上（单位度）
         public required long Seen;
+    }
+
+    /// <summary>一个接触的可视元素：包围盒椭圆 + 方位角指针 + 角标。</summary>
+    private sealed class ContactVisual
+    {
+        public required Ellipse Box;
+        public required Line Needle;
+        public required TextBlock Label;
     }
 
     private sealed class LiveRow
@@ -58,7 +78,6 @@ public partial class MainWindow : Window
 
     private LiveRow? _contactCountRow;       // 0x0D:0x54 接触数量（状态栏显示实时值）
     private int _declaredSlots;              // 描述符声明的触点槽位数（Link 组数）
-    private int _pressedLinks;               // 当前按下的 Link 数
     private bool _allowAnyLink;              // 单触点设备才允许"全集合搜索"兜底（多触点严格按 Link 取，防串指）
 
     // 子报文解码探针（用于"最近报文"段：每份子报文里到底哪几个 Link 活着）
@@ -71,9 +90,10 @@ public partial class MainWindow : Window
     private long _frameIndex;
     private long _lastSubLogTicks;           // 子报文日志节流
     private long _lastRowLogTicks;           // 表格快照日志节流
+    private string? _lastSubSig;             // 上一份子报文的触点状态签名（Tip/CID/接触数），用于识别状态跳变
 
-    private readonly Dictionary<int, RawContact> _rawContacts = new();   // key = ContactID（无则 Link）
-    private readonly Dictionary<int, Ellipse> _rawEllipses = new();
+    private readonly Dictionary<int, RawContact> _rawContacts = new();     // key = 槽位(Link)
+    private readonly Dictionary<int, ContactVisual> _rawVisuals = new();   // 同一批接触的可视元素
     private readonly Dictionary<int, Ellipse> _touchDots = new();        // WPF 触摸/鼠标蓝点
 
     private readonly DispatcherTimer _renderTimer;
@@ -148,11 +168,7 @@ public partial class MainWindow : Window
 
         _suppressCombo = true;
         DeviceCombo.Items.Clear();
-        foreach (HidApi.HidDevice d in _devices)
-        {
-            string tag = d.IsTouch ? "" : "　（非触摸类）";
-            DeviceCombo.Items.Add($"{HidApi.TlcText(d.UsagePage, d.Usage)}　{ShortPath(d.Path)}{tag}");
-        }
+        _comboDevices.Clear();
         _suppressCombo = false;
 
         Log.Info($"枚举到 HID 顶层集合 {_devices.Count} 个（触摸类 {_devices.Count(x => x.IsTouch)}）：");
@@ -162,27 +178,63 @@ public partial class MainWindow : Window
             Log.Info($"  [{i + 1}] {HidApi.TlcText(d.UsagePage, d.Usage)} 值帽 {d.Caps.NumberInputValueCaps} 按钮帽 {d.Caps.NumberInputButtonCaps} 输入长度 {d.Caps.InputReportByteLength}B 触摸={d.IsTouch} {d.Path}");
         }
 
-        // 默认选触摸类里"能力最强"的一块（值帽最多的那个，通常就是多点触摸数字化器），
-        // 而不是列表里的第一块（那往往是单触点的辅助集合）。
-        int pick = -1;
-        for (int i = 0; i < _devices.Count; i++)
+        RefreshDeviceCombo();
+    }
+
+    /// <summary>
+    /// 按「显示非触摸设备」勾选状态重建下拉列表（默认只列触摸类）。
+    /// keepPath 指定时要尽量保持原选中项，找不到再回退到"能力最强的触摸设备"。
+    /// </summary>
+    private void RefreshDeviceCombo(string? keepPath = null)
+    {
+        string? want = keepPath ?? _selected?.Path;
+        bool showAll = ShowAllCheck?.IsChecked == true;
+
+        _suppressCombo = true;
+        _comboDevices.Clear();
+        DeviceCombo.Items.Clear();
+        foreach (HidApi.HidDevice d in _devices)
         {
-            if (!_devices[i].IsTouch)
+            if (!showAll && !d.IsTouch)
                 continue;
-            if (pick < 0 || _devices[i].Caps.NumberInputValueCaps > _devices[pick].Caps.NumberInputValueCaps)
-                pick = i;
+            _comboDevices.Add(d);
+            DeviceCombo.Items.Add($"{HidApi.TlcText(d.UsagePage, d.Usage)}　{ShortPath(d.Path)}");
         }
-        if (pick < 0 && _devices.Count > 0)
-            pick = 0;
-        if (pick >= 0)
-            DeviceCombo.SelectedIndex = pick;   // 触发 OnDevicePicked
+        _suppressCombo = false;
+
+        int idx = want is null ? -1 : _comboDevices.FindIndex(x => x.Path == want);
+        if (idx < 0)
+        {
+            // 默认选触摸类里"能力最强"的一块（值帽最多的那个，通常就是多点触摸数字化器）
+            int best = -1;
+            for (int i = 0; i < _comboDevices.Count; i++)
+            {
+                if (!_comboDevices[i].IsTouch)
+                    continue;
+                if (best < 0 || _comboDevices[i].Caps.NumberInputValueCaps > _comboDevices[best].Caps.NumberInputValueCaps)
+                    best = i;
+            }
+            idx = best >= 0 ? best : (_comboDevices.Count > 0 ? 0 : -1);
+        }
+
+        if (idx >= 0)
+        {
+            DeviceCombo.SelectedIndex = idx;   // 触发 OnDevicePicked
+        }
         else
         {
             _selected = null;
             Rows.Children.Clear();
             ProductText.Text = "";
-            SetStatus("未发现任何 HID 设备。");
+            SetStatus(showAll ? "未发现任何 HID 设备。" : "未发现触摸类 HID 设备（可勾选「显示非触摸设备」查看全部）。");
         }
+    }
+
+    private void OnShowAllChanged(object sender, RoutedEventArgs e)
+    {
+        if (!IsLoaded)
+            return;
+        RefreshDeviceCombo();
     }
 
     private void OnRescan(object sender, RoutedEventArgs e) => Rescan();
@@ -192,10 +244,10 @@ public partial class MainWindow : Window
         if (_suppressCombo)
             return;
         int i = DeviceCombo.SelectedIndex;
-        if (i < 0 || i >= _devices.Count)
+        if (i < 0 || i >= _comboDevices.Count)
             return;
 
-        _selected = _devices[i];
+        _selected = _comboDevices[i];
         _frames = 0;
         _lastHex = "";
         _lastHexLen = 0;
@@ -232,12 +284,16 @@ public partial class MainWindow : Window
     {
         Rows.Children.Clear();
         _rows.Clear();
+        _reportLines.Clear();
+        _reportIndex.Clear();
         _probeLinks.Clear();
         _logLines.Clear();
         _pendingLog.Clear();
         _probeContactCount = null;
+        _lastSubSig = null;                      // 换设备后第一帧不算跳变
         _allowAnyLink = false;
-        _capX = _capY = _capW = _capH = _capId = null;
+        _visLinks.Clear();
+        _rawVisuals.Clear();
 
         List<HidApi.ValueCap> inVals = HidApi.ValueCaps(d.Preparsed, HidApi.ReportTypeInput, d.Caps.NumberInputValueCaps);
         List<HidApi.ButtonCap> inBtns = HidApi.ButtonCaps(d.Preparsed, HidApi.ReportTypeInput, d.Caps.NumberInputButtonCaps);
@@ -316,6 +372,9 @@ public partial class MainWindow : Window
         }
         List<ushort> btnPageOrder = btnEntries.Select(x => x.Page).Distinct().ToList();
         btnEntries = btnEntries.OrderBy(x => btnPageOrder.IndexOf(x.Page)).ThenBy(x => x.Link).ThenBy(x => x.Usage).ToList();
+
+        foreach (HidApi.ButtonCap b in inBtns)
+            TrackVisualButton(b);   // 记下各 Link 的「笔尖接触」，左侧红圈据此判断哪几个槽位真的按下
 
         prevPage = prevLink = ushort.MaxValue;
         foreach (var (page, link, usage, btn, summary) in btnEntries)
@@ -419,6 +478,28 @@ public partial class MainWindow : Window
         return sb.ToString();
     }
 
+    /// <summary>
+    /// 一份子报文的「触点状态签名」：逐 Link 的 CID + Tip 位，末尾附接触数。
+    /// 只要这个串变了，就说明发生了接触状态跳变（按下/抬起/换指/接触数增减），
+    /// 该帧必须完整记录 —— 抬手帧只有一帧，靠时间节流会把它漏掉。
+    /// </summary>
+    private string ReportSignature(HidApi.HidDevice d, byte[] report)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var p in _probeLinks)
+        {
+            HashSet<ushort> pressed = HidApi.PressedUsages(d.Preparsed, 0x0D, p.Link, report, report.Length);
+            bool ts = p.Tip is not null && pressed.Contains(p.Tip.UsageMin);
+            uint cid = 0;
+            bool hasId = p.Id is not null && HidApi.TryGetUsageValue(d.Preparsed, 0x0D, p.Link, 0x51, report, report.Length, out cid, _allowAnyLink);
+            sb.Append(hasId ? cid.ToString() : "-").Append(ts ? '1' : '0').Append(' ');
+        }
+        if (_probeContactCount is HidApi.ValueCap cc
+            && HidApi.TryGetUsageValue(d.Preparsed, cc.UsagePage, cc.LinkCollection, cc.UsageMin, report, report.Length, out uint count, _allowAnyLink))
+            sb.Append('|').Append(count);
+        return sb.ToString();
+    }
+
     private void AddStaticCap(HidApi.ValueCap c)
         => AddDataRow(HidApi.PageText(c.UsagePage), HidApi.UsageLabel(c.UsagePage, c.UsageMin), c.LinkCollection.ToString(), HidApi.RangeText(c), null);
 
@@ -444,6 +525,10 @@ public partial class MainWindow : Window
         AddCell(row, 1, usageText, UsageBrush, bold: false);
         AddCell(row, 2, linkText, DimBrush, bold: false);
         AddCell(row, 3, rangeText, DimBrush, bold: false);
+
+        _reportLines.Add($"{pageText}\t{usageText}\t{linkText}\t{rangeText}\t{(liveRow is null ? "" : "当前 = " + liveRow.Text)}");
+        if (liveRow is not null)
+            _reportIndex[liveRow] = _reportLines.Count - 1;
 
         var valueCell = new TextBlock
         {
@@ -515,6 +600,8 @@ public partial class MainWindow : Window
             TextAlignment = TextAlignment.Left,
             Margin = new Thickness(0, 10, 0, 3),
         });
+        _reportLines.Add("");
+        _reportLines.Add($"===== {title} =====");
         StartGrid();
     }
 
@@ -537,18 +624,96 @@ public partial class MainWindow : Window
         if (bold)
             tb.Margin = new Thickness(0, 10, 0, 3);
         Rows.Children.Add(tb);
+        _reportLines.Add(text);
     }
 
-    /// <summary>记录首个 X/Y/宽/高/接触ID 的 cap，供左侧红圈可视化。</summary>
+    /// <summary>用资源管理器打开报告/日志所在目录（logs\）。</summary>
+    private void OnOpenLogFolder(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            string dir = System.IO.Path.Combine(AppContext.BaseDirectory, "logs");
+            System.IO.Directory.CreateDirectory(dir);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = dir,
+                UseShellExecute = true,     // 交给资源管理器打开
+            });
+            SetStatus("已打开：" + dir);
+            Log.Info("打开报告文件夹：" + dir);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("打开文件夹失败：" + ex.Message);
+            Log.Error("打开报告文件夹失败", ex);
+        }
+    }
+
+    /// <summary>把界面上的内容（设备信息 + 能力表 + 描述符 + 当前实时值）导出成 txt，方便发出去分析。</summary>
+    private void OnExportReport(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            // 先把实时值刷新进报告行
+            foreach (KeyValuePair<LiveRow, int> kv in _reportIndex)
+            {
+                LiveRow row = kv.Key;
+                int idx = kv.Value;
+                string[] parts = _reportLines[idx].Split('\t');
+                if (parts.Length == 5)
+                {
+                    parts[4] = "当前 = " + row.Text;
+                    _reportLines[idx] = string.Join("\t", parts);
+                }
+            }
+
+            string dir = System.IO.Path.Combine(AppContext.BaseDirectory, "logs");
+            System.IO.Directory.CreateDirectory(dir);
+            string path = System.IO.Path.Combine(dir, $"report-{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"TouchSuite.HidDump 报告  {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine($"设备：{DeviceCombo.SelectedItem}");
+            sb.AppendLine(ProductText.Text);
+            sb.AppendLine(new string('-', 100));
+            foreach (string line in _reportLines)
+                sb.AppendLine(line.Replace("\t", "  |  "));
+
+            System.IO.File.WriteAllText(path, sb.ToString(), new System.Text.UTF8Encoding(false));
+            SetStatus("报告已导出：" + path);
+            Log.Info("报告已导出：" + path);
+        }
+        catch (Exception ex)
+        {
+            SetStatus("导出报告失败：" + ex.Message);
+            Log.Error("导出报告失败", ex);
+        }
+    }
+
+    /// <summary>记录某个 Link 上的 X/Y/宽/高/接触ID/方位角 cap，供左侧红圈可视化（逐 Link=逐指）。</summary>
     private void TrackVisualCap(HidApi.ValueCap c)
     {
-        if (c.ReportCount > 1)
+        if (c.ReportCount > 1 || c.LinkCollection == 0 || c.IsRange)
             return;
-        if (_capX is null && c.UsagePage == 0x01 && c.UsageMin == 0x30) _capX = c;
-        else if (_capY is null && c.UsagePage == 0x01 && c.UsageMin == 0x31) _capY = c;
-        else if (_capW is null && c.UsagePage == 0x0D && c.UsageMin == 0x48) _capW = c;
-        else if (_capH is null && c.UsagePage == 0x0D && c.UsageMin == 0x49) _capH = c;
-        else if (_capId is null && c.UsagePage == 0x0D && c.UsageMin == 0x51) _capId = c;
+        if (!_visLinks.TryGetValue(c.LinkCollection, out LinkCaps? lc))
+            _visLinks[c.LinkCollection] = lc = new LinkCaps { Link = c.LinkCollection };
+
+        if (c.UsagePage == 0x01 && c.UsageMin == 0x30) lc.X ??= c;
+        else if (c.UsagePage == 0x01 && c.UsageMin == 0x31) lc.Y ??= c;
+        else if (c.UsagePage == 0x0D && c.UsageMin == 0x48) lc.W ??= c;
+        else if (c.UsagePage == 0x0D && c.UsageMin == 0x49) lc.H ??= c;
+        else if (c.UsagePage == 0x0D && c.UsageMin == 0x51) lc.Id ??= c;
+        else if (c.UsagePage == 0x0D && c.UsageMin == 0x3F) lc.Az ??= c;
+    }
+
+    /// <summary>记录某个 Link 的「笔尖接触」按钮帽 —— 用来判断该指的槽位当前是否真的按下。</summary>
+    private void TrackVisualButton(HidApi.ButtonCap b)
+    {
+        if (b.LinkCollection == 0 || b.IsRange || b.UsagePage != 0x0D || b.UsageMin != 0x42)
+            return;
+        if (!_visLinks.TryGetValue(b.LinkCollection, out LinkCaps? lc))
+            _visLinks[b.LinkCollection] = lc = new LinkCaps { Link = b.LinkCollection };
+        lc.Tip ??= b;
     }
 
     /// <summary>原始报告描述符段：USB 设备走父集线器取字节流并逐项解析；虚拟设备给出说明。</summary>
@@ -567,13 +732,96 @@ public partial class MainWindow : Window
 
         if (desc is null)
         {
+            // 非 USB 设备（VHF / 虚拟）：Windows 没有用户态接口 → 试本仓库驱动的 IOCTL
+            byte[]? fromDriver = null;
+            string driverReason = "";
+            try
+            {
+                fromDriver = VhfDescriptor.TryGet(_declaredSlots, out driverReason);
+            }
+            catch
+            {
+                driverReason = "调用驱动 IOCTL 异常";
+            }
+
+            if (fromDriver is not null)
+            {
+                AddNote($"来源：TouchBridge 驱动 IOCTL_TB_VHID_GET_DESCRIPTOR（{fromDriver.Length} 字节；本设备非 USB，操作系统不提供描述符）", ValueBrush, mono: false);
+                LogDescriptor("驱动 IOCTL", fromDriver);
+                foreach (ReportDescriptor.Line line in ReportDescriptor.Parse(fromDriver))
+                    AddNote(line.Text, line.Kind switch { 1 => ValueBrush, 2 => MonoIdBrush, _ => MonoBrush }, mono: true);
+                return;
+            }
+
             AddNote("取不到原始描述符：" + UsbDescriptor.LastReason, DimBrush, mono: false);
+            AddNote("驱动 IOCTL 途径也没成功：" + driverReason, DimBrush, mono: false);
+
+            // 降级信息：网络重定向之类只转发标准描述符的总线，至少能给出报告描述符长度等信息
+            string? std = null;
+            try
+            {
+                std = _selected is null ? null : UsbDescriptor.TryDescribeStandard(_selected.Path);
+            }
+            catch
+            {
+                // 忽略
+            }
+            if (std is not null)
+                AddNote("降级信息（标准描述符读到了）：" + std, DimBrush, mono: false);
+
+            // 最后的兜底：从 HidP 解析结果重建一份【语义等价】描述符（usage/量程/单位/RC/集合树一致，
+            // 但不是原始字节的逐字节复刻）。远程重定向拿不到原始字节时，这份即是对设备描述的完整刻画。
+            try
+            {
+                if (_selected is not null)
+                {
+                    List<HidApi.ValueCap> vals = HidApi.ValueCaps(_selected.Preparsed, HidApi.ReportTypeInput, _selected.Caps.NumberInputValueCaps);
+                    List<HidApi.ButtonCap> btns = HidApi.ButtonCaps(_selected.Preparsed, HidApi.ReportTypeInput, _selected.Caps.NumberInputButtonCaps);
+                    List<HidApi.LinkNode> nodes = HidApi.LinkNodes(_selected.Preparsed, _selected.Caps.NumberLinkCollectionNodes);
+                    int rid = vals.Select(v => (int)v.ReportID).Concat(btns.Select(b => (int)b.ReportID)).FirstOrDefault(x => x != 0);
+                    byte[] recon = ReportDescriptor.Reconstruct(vals, btns, nodes, _selected.UsagePage, _selected.Usage, rid);
+                    AddNote($"▼ 重建描述符（语义等价，{recon.Length} 字节；原始 703 字节级别的字段定义全在此）：", ValueBrush, mono: false);
+                    foreach (ReportDescriptor.Line line in ReportDescriptor.Parse(recon))
+                        AddNote(line.Text, line.Kind switch { 1 => ValueBrush, 2 => MonoIdBrush, _ => MonoBrush }, mono: true);
+                    AddNote("重建 hex：" + BitConverter.ToString(recon).Replace("-", " "), MonoBrush, mono: false);
+                    Log.Info($"重建描述符 {recon.Length} 字节（原始字节不可得）：\n" + BitConverter.ToString(recon).Replace("-", " "));
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error("重建描述符失败", ex);
+            }
+
             AddNote("上方表格“逻辑 / 物理 / RC”列就是 HidP 从描述符解出的对应字段值，等价可用。", DimBrush, mono: false);
+            Log.Info($"描述符获取失败：USB 途径={UsbDescriptor.LastReason}；驱动 IOCTL={driverReason}");
             return;
         }
 
+        LogDescriptor("USB 集线器", desc);
         foreach (ReportDescriptor.Line line in ReportDescriptor.Parse(desc))
             AddNote(line.Text, line.Kind switch { 1 => ValueBrush, 2 => MonoIdBrush, _ => MonoBrush }, mono: true);
+    }
+
+    /// <summary>把整份描述符（逐项 + 原始 hex）写进日志 —— 便于把日志直接发出去分析。</summary>
+    private static void LogDescriptor(string source, byte[] desc)
+    {
+        Log.Info($"=== 报告描述符（来源：{source}，{desc.Length} 字节）逐项 ===");
+        foreach (ReportDescriptor.Line line in ReportDescriptor.Parse(desc))
+            Log.Info("  " + line.Text);
+        Log.Info("=== 报告描述符原始 hex ===\n" + ToHexLines(desc));
+    }
+
+    private static string ToHexLines(byte[] d)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < d.Length; i += 16)
+        {
+            sb.Append($"  {i:X4}: ");
+            for (int j = i; j < Math.Min(i + 16, d.Length); j++)
+                sb.Append(d[j].ToString("X2")).Append(' ');
+            sb.AppendLine();
+        }
+        return sb.ToString().TrimEnd();
     }
 
     // ================= WM_INPUT → 实时值 =================
@@ -600,11 +848,18 @@ public partial class MainWindow : Window
                 ApplyReport(sel, report, pressedCache);
 
                 _frameIndex++;
-                // 文件日志：逐 Link 解码 + 完整原始 hex（节流 ~40 行/秒）
-                if (Environment.TickCount64 - _lastSubLogTicks >= 25)
+                // 文件日志：逐 Link 解码 + 完整原始 hex（节流 ~40 行/秒）。
+                // 但「状态跳变」帧（任一槽 Tip 位翻转、接触数变化、CID 变化）一律不节流：
+                // 抬手帧只有一帧，25ms 节流会把它整帧丢掉，日志里就只剩"连着的一笔"，
+                // 无法判断两笔之间到底有没有发出"断开"报文。跳变帧必须逐帧留证。
+                string sig = ReportSignature(sel, report);
+                bool transition = _lastSubSig != null && _lastSubSig != sig;
+                _lastSubSig = sig;
+
+                if (transition || Compat.NowMs() - _lastSubLogTicks >= 25)
                 {
-                    _lastSubLogTicks = Environment.TickCount64;
-                    Log.Info($"子报文#{_frameIndex} {DescribeReport(sel, report)} | hex={Hex(report)}");
+                    _lastSubLogTicks = Compat.NowMs();
+                    Log.Info($"子报文#{_frameIndex}{(transition ? " ★跳变" : "")} {DescribeReport(sel, report)} | hex={Hex(report)}");
                 }
                 // 界面上「最近报文」段：4 份取 1 条
                 if ((_frameIndex & 3) == 0)
@@ -617,10 +872,10 @@ public partial class MainWindow : Window
             }
             _dirty = true;
         }
-        else if (!_byHandle.ContainsKey(hDevice) && Environment.TickCount64 - _lastRescanTicks > 800)
+        else if (!_byHandle.ContainsKey(hDevice) && Compat.NowMs() - _lastRescanTicks > 800)
         {
             // 设备中途重枚举（句柄不在表里）→ 节流重扫
-            _lastRescanTicks = Environment.TickCount64;
+            _lastRescanTicks = Compat.NowMs();
             Dispatcher.BeginInvoke(Rescan);
         }
         return IntPtr.Zero;
@@ -628,7 +883,6 @@ public partial class MainWindow : Window
 
     private void ApplyReport(HidApi.HidDevice sel, byte[] report, Dictionary<(ushort, ushort), HashSet<ushort>> pressedCache)
     {
-        int pressedLinks = 0;
         int valueRows = 0, valueHits = 0;
         foreach (LiveRow row in _rows)
         {
@@ -653,9 +907,6 @@ public partial class MainWindow : Window
                 row.Text = row.Summary
                     ? (pressed.Count == 0 ? "—" : string.Join("、", pressed.Select(u => HidApi.UsageLabel(row.Btn!.UsagePage, u))))
                     : pressed.Contains(row.Usage) ? "按下" : "—";
-                // 0x0D:0x42 笔尖接触 每个 Link 一个 → 按下数即当前触点数
-                if (!row.Summary && row.Text == "按下" && row.Usage == 0x42 && row.Page == 0x0D)
-                    pressedLinks++;
             }
             else
             {
@@ -680,56 +931,73 @@ public partial class MainWindow : Window
             return;
         }
 
-        _pressedLinks = pressedLinks;
         UpdateRawContact(report);
 
         // 表格快照日志（节流 250ms）：记录"程序当前算出来的值"，与原始 hex 对照即可判断是解析问题还是设备行为
-        if (Environment.TickCount64 - _lastRowLogTicks >= 250)
+        if (Compat.NowMs() - _lastRowLogTicks >= 250)
         {
-            _lastRowLogTicks = Environment.TickCount64;
+            _lastRowLogTicks = Compat.NowMs();
             Log.Info("表格快照：" + string.Join(" | ",
                 _rows.Where(r => r.Text.Length > 0 && r.Text != "—")
                      .Select(r => $"{(r.IsButton ? "Btn" : "Val")} {r.Page:X2}:{r.Usage:X2}/L{r.Link}={r.Text}"))
-                + $"　按下Link={pressedLinks}　_allowAnyLink={_allowAnyLink}");
+                + $"　_allowAnyLink={_allowAnyLink}");
         }
     }
 
-    /// <summary>原始计数 + 附加解读（X/Y 百分比、压感归一、宽/高换算 mm）。</summary>
-    private static string FormatRaw(LiveRow row, uint raw)
-    {
-        HidApi.ValueCap c = row.Cap!;
-        string extra = (row.Page, row.Usage) switch
-        {
-            (0x01, 0x30) or (0x01, 0x31) when c.LogicalMax > c.LogicalMin
-                => $"（{100.0 * Math.Clamp((raw - c.LogicalMin) / (double)(c.LogicalMax - c.LogicalMin), 0, 1):0.#}%）",
-            (0x0D, 0x30) when c.LogicalMax > c.LogicalMin
-                => $"（{Math.Clamp((raw - c.LogicalMin) / (double)(c.LogicalMax - c.LogicalMin), 0, 1):0.###}）",
-            (0x0D, 0x48) or (0x0D, 0x49) when HidApi.MmPerCount(c) is double per
-                => $"（{raw * per:0.##} mm）",
-            _ => "",
-        };
-        return $"{raw}{extra}";
-    }
+    /// <summary>当前值单元格的文本：只放 HID 原始值（计数），不做任何换算/归一化。</summary>
+    private static string FormatRaw(LiveRow row, uint raw) => raw.ToString();
 
     // ================= 左侧：整屏缩放框 + 接触红圈 =================
 
     private void UpdateRawContact(byte[] report)
     {
-        if (_capX is null || _capY is null || _selected is null)
+        if (_selected is null || _visLinks.Count == 0)
             return;
 
-        double? x = Norm(_capX, report);
-        double? y = Norm(_capY, report);
-        if (x is not double xv || y is not double yv)
-            return;
+        // 逐 Link（= 逐触点槽位）取一份数据：支持多指；用「笔尖接触」判断该槽位本帧是否真的按下
+        foreach (LinkCaps lc in _visLinks.Values)
+        {
+            if (lc.X is null || lc.Y is null)
+                continue;
 
-        double? wn = _capW is null ? null : Norm(_capW, report);
-        double? hn = _capH is null ? null : Norm(_capH, report);
-        int key = _capId is HidApi.ValueCap idc
-                  && HidApi.TryGetUsageValue(_selected.Preparsed, idc.UsagePage, idc.LinkCollection, idc.UsageMin, report, report.Length, out uint idv)
-            ? (int)idv
-            : _capX.LinkCollection;
-        _rawContacts[key] = new RawContact { Xn = xv, Yn = yv, Wn = wn, Hn = hn, Seen = Environment.TickCount64 };
+            bool active = true;
+            if (lc.Tip is not null)
+            {
+                HashSet<ushort> pressed = HidApi.PressedUsages(_selected.Preparsed, 0x0D, lc.Link, report, report.Length);
+                active = pressed.Contains(lc.Tip.UsageMin);
+            }
+            else if (lc.Id is not null
+                     && HidApi.TryGetUsageValue(_selected.Preparsed, 0x0D, lc.Link, 0x51, report, report.Length, out uint cid0, _allowAnyLink)
+                     && cid0 == 0xFF)
+            {
+                active = false;   // 部分设备用 0xFF 表示"该槽位无接触"
+            }
+
+            double? x = Norm(lc.X, report);
+            double? y = Norm(lc.Y, report);
+            if (x is not double xv || y is not double yv)
+                continue;
+            if (!active)
+            {
+                _rawContacts.Remove((int)lc.Link);
+                continue;
+            }
+
+            double? wn = lc.W is null ? null : Norm(lc.W, report);
+            double? hn = lc.H is null ? null : Norm(lc.H, report);
+
+            double? az = null;
+            if (lc.Az is not null
+                && HidApi.TryGetUsageValue(_selected.Preparsed, 0x0D, lc.Link, 0x3F, report, report.Length, out uint azRaw, _allowAnyLink)
+                && lc.Az.LogicalMax > lc.Az.LogicalMin)
+                az = Compat.Clamp((azRaw - lc.Az.LogicalMin) / (double)(lc.Az.LogicalMax - lc.Az.LogicalMin), 0, 1) * 359.0;
+
+            // 槽位号做 key（ContactID 有的设备一直是 0/1，碰撞了就看不出多指）
+            _rawContacts[lc.Link] = new RawContact
+            {
+                Xn = xv, Yn = yv, Wn = wn, Hn = hn, AzDeg = az, Seen = Compat.NowMs(),
+            };
+        }
     }
 
     private double? Norm(HidApi.ValueCap c, byte[] report)
@@ -740,7 +1008,29 @@ public partial class MainWindow : Window
             return null;
         if (c.LogicalMax <= c.LogicalMin)
             return null;
-        return Math.Clamp((raw - c.LogicalMin) / (double)(c.LogicalMax - c.LogicalMin), 0, 1);
+        return Compat.Clamp((raw - c.LogicalMin) / (double)(c.LogicalMax - c.LogicalMin), 0, 1);
+    }
+
+    /// <summary>
+    /// 方位角（HID 语义：绕 Z 轴逆时针、0 = 竖直向上）→ 中文方向词。
+    /// 便于一眼核对：az=0 上、45 左上、90 左、135 左下、180 下、225 右下、270 右、315 右上。
+    /// </summary>
+    private static string AzDirection(double az)
+    {
+        string[] names = { "上", "左上", "左", "左下", "下", "右下", "右", "右上" };
+        double d = ((az % 360) + 360) % 360;
+        return names[(int)Math.Round(d / 45.0) % 8];
+    }
+
+    /// <summary>移除一个接触的可视元素（包围盒 + 指针 + 角标）。</summary>
+    private void RemoveContactVisual(int key)
+    {
+        if (!_rawVisuals.TryGetValue(key, out ContactVisual? vis))
+            return;
+        _rawVisuals.Remove(key);
+        RawCanvas.Children.Remove(vis.Box);
+        RawCanvas.Children.Remove(vis.Needle);
+        RawCanvas.Children.Remove(vis.Label);
     }
 
     /// <summary>整屏在面板里的等比缩放矩形。设备上报的 X/Y 是"全屏"归一化值，必须落进这个框才对位。</summary>
@@ -789,14 +1079,16 @@ public partial class MainWindow : Window
         bool realPos = RealPos;
 
         // 过期接触清理
-        long now = Environment.TickCount64;
+        long now = Compat.NowMs();
         List<int> stale = _rawContacts.Where(kv => now - kv.Value.Seen > RawContactTtlMs).Select(kv => kv.Key).ToList();
         foreach (int key in stale)
         {
             _rawContacts.Remove(key);
-            if (_rawEllipses.Remove(key, out Ellipse? gone))
-                RawCanvas.Children.Remove(gone);
+            RemoveContactVisual(key);
         }
+        // 界面元素比数据多（例如切换到别的设备）时也清掉
+        foreach (int key in _rawVisuals.Keys.Where(k => !_rawContacts.ContainsKey(k)).ToList())
+            RemoveContactVisual(key);
 
         // 红圈落点：1:1 真实屏幕位置（面板屏幕原点 + 归一化×屏幕尺寸）；
         // 或面板里的整屏等比缩放框（baseX/baseY/unitW/unitH 为映射基准）
@@ -842,38 +1134,74 @@ public partial class MainWindow : Window
             modeText = "红圈 整屏等比缩放";
         }
 
-        foreach ((int key, RawContact rc) in _rawContacts)
+        foreach (KeyValuePair<int, RawContact> kv in _rawContacts)
         {
-            if (!_rawEllipses.TryGetValue(key, out Ellipse? ell))
+            int key = kv.Key;
+            RawContact rc = kv.Value;
+            if (!_rawVisuals.TryGetValue(key, out ContactVisual? vis))
             {
-                ell = new Ellipse
+                var box = new Ellipse
                 {
                     Stroke = new SolidColorBrush(Color.FromRgb(0xE0, 0x4F, 0x44)),
                     StrokeThickness = 2,
                     Fill = new SolidColorBrush(Color.FromArgb(0x28, 0xE0, 0x4F, 0x44)),
                     IsHitTestVisible = false,
                 };
-                RawCanvas.Children.Add(ell);
-                _rawEllipses[key] = ell;
+                var needle = new Line
+                {
+                    Stroke = new SolidColorBrush(Color.FromRgb(0xFF, 0x9A, 0x3C)),
+                    StrokeThickness = 2,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Triangle,
+                    IsHitTestVisible = false,
+                };
+                var label = new TextBlock
+                {
+                    Foreground = new SolidColorBrush(Color.FromRgb(0xFF, 0xD1, 0x8A)),
+                    FontSize = 11,
+                    FontFamily = new FontFamily("Consolas"),
+                    IsHitTestVisible = false,
+                };
+                RawCanvas.Children.Add(box);
+                RawCanvas.Children.Add(needle);
+                RawCanvas.Children.Add(label);
+                vis = new ContactVisual { Box = box, Needle = needle, Label = label };
+                _rawVisuals[key] = vis;
             }
-            double w = rc.Wn is double wv ? Math.Max(8, wv * unitW) : 24;
-            double h = rc.Hn is double hv ? Math.Max(8, hv * unitH) : 24;
-            ell.Width = w;
-            ell.Height = h;
-            Canvas.SetLeft(ell, baseX + rc.Xn * unitW - w / 2);
-            Canvas.SetTop(ell, baseY + rc.Yn * unitH - h / 2);
+
+            // 包围盒：W/H 是设备上报的"轴对齐包围盒"尺寸（无则给个 24 的示意圈）
+            double w = Math.Max(8, (rc.Wn ?? 0.09) * unitW);
+            double h = Math.Max(8, (rc.Hn ?? 0.09) * unitH);
+            double cx = baseX + rc.Xn * unitW;
+            double cy = baseY + rc.Yn * unitH;
+            vis.Box.Width = w;
+            vis.Box.Height = h;
+            Canvas.SetLeft(vis.Box, cx - w / 2);
+            Canvas.SetTop(vis.Box, cy - h / 2);
+
+            // 方位角指针：HID Azimuth 是「绕 Z 轴逆时针、0 = 竖直向上」，
+            // 屏幕坐标 y 向下 → 角度 a 的方向向量 = (-sin a, -cos a)（a=0 向上、a=90 向左）。
+            double az = rc.AzDeg ?? 0;
+            double rad = az * Math.PI / 180.0;
+            double len = Math.Max(w, h) / 2.0 * 0.95;
+            vis.Needle.X1 = cx;
+            vis.Needle.Y1 = cy;
+            vis.Needle.X2 = cx - Math.Sin(rad) * len;
+            vis.Needle.Y2 = cy - Math.Cos(rad) * len;
+            vis.Needle.Visibility = rc.AzDeg is null ? Visibility.Collapsed : Visibility.Visible;
+
+            vis.Label.Text = rc.AzDeg is null
+                ? $"#{key}"
+                : $"#{key} {az:0}°{AzDirection(az)}（Win {(270 - az + 360) % 360:0}°）";
+            Canvas.SetLeft(vis.Label, cx + w / 2 + 3);
+            Canvas.SetTop(vis.Label, cy - h / 2 - 14);
         }
 
         if (_selected is not null)
         {
-            string contacts = _contactCountRow is not null ? $"　接触数量 = {_contactCountRow.Text}" : "";
-            // 设备自报的接触数 > 描述符声明的槽位数 → 驱动只塞得下这么多槽位，多出来的触点会被丢弃/轮换
-            string over = "";
-            if (_contactCountRow is not null && int.TryParse(_contactCountRow.Text, out int liveCount)
-                && _declaredSlots > 0 && liveCount > _declaredSlots)
-                over = $"　⚠ 自报接触数 {liveCount} > 声明槽位 {_declaredSlots}：驱动每条报文只塞 {_declaredSlots} 个，其余触点被丢弃或轮换到别的槽位";
+            string contacts = _contactCountRow is not null ? $"　接触数量(0x54) = {_contactCountRow.Text}" : "";
             StatusText.Text = $"帧 {_frames}　最新报文 {(_lastHexLen > 0 ? $"{_lastHexLen}B：{_lastHex}" : "—")}"
-                            + $"　触点 {_pressedLinks} 个{contacts}{over}"
+                            + contacts
                             + $"　屏幕 {(int)sw}×{(int)sh} DIP　{modeText}";
         }
     }
@@ -897,8 +1225,11 @@ public partial class MainWindow : Window
 
     private void OnTouchUp(object sender, TouchEventArgs e)
     {
-        if (_touchDots.Remove(e.TouchDevice.Id, out Ellipse? ell))
+        if (_touchDots.TryGetValue(e.TouchDevice.Id, out Ellipse? ell))
+        {
+            _touchDots.Remove(e.TouchDevice.Id);
             TouchCanvas.Children.Remove(ell);
+        }
     }
 
     private void OnMouseDown(object sender, MouseButtonEventArgs e)
@@ -920,8 +1251,11 @@ public partial class MainWindow : Window
     private void OnMouseUp(object sender, MouseButtonEventArgs e)
     {
         TouchHost.ReleaseMouseCapture();
-        if (_touchDots.Remove(MouseDotKey, out Ellipse? ell))
+        if (_touchDots.TryGetValue(MouseDotKey, out Ellipse? ell))
+        {
+            _touchDots.Remove(MouseDotKey);
             TouchCanvas.Children.Remove(ell);
+        }
     }
 
     private static Ellipse MakeDot() => new()
@@ -945,10 +1279,10 @@ public partial class MainWindow : Window
     private static string ShortPath(string p)
     {
         if (p.StartsWith(@"\\?\HID#", StringComparison.OrdinalIgnoreCase))
-            p = p[8..];
+            p = p.Substring(8);
         int lastHash = p.LastIndexOf('#');
         if (lastHash > 0 && lastHash + 1 < p.Length && p[lastHash + 1] == '{')
-            p = p[..lastHash];
+            p = p.Substring(0, lastHash);
         return p;
     }
 

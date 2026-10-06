@@ -9,8 +9,8 @@ TouchBridgeVhid.c —— TouchBridge 的虚拟触摸屏驱动（KMDF + VHF）
                               W/H 按 0.01 mm 声明，压感 0..1024 —— 面积/压感都是真值。
 
 报告描述符要点：
-    单个顶层集合 Touch Screen(0x0D:0x04)，带 Report ID(1)，10 个并行槽位；报告共 124 字节（含 ID 字节）。
-    字段按 HID 规范「按位顺排」（不是每槽 12 字节对齐）：
+    单个顶层集合 Touch Screen(0x0D:0x04)，带 Report ID(1)，10 个并行槽位；报告共 144 字节（含 ID 字节）。
+    字段按 HID 规范「按位顺排」（不是每槽 14 字节对齐）：
         偏移 0   : Contact Identifier  10 × 8 bit
         偏移 80  : Tip Switch          10 × 1 bit
         偏移 90  : In Range            10 × 1 bit
@@ -20,11 +20,12 @@ TouchBridgeVhid.c —— TouchBridge 的虚拟触摸屏驱动（KMDF + VHF）
         偏移 320 : Y                   10 × 16 bit
         偏移 480 : Width               10 × 16 bit
         偏移 640 : Height              10 × 16 bit
-        偏移 800 : Tip Pressure        10 × 16 bit
-        偏移 960 : Scan Time            1 × 16 bit   ← 报告级（可选）
-        偏移 976 : Contact Count        1 × 8 bit    ← 报告级（必需！缺它 Windows 不认触摸屏）
+        偏移 800 : Azimuth             10 × 16 bit   ← 0..359 度
+        偏移 960 : Tip Pressure        10 × 16 bit
+        偏移 1120: Scan Time            1 × 16 bit   ← 报告级（可选）
+        偏移 1136: Contact Count        1 × 8 bit    ← 报告级（必需！缺它 Windows 不认触摸屏）
     （以上偏移均不含开头那个 Report ID 字节；落在缓冲里时整体后移 1 字节）
-    X/Y 逻辑量程 0..32767（归一化）；Width/Height 单位 = 厘米×10^-3 = 0.01 mm。
+    X/Y 逻辑量程 0..32767（归一化）；Width/Height 单位 = 厘米×10^-3 = 0.01 mm；Azimuth 单位 = 度。
 
     注意：Contact Count(0x0D:0x54) 是微软规定的报告级「必需用法」，且由 Windows 主机严格执行；
     "Any device that does not report all mandatory usages ... will be non-functional as a
@@ -46,13 +47,23 @@ TouchBridgeVhid.c —— TouchBridge 的虚拟触摸屏驱动（KMDF + VHF）
 //
 // 每个触点是一个「Finger」逻辑集合（0x0D:0x22），各声明：
 //   Contact Identifier(8b) + TipSwitch(1b) + InRange(1b) + Confidence(1b) + 填充(5b)
-//   + X(16b) + Y(16b) + Width(16b) + Height(16b) + TipPressure(16b)
-// 全部按位顺排后，每根手指恰好 12 字节（含位填充后自然字节对齐）。
+//   + X(16b) + Y(16b) + Width(16b) + Height(16b) + Azimuth(16b) + TipPressure(16b)
+// 全部按位顺排后，每根手指恰好 14 字节（含位填充后自然字节对齐）。
 // 整个应用程序集合带 Report ID(1)，报告 = [0x01][指0..指9][ScanTime 2B][ContactCount 1B]。
 // 这是 Windows HID 触摸驱动的通用（推荐）写法。
 
 #define TB_FINGER_COUNT 10
-#define TB_FINGER_BYTES 12
+#define TB_FINGER_BYTES 14
+
+// "空闲"判定阈值：距上一帧超过这么久，就认为设备停止过上报，
+// 下一帧按 Scan Time 规范重新作为基准（从 0 起算）。50 ms ≈ 3~6 个正常帧间隔。
+#define TB_IDLE_GAP_100NS  (50ULL * 10000ULL)
+
+// 待投递报告的小队列深度。
+// 关键：**抬手帧绝不能被后续帧覆盖** —— 若主机还没读走"抬手"那一帧，用户就已经按下第二笔，
+// 覆盖掉抬手帧会让主机看不到"断开"，Windows 便把两笔当成同一个连续触点（批注软件里表现为
+// 两笔之间连一条线）。所以按顺序排小队，主机每来读一次就取队首送一帧。
+#define TB_PENDING_MAX 4
 
 // 报告缓冲内的字节偏移（含开头的 Report ID 字节）
 #define TB_SCAN_TIME_OFFSET     (1 + TB_FINGER_COUNT * TB_FINGER_BYTES)       // Scan Time，2 字节
@@ -81,6 +92,12 @@ static const UCHAR g_FingerBlock[] =
     0x75, 0x05,                     //     Report Size (5)
     0x95, 0x01,                     //     Report Count (1)
     0x81, 0x03,                     //     Input (Const) ← 填充，使本手指凑满整字节
+    // 每指块开头复位全局状态：否则第 2 指起 X/Y 会继承上一指 TipPressure 的
+    // 物理量程(0..1024)与量纲，能力表/校验工具里看着会乱（X/Y 本就无量纲）。
+    0x65, 0x00,                     //     Unit (None)
+    0x55, 0x00,                     //     Unit Exponent (0)
+    0x36, 0x00, 0x00,               //     Physical Minimum (0)
+    0x46, 0x00, 0x00,               //     Physical Maximum (0)
     0x05, 0x01,                     //     Usage Page (Generic Desktop)
     0x09, 0x30,                     //     Usage (X)
     0x09, 0x31,                     //     Usage (Y)
@@ -100,6 +117,17 @@ static const UCHAR g_FingerBlock[] =
     0x26, 0xFF, 0x7F,               //     Logical Maximum (32767)
     0x75, 0x10,                     //     Report Size (16)
     0x95, 0x02,                     //     Report Count (2)
+    0x81, 0x02,                     //     Input (Data,Var,Abs)
+    0x05, 0x0D,                     //     Usage Page (Digitizers)
+    0x65, 0x00,                     //     Unit (None)      ← 角度：HID 无法精确表达"度"，按惯例留 None
+    0x55, 0x00,                     //     Unit Exponent (0)
+    0x09, 0x3F,                     //     Usage (Azimuth)  接触朝向，绕 Z 轴逆时针，0..359 度
+    0x15, 0x00,                     //     Logical Minimum (0)
+    0x26, 0x67, 0x01,               //     Logical Maximum (359)
+    0x36, 0x00, 0x00,               //     Physical Minimum (0)
+    0x46, 0x68, 0x01,               //     Physical Maximum (360)   ← 微软 HID 校验要求物理范围 0..360 度
+    0x75, 0x10,                     //     Report Size (16)
+    0x95, 0x01,                     //     Report Count (1)
     0x81, 0x02,                     //     Input (Data,Var,Abs)
     0x05, 0x0D,                     //     Usage Page (Digitizers)
     0x65, 0x00,                     //     Unit (None)
@@ -186,19 +214,35 @@ static VOID TbBuildDescriptor(VOID)
 }
 
 // ------------------------------------------------------------------ 设备上下文
+// 每个槽位"最后一次 move"的数据。抬手帧必须沿用它的坐标 ——
+// 微软《Button state transitions》明确要求：
+//   手指离开表面那一包里的 X/Y，必须与最后一次 move 包相同
+//   （悬停设备还要求 out-of-range 包也沿用相同坐标）。
+// 若抬手帧把坐标清零，(0,0) 会被笔迹引擎当成笔迹的落点，
+// 表现为"上一笔抬起处与下一笔按下处被连成一条线"（各种批注软件都会中招）。
+typedef struct _TB_SLOT
+{
+    TB_VHID_CONTACT Data;       // 该槽位最后一次上报的完整数据
+    BOOLEAN         HasData;    // 是否曾经有过数据（决定是否需要输出"沿用坐标"）
+} TB_SLOT;
+
 typedef struct _TB_DEVICE_CONTEXT
 {
     VHFHANDLE  Vhf;
     KSPIN_LOCK Lock;
     BOOLEAN    Ready;        // 系统已消化上一份报告，可以再提交
-    BOOLEAN    HaveLatest;   // 有最新报告待提交
     UCHAR      Latest[TB_VHID_REPORT_BYTES];
+    // 待投递队列（保证顺序：抬手帧不会被覆盖丢掉）
+    UCHAR      Pending[TB_PENDING_MAX][TB_VHID_REPORT_BYTES];
+    ULONG      PendingCount;
     volatile LONG SubmitAttempts;   // 诊断：VhfReadReportSubmit 调用次数
     volatile LONG SubmitFailures;   // 诊断：VhfReadReportSubmit 失败次数
     volatile LONG ReadyCallbacks;   // 诊断：EvtVhfReadyForNextReadReport 调用次数
     volatile LONG LastSubmitStatus; // 诊断：最近一次 VhfReadReportSubmit 的 NTSTATUS
-    volatile LONG ScanTime;         // 报告级 Scan Time 计数（单调递增，单位约 100 µs）
+    ULONG64 ScanBase100ns;          // Scan Time 基准时刻；0 = 尚未起算（下一帧为基准）
+    ULONG64 LastFrame100ns;         // 上一帧提交时刻（判断"空闲"用）
     volatile LONG FeatureRequests;  // 诊断：主机读取 Feature 报告的次数
+    TB_SLOT         Slots[TB_VHID_MAX_CONTACTS];   // 各槽位最后一次 move 的数据（抬手帧沿用其坐标）
 } TB_DEVICE_CONTEXT, *PTB_DEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(TB_DEVICE_CONTEXT, TbGetContext)
@@ -224,8 +268,9 @@ static VOID TbPut16(_Out_writes_bytes_(2) UCHAR* p, _In_ ULONG v)
 }
 
 // 把用户态的一帧触点编成 HID 报告。
-// 布局：[0]=Report ID(1)，随后 10 个手指块（各 12 字节），最后 ScanTime(2B) + ContactCount(1B)。
-// 抬手：Count=0 → 所有手指的 Tip/InRange 均为 0，且 ContactCount=0。
+// 布局：[0]=Report ID(1)，随后 10 个手指块（各 14 字节），最后 ScanTime(2B) + ContactCount(1B)。
+// 注意：**槽位数据不再受 Count 限制** —— 未按下的槽位由调用方（TbQueueFrame）填入
+// "最后一次 move 的坐标 + Tip/InRange=0"，这是微软对抬手帧的硬性要求（见 TB_SLOT 注释）。
 static VOID TbBuildReport(
     _In_ const TB_VHID_FRAME* frame,
     _In_ ULONG scanTime,
@@ -239,42 +284,31 @@ static VOID TbBuildReport(
     for (i = 0; i < TB_FINGER_COUNT; i++)
     {
         UCHAR* f = report + 1 + (i * TB_FINGER_BYTES);
-        ULONG x = 0, y = 0, w = 0, h = 0, press = 0;
-        UCHAR bits;
+        const TB_VHID_CONTACT* c = &frame->Contacts[i];
+        UCHAR bits = 0x00;
 
-        if (i < frame->Count)
+        // Confidence 只在"真实按下"时为 1（抬手后沿用的坐标不算接触）
+        if (c->Flags & TB_VHID_FLAG_TIP)
         {
-            const TB_VHID_CONTACT* c = &frame->Contacts[i];
-            x     = TbMin(c->X, 32767);
-            y     = TbMin(c->Y, 32767);
-            w     = TbMin(c->WidthMm100, 32767);
-            h     = TbMin(c->HeightMm100, 32767);
-            press = TbMin(c->Pressure, 1024);
-
-            bits = 0x04;                                   // Confidence 恒为 1（真实接触）
-            if (c->Flags & TB_VHID_FLAG_TIP)
-                bits |= 0x01;
+            bits = 0x05;                                   // Tip + Confidence
             if (c->Flags & TB_VHID_FLAG_INRANGE)
-                bits |= 0x02;
-        }
-        else
-        {
-            bits = 0x00;                                   // 未使用的手指：无接触
+                bits |= 0x02;                              // InRange（与 Tip 一起置位，见非悬停设备要求）
         }
 
         f[0] = (UCHAR)i;                                   // Contact Identifier（槽位固定）
         f[1] = bits;                                       // TipSwitch/InRange/Confidence(+填充)
-        TbPut16(f + 2,  x);
-        TbPut16(f + 4,  y);
-        TbPut16(f + 6,  w);
-        TbPut16(f + 8,  h);
-        TbPut16(f + 10, press);
+        TbPut16(f + 2,  TbMin(c->X, 32767));
+        TbPut16(f + 4,  TbMin(c->Y, 32767));
+        TbPut16(f + 6,  TbMin(c->WidthMm100, 32767));
+        TbPut16(f + 8,  TbMin(c->HeightMm100, 32767));
+        TbPut16(f + 10, TbMin(c->AzimuthDeg, 359));        // Azimuth（0..359 度）
+        TbPut16(f + 12, TbMin(c->Pressure, 1024));
     }
 
     // ---- 报告级字段（必须在所有手指字段之后）----
     // Scan Time：每帧相对扫描时间，单位 100 µs（这里用单调递增的帧计数近似）
     TbPut16(report + TB_SCAN_TIME_OFFSET, scanTime & 0xFFFF);
-    // Contact Count：本帧触点总数（报告级【必需】用法，缺它 Windows 不认触摸屏）
+    // Contact Count：本帧【真实按下】的触点总数（报告级【必需】用法，缺它 Windows 不认触摸屏）
     report[TB_CONTACT_COUNT_OFFSET] = (UCHAR)TbMin(frame->Count, TB_FINGER_COUNT);
 }
 
@@ -284,12 +318,15 @@ static VOID TbTrySubmit(_In_ PTB_DEVICE_CONTEXT ctx)
     UCHAR   report[TB_VHID_REPORT_BYTES];
     KIRQL   oldIrql;
     BOOLEAN submit = FALSE;
+    ULONG   i;
 
     KeAcquireSpinLock(&ctx->Lock, &oldIrql);
-    if (ctx->Vhf != NULL && ctx->Ready && ctx->HaveLatest)
+    if (ctx->Vhf != NULL && ctx->Ready && ctx->PendingCount > 0)
     {
-        RtlCopyMemory(report, ctx->Latest, sizeof(report));
-        ctx->HaveLatest = FALSE;
+        RtlCopyMemory(report, ctx->Pending[0], sizeof(report));      // 取队首（最旧的一帧，顺序保证）
+        for (i = 1; i < ctx->PendingCount; i++)                      // 整体前移出队
+            RtlCopyMemory(ctx->Pending[i - 1], ctx->Pending[i], sizeof(report));
+        ctx->PendingCount--;
         ctx->Ready      = FALSE;         // 等 EvtVhfReadyForNextReadReport 再放开
         submit = TRUE;
     }
@@ -322,10 +359,69 @@ static VOID TbTrySubmit(_In_ PTB_DEVICE_CONTEXT ctx)
 static VOID TbQueueFrame(_In_ PTB_DEVICE_CONTEXT ctx, _In_ const TB_VHID_FRAME* frame)
 {
     KIRQL oldIrql;
+    TB_VHID_FRAME merged;        // 合并后的帧（324B，栈上）
+    ULONG i, pressed = 0;
 
     KeAcquireSpinLock(&ctx->Lock, &oldIrql);
-    TbBuildReport(frame, (ULONG)InterlockedIncrement(&ctx->ScanTime), ctx->Latest);
-    ctx->HaveLatest = TRUE;
+
+    // 逐槽位合并：按下的照抄并记住；**抬手/未使用的槽位沿用最后一次 move 的坐标**（只清 Tip/InRange）——
+    // 微软要求抬笔包的 X/Y 必须与最后一次 move 相同，否则 (0,0) 会让笔迹引擎把两笔连成一条线。
+    for (i = 0; i < TB_VHID_MAX_CONTACTS; i++)
+    {
+        TB_VHID_CONTACT* out = &merged.Contacts[i];
+
+        if (i < frame->Count && (frame->Contacts[i].Flags & TB_VHID_FLAG_TIP))
+        {
+            *out = frame->Contacts[i];
+            ctx->Slots[i].Data    = *out;      // 记下最后一次 move 的数据
+            ctx->Slots[i].HasData = TRUE;
+            pressed++;
+        }
+        else if (ctx->Slots[i].HasData)
+        {
+            *out = ctx->Slots[i].Data;         // 坐标沿用，Tip/InRange 清 0
+            out->Flags = 0;
+        }
+        else
+        {
+            RtlZeroMemory(out, sizeof(*out));
+        }
+    }
+    merged.Count = pressed;                    // ContactCount 只算真实按下的触点
+
+    // Scan Time（0x0D:0x56）—— 严格按 USB-IF HUTRR83 / MS《Supported usages in digitizer
+    // report descriptors》实现：
+    //   · 单位固定 100 µs（描述符里已按 10^-4 s 声明），**增量必须反映扫描频率**，
+    //     即按真实经过时间递增（不是"每帧 +1"）；
+    //   · "一段空闲之后重新开始上报数据的第一帧"作为**基准**（该帧的值 ≈ 0），
+    //     所以停顿后再画一笔会从 0 重新起算；帧不断则连续累加；
+    //   · 同一帧内所有触点共享同一个值；16 位字段自然回绕（规范允许，不必重置）。
+    {
+        ULONG64 now100ns = KeQueryInterruptTime();
+        if (ctx->ScanBase100ns == 0
+            || (now100ns - ctx->LastFrame100ns) > TB_IDLE_GAP_100NS)   // 距上一帧超过 TB_IDLE_GAP 视为空闲
+        {
+            ctx->ScanBase100ns = now100ns;      // 以本帧为基准 → 本帧值 ≈ 0
+        }
+        ctx->LastFrame100ns = now100ns;
+
+        ULONG scanTime = (ULONG)((now100ns - ctx->ScanBase100ns) / 1000ULL);   // 100ns → 100µs
+        TbBuildReport(&merged, scanTime, ctx->Latest);
+    }
+
+    // 入队（不覆盖未投递的帧）：主机每读一次取队首送一帧；队满才丢最旧的一帧
+    if (ctx->PendingCount < TB_PENDING_MAX)
+    {
+        RtlCopyMemory(ctx->Pending[ctx->PendingCount], ctx->Latest, TB_VHID_REPORT_BYTES);
+        ctx->PendingCount++;
+    }
+    else
+    {
+        for (i = 1; i < TB_PENDING_MAX; i++)
+            RtlCopyMemory(ctx->Pending[i - 1], ctx->Pending[i], TB_VHID_REPORT_BYTES);
+        RtlCopyMemory(ctx->Pending[TB_PENDING_MAX - 1], ctx->Latest, TB_VHID_REPORT_BYTES);
+    }
+
     KeReleaseSpinLock(&ctx->Lock, oldIrql);
 
     TbTrySubmit(ctx);
@@ -421,6 +517,27 @@ VOID TbEvtIoDeviceControl(
             status = STATUS_SUCCESS;
         }
     }
+    else if (IoControlCode == IOCTL_TB_VHID_GET_DESCRIPTOR)
+    {
+        // 把驱动正在用的报告描述符原样回给用户态（调试/对照用，见 TouchBridgeVhidPublic.h）
+        PVOID  out = NULL;
+        size_t outLen = 0;
+
+        if (g_ReportDescriptorLength == 0)
+        {
+            status = STATUS_DEVICE_NOT_READY;           // 设备还没初始化完
+        }
+        else if (OutputBufferLength < g_ReportDescriptorLength)
+        {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        else if (NT_SUCCESS(status = WdfRequestRetrieveOutputBuffer(Request, g_ReportDescriptorLength, &out, &outLen)))
+        {
+            RtlCopyMemory(out, g_ReportDescriptor, g_ReportDescriptorLength);
+            WdfRequestSetInformation(Request, g_ReportDescriptorLength);
+            status = STATUS_SUCCESS;
+        }
+    }
 
     WdfRequestComplete(Request, status);
 }
@@ -456,6 +573,18 @@ NTSTATUS TbEvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceIni
     if (!NT_SUCCESS(status))
         return status;
 
+    // 安全描述符：系统/管理员全权，其余用户只给「读」。
+    // 目的：让非管理员的调试工具（TouchSuite.HidDump）也能取报告描述符
+    //   —— IOCTL_TB_VHID_GET_DESCRIPTOR 是 FILE_ANY_ACCESS，只读句柄即可调用；
+    //   —— IOCTL_TB_VHID_SUBMIT 需要 FILE_WRITE_DATA，非管理员依旧打不开（注入仍要管理员）。
+    {
+        UNICODE_STRING sddl;
+        RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)");
+        status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
+        if (!NT_SUCCESS(status))
+            return status;
+    }
+
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, TB_DEVICE_CONTEXT);
     attributes.EvtCleanupCallback = TbEvtDeviceCleanup;
 
@@ -466,14 +595,16 @@ NTSTATUS TbEvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceIni
     ctx = TbGetContext(device);
     KeInitializeSpinLock(&ctx->Lock);
     ctx->Ready      = FALSE;
-    ctx->HaveLatest = FALSE;
-    ctx->ScanTime   = 0;
+    ctx->PendingCount = 0;                             // 待投递队列为空
+    ctx->ScanBase100ns = 0;                            // Scan Time：下一帧作为基准（从 0 起算）
+    ctx->LastFrame100ns = 0;
     ctx->SubmitAttempts   = 0;
     ctx->SubmitFailures   = 0;
     ctx->ReadyCallbacks   = 0;
     ctx->LastSubmitStatus = 0;
     ctx->FeatureRequests  = 0;
     RtlZeroMemory(ctx->Latest, sizeof(ctx->Latest));
+    RtlZeroMemory(ctx->Slots, sizeof(ctx->Slots));      // 清空"最后一次 move"记录（抬手沿用坐标用）
 
     RtlInitUnicodeString(&name, TB_VHID_DOS_NAME);
     status = WdfDeviceCreateSymbolicLink(device, &name);

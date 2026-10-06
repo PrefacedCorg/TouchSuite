@@ -175,6 +175,40 @@ internal static class HidApi
     private static extern int HidP_GetUsageValueArray(int reportType, ushort usagePage, ushort linkCollection, ushort usage,
         [Out] byte[] usageValueBuffer, ushort usageValueByteLength, IntPtr preparsedData, byte[] report, uint reportLength);
 
+    [DllImport("hid.dll")]
+    private static extern int HidP_GetLinkCollectionNodes([Out] byte[] linkCollectionNodes, ref uint linkCollectionNodesLength, IntPtr preparsedData);
+
+    /// <summary>链接集合树节点（HIDP_LINK_COLLECTION_NODE，x64 = 24B：
+    /// Usage@0 页@2 Parent@4（索引）Children@6 NextSibling@8 FirstChild@10 flags@12）。</summary>
+    public sealed record LinkNode(ushort Usage, ushort UsagePage, ushort Parent, ushort Children, ushort NextSibling, ushort FirstChild, ushort CollectionType, bool IsAlias);
+
+    /// <summary>取链接集合树（描述符里 Collection 的嵌套结构）。</summary>
+    public static List<LinkNode> LinkNodes(IntPtr preparsed, ushort count)
+    {
+        var nodes = new List<LinkNode>();
+        if (count == 0)
+            return nodes;
+        const int nodeSize = 24;
+        var buf = new byte[nodeSize * count];
+        uint len = count;
+        if (HidP_GetLinkCollectionNodes(buf, ref len, preparsed) != HidpStatusSuccess)
+            return nodes;
+        for (int i = 0; i < len; i++)
+        {
+            int o = i * nodeSize;
+            nodes.Add(new LinkNode(
+                BitConverter.ToUInt16(buf, o),
+                BitConverter.ToUInt16(buf, o + 2),
+                BitConverter.ToUInt16(buf, o + 4),
+                BitConverter.ToUInt16(buf, o + 6),
+                BitConverter.ToUInt16(buf, o + 8),
+                BitConverter.ToUInt16(buf, o + 10),
+                (ushort)(BitConverter.ToUInt32(buf, o + 12) & 0xFF),
+                (BitConverter.ToUInt32(buf, o + 12) & 0x100) != 0));
+        }
+        return nodes;
+    }
+
     /// <summary>
     /// 值能力（HIDP_VALUE_CAPS，72B）。布局取自 Windows SDK hidpi.h（10.0.26100）：
     /// UsagePage@0、ReportID@2、IsAlias@3、LinkCollection@6、IsRange@12、IsAbsolute@15、
@@ -440,24 +474,39 @@ internal static class HidApi
         (0x0D, 0x02) => "笔",
         (0x0D, 0x04) => "触摸屏",
         (0x0D, 0x05) => "触摸板",
-        (0x0D, 0x20) => "数字化器集合",
-        (0x0D, 0x22) => "触摸数字化器",
-        (0x0D, 0x23) => "集成触摸",
-        (0x0D, 0x30) => "压感",
+        (0x0D, 0x20) => "触控笔",
+        (0x0D, 0x21) => "游标器",
+        (0x0D, 0x22) => "手指",
+        (0x0D, 0x23) => "设备设置",
+        (0x0D, 0x30) => "笔尖压力",
         (0x0D, 0x31) => "笔尖高度",
         (0x0D, 0x32) => "感应范围内",
-        (0x0D, 0x3A) => "翻转",
-        (0x0D, 0x3B) => "扭转",
-        (0x0D, 0x3C) => "倾斜X",
-        (0x0D, 0x3D) => "倾斜Y",
+        (0x0D, 0x33) => "触摸",
+        (0x0D, 0x34) => "离开",
+        (0x0D, 0x35) => "轻点",
+        (0x0D, 0x36) => "质量",
+        (0x0D, 0x37) => "数据有效",
+        (0x0D, 0x38) => "传感器序号",
+        (0x0D, 0x39) => "数位板功能键",
+        (0x0D, 0x3A) => "程序切换键",
+        (0x0D, 0x3B) => "电池电量",
+        (0x0D, 0x3C) => "反相",
+        (0x0D, 0x3D) => "X 倾斜",
+        (0x0D, 0x3E) => "Y 倾斜",
+        (0x0D, 0x3F) => "方位角",
+        (0x0D, 0x40) => "高度",
+        (0x0D, 0x41) => "扭转",
         (0x0D, 0x42) => "笔尖接触",
-        (0x0D, 0x43) => "第二桶形开关",
+        (0x0D, 0x43) => "第二笔尖开关",
         (0x0D, 0x44) => "桶形开关",
         (0x0D, 0x45) => "橡皮擦",
+        (0x0D, 0x46) => "数位板拾取",
+        (0x0D, 0x47) => "置信度",
         (0x0D, 0x48) => "宽度",
         (0x0D, 0x49) => "高度",
         (0x0D, 0x51) => "接触ID",
         (0x0D, 0x52) => "设备模式",
+        (0x0D, 0x53) => "设备序号",
         (0x0D, 0x54) => "接触数量",
         (0x0D, 0x55) => "最大接触数",
         (0x0D, 0x56) => "扫描时间",
@@ -522,8 +571,9 @@ internal static class HidApi
     {
         if (c.PhysicalMin == 0 && c.PhysicalMax == 0)
             return "—";
-        int nibble = (c.Units >> 12) & 0xF;
-        string unit = nibble switch
+        // HID Unit 项：低 4 位 = 单位制（0=无 / 1=SI 线性(cm) / 2=SI 旋转(rad) / 3=英制线性的(in) / 4=英制旋转(deg)）
+        int system = c.Units & 0xF;
+        string unit = system switch
         {
             0x1 => "cm",
             0x2 => "rad",
@@ -537,33 +587,12 @@ internal static class HidApi
         return c.PhysicalMin == 0 ? $"{c.PhysicalMax}{suffix}" : $"{c.PhysicalMin}..{c.PhysicalMax}{suffix}";
     }
 
-    /// <summary>逻辑量程 → 物理 → 每计数毫米（仅 宽度/高度 且物理量程有效、量纲为 厘米/英寸 时给出）。</summary>
-    public static double? MmPerCount(ValueCap c)
-    {
-        if (c.LogicalMax <= c.LogicalMin || c.PhysicalMax <= c.PhysicalMin)
-            return null;
-        int nibble = (c.Units >> 12) & 0xF;
-        if (nibble is not (0x1 or 0x3))
-            return null;
-        bool english = nibble == 0x3;
-        int exp = c.UnitsExp & 0xF;
-        if (exp >= 8) exp -= 16;
-        double unitMm = Math.Pow(10, exp) * (english ? 25.4 : 10.0);
-        return unitMm * c.PhysicalMax / (double)c.LogicalMax;
-    }
-
-    /// <summary>宽/高 usage 的 mm 换算提示（紧凑）。</summary>
-    public static string MmHint(ValueCap c)
-        => (c.UsagePage, c.UsageMin) is (0x0D, 0x48) or (0x0D, 0x49) && MmPerCount(c) is double mm
-            ? $"　→ {mm:0.######}mm/计数"
-            : "";
-
-    /// <summary>值帽的范围串（紧凑单行：Link 已单独成列，不在这里重复）。</summary>
+    /// <summary>值帽的范围串（紧凑单行：Link 已单独成列，不在这里重复）。**只列描述符原始声明，不做任何换算**。</summary>
     public static string RangeText(ValueCap c)
         => $"逻辑 {c.LogicalMin}..{c.LogicalMax}　物理 {PhysText(c)}　RC {c.ReportCount}×{c.BitSize}位"
          + $"　{(c.IsAbsolute ? "绝对" : "相对")}"
          + $"{(c.IsRange ? " 范围" : "")}{(c.IsAlias ? " 别名" : "")}"
-         + $"{(c.ReportID != 0 ? $" ID{c.ReportID}" : "")}{MmHint(c)}";
+         + $"{(c.ReportID != 0 ? $" ID{c.ReportID}" : "")}";
 
     /// <summary>按钮帽的范围串（紧凑）。</summary>
     public static string RangeText(ButtonCap b)

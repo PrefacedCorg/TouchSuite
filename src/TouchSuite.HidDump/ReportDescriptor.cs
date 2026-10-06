@@ -97,7 +97,13 @@ internal static class ReportDescriptor
                         case 0x2: text = $"{ind}Logical Max ({sval})"; break;
                         case 0x3: text = $"{ind}Physical Min ({sval})"; break;
                         case 0x4: text = $"{ind}Physical Max ({sval})"; break;
-                        case 0x5: text = $"{ind}Unit Exponent ({sval})"; break;
+                        case 0x5:
+                        {
+                            int e = (int)(uval & 0xF);   // 指数按 4 位补码显示（0x0E = -2）
+                            if (e >= 8) e -= 16;
+                            text = $"{ind}Unit Exponent ({e})";
+                            break;
+                        }
                         case 0x6: text = $"{ind}Unit (0x{uval:X})"; break;
                         case 0x7:
                             reportSize = (int)uval;
@@ -202,5 +208,125 @@ internal static class ReportDescriptor
     {
         string name = HidApi.UsageName(page, usage);
         return $"0x{page:X2}:{usage:X2}{(string.IsNullOrEmpty(name) ? "" : " " + name)}";
+    }
+
+    // ================= 重建：从 HidP 解析结果反推一份语义等价的描述符 =================
+
+    /// <summary>
+    /// 原始字节拿不到时（网络重定向总线只转发标准描述符），用 HidP 已解析出的
+    /// 「usage/量程/单位/Report Count/集合树」重建一份【语义等价】的报告描述符。
+    /// 注意：不是原始字节的逐字节复刻 —— 字段声明顺序、位打包方式可能不同，
+    /// 但 usage 集合、逻辑/物理量程、单位、Report Count 与原设备一致。
+    /// </summary>
+    public static byte[] Reconstruct(
+        List<HidApi.ValueCap> values, List<HidApi.ButtonCap> buttons,
+        List<HidApi.LinkNode> nodes, ushort tlcPage, ushort tlcUsage, int reportId)
+    {
+        var d = new List<byte>();
+        ushort page = 0;
+
+        // 短项编码：baseSize1 = 该项目的「1 字节数据」形态（如 0x05 = Usage Page/1B）。
+        // 低 2 位是长度码（0→无数据，1→1B，2→2B，3→4B），高位是标签。
+        void Emit(byte baseSize1, int value)
+        {
+            int size = value == 0 ? 0
+                : value is >= -128 and <= 127 ? 1
+                : value is >= -32768 and <= 32767 ? 2
+                : 4;
+            int code = size switch { 0 => 0, 1 => 1, 2 => 2, _ => 3 };
+            d.Add((byte)((baseSize1 & 0xFC) | code));
+            for (int i = 0; i < size; i++)
+                d.Add((byte)((value >> (8 * i)) & 0xFF));
+        }
+
+        void EmitValueCap(HidApi.ValueCap c)
+        {
+            if (c.UsagePage != page)
+            {
+                page = c.UsagePage;
+                Emit(0x05, page);
+            }
+            if (c.IsRange)
+            {
+                Emit(0x19, c.UsageMin);
+                Emit(0x29, c.UsageMax);
+            }
+            else
+            {
+                Emit(0x09, c.UsageMin);
+            }
+            Emit(0x15, c.LogicalMin);
+            Emit(0x25, c.LogicalMax);
+            if (c.PhysicalMin != 0 || c.PhysicalMax != 0)
+            {
+                Emit(0x35, c.PhysicalMin);
+                Emit(0x45, c.PhysicalMax);
+            }
+            Emit(0x55, c.Units != 0 ? c.UnitsExp : 0);
+            Emit(0x65, c.Units);
+            Emit(0x75, c.BitSize);
+            Emit(0x95, c.ReportCount);
+            d.Add(0x81);
+            d.Add(0x02);   // Input (Data, Var, Abs)
+        }
+
+        void EmitButtonCap(HidApi.ButtonCap b)
+        {
+            if (b.UsagePage != page)
+            {
+                page = b.UsagePage;
+                Emit(0x05, page);
+            }
+            if (b.IsRange)
+            {
+                Emit(0x19, b.UsageMin);
+                Emit(0x29, b.UsageMax);
+            }
+            else
+            {
+                Emit(0x09, b.UsageMin);
+            }
+            Emit(0x15, 0);
+            Emit(0x25, 1);
+            Emit(0x75, 1);
+            Emit(0x95, 1);
+            d.Add(0x81);
+            d.Add(0x02);
+        }
+
+        // 深度优先：本节点的帽子（值帽在前、按钮帽在后），再递归子集合（FirstChild → NextSibling 链）
+        void EmitNode(int idx)
+        {
+            foreach (HidApi.ValueCap c in values.Where(v => v.LinkCollection == idx))
+                EmitValueCap(c);
+            foreach (HidApi.ButtonCap b in buttons.Where(b => b.LinkCollection == idx))
+                EmitButtonCap(b);
+
+            for (ushort child = nodes[idx].FirstChild; child != 0 && child < nodes.Count; child = nodes[child].NextSibling)
+            {
+                Emit(0x05, nodes[child].UsagePage);
+                // 部分设备给子集合的 LinkUsage 是 0（别名集合没记 usage）——触摸屏 TLC 下的按 Finger 补
+                ushort childUsage = nodes[child].Usage != 0 ? nodes[child].Usage
+                    : nodes[child].UsagePage == 0x0D ? (ushort)0x22 : nodes[child].Usage;
+                Emit(0x09, childUsage);
+                d.Add(0xA1);
+                d.Add((byte)(nodes[child].CollectionType is 0x00 or 0x01 ? nodes[child].CollectionType : 0x02));
+                EmitNode(child);
+                d.Add(0xC0);
+            }
+        }
+
+        // 顶层：Application 集合（节点 0）
+        Emit(0x05, tlcPage);
+        Emit(0x09, tlcUsage);
+        d.Add(0xA1);
+        d.Add(0x01);
+        if (reportId != 0)
+            Emit(0x85, reportId);
+
+        if (nodes.Count > 0)
+            EmitNode(0);
+        d.Add(0xC0);
+        return d.ToArray();
     }
 }

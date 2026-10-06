@@ -505,7 +505,13 @@ internal sealed class TouchInjector : ITouchSink, IDisposable
                 if (!float.IsNaN(p.OrientationDeg))
                 {
                     mask |= TOUCH_MASK_ORIENTATION;
-                    orientationDeg = (int)Math.Round(p.OrientationDeg) % 360;
+                    // 约定换算：Android getOrientation() 是「相对竖直方向、顺时针」，
+                    // 而 POINTER_TOUCH_INFO.orientation 是「0 = 沿 X 轴（水平向右）、顺时针，0..359」
+                    // （见 MS 文档：0 indicates a touch pointer aligned with the x-axis ... increasing
+                    //   values indicate degrees of rotation in the clockwise direction）。
+                    // 两者方向一致、参考轴差 90°：竖直朝上在 Windows 里是 270°，故减 90。
+                    double d = (p.OrientationDeg - 90.0) % 360.0;
+                    orientationDeg = (int)Math.Round(d);
                     if (orientationDeg < 0) orientationDeg += 360;
                 }
             }

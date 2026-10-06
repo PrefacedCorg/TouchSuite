@@ -163,15 +163,15 @@ internal static class UsbDescriptor
                 }
                 try
                 {
-                    if (!PortMatches(hub, (int)port, vid, pid))
-                    {
-                        LastReason = $"设备 {instanceId} 挂在 {hubId} 端口 {port}，但该集线器不支持端口查询 —— 多为虚拟 / 网络重定向 USB（向日葵、SpaceDesk 等），本机拿不到原始描述符。";
-                        continue;
-                    }
-                    byte[]? desc = FetchReportDescriptor(hub, (int)port, iface);
+                    bool portOk = PortMatches(hub, (int)port, vid, pid);
+                    byte[]? desc = FetchReportDescriptor(hub, (int)port, iface, out string fetchNote);
                     if (desc is not null)
                         return desc;
-                    LastReason = $"设备 {instanceId} 在 {hubId} 端口 {port}，但该集线器不支持取描述符（虚拟 / 重定向 USB）。";
+
+                    LastReason = portOk
+                        ? $"设备 {instanceId} 在 {hubId} 端口 {port}（端口校验通过），但描述符请求没取到像样的内容 → {fetchNote}"
+                        : $"设备 {instanceId} 挂在 {hubId} 端口 {port}，端口查询不支持（虚拟/重定向总线）；转发描述符也未成功 → {fetchNote}";
+                    Log.Warn(LastReason);
                 }
                 finally
                 {
@@ -258,8 +258,25 @@ internal static class UsbDescriptor
         }
     }
 
-    private static bool PortMatches(IntPtr hub, int connectionIndex, ushort vid, ushort pid)
+    /// <summary>
+    /// 粗校验「像不像一份 HID 报告描述符」：以 End Collection(0xC0) 结尾，或含数字化器/触摸屏顶层集合(05 0D 09 04)。
+    /// 虚拟/重定向集线器不支持端口查询时，只能靠内容自证是这块设备的描述符。
+    /// </summary>
+    private static bool LooksLikeReportDescriptor(byte[] d)
     {
+        if (d.Length < 6 || d.Length > 4096)
+            return false;
+        if (d[d.Length - 1] == 0xC0)
+            return true;
+        for (int i = 0; i + 3 < d.Length; i++)
+        {
+            if (d[i] == 0x05 && d[i + 1] == 0x0D && d[i + 2] == 0x09 && d[i + 3] == 0x04)
+                return true;
+        }
+        return false;
+    }
+
+    private static bool PortMatches(IntPtr hub, int connectionIndex, ushort vid, ushort pid)    {
         var info = new byte[256];
         BitConverter.GetBytes(connectionIndex).CopyTo(info, 0);
         if (!DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, info, 4, info, (uint)info.Length, out _, IntPtr.Zero))
@@ -415,25 +432,144 @@ internal static class UsbDescriptor
     }
 
     internal static byte[]? FetchReportDescriptor(IntPtr hub, int connectionIndex, int iface)
+        => FetchReportDescriptor(hub, connectionIndex, iface, out _);
+
+    /// <summary>
+    /// 取报告描述符：把「接口号 × 接收者类型」都试一遍（不同驱动/组合设备认的参数不一样），
+    /// 用 LooksLikeReportDescriptor 判"像不像"，并返回尝试过程摘要供日志/界面显示。
+    /// </summary>
+    internal static byte[]? FetchReportDescriptor(IntPtr hub, int connectionIndex, int iface, out string note)
+    {
+        var tried = new List<string>();
+        foreach (ushort wIndex in new ushort[] { (ushort)iface, 0, 1, 2 }.Distinct())
+        {
+            foreach (byte bm in new byte[] { 0x81, 0x80 })   // 0x81=接口接收者（规范用法），0x80 兜底
+            {
+                byte[]? d = FetchDescriptor(hub, connectionIndex, bm, 0x22, 0, wIndex, 1024);
+                if (d is null)
+                {
+                    tried.Add($"bm0x{bm:X2}/索引{wIndex}=IOCTL失败");
+                    continue;
+                }
+                if (LooksLikeReportDescriptor(d))
+                {
+                    note = $"bm=0x{bm:X2} wIndex={wIndex}";
+                    return d;
+                }
+                tried.Add($"bm0x{bm:X2}/索引{wIndex}={d.Length}字节 首0x{d[0]:X2} 末0x{d[d.Length - 1]:X2}"
+                          + $"\n{HexLines(d)}");
+            }
+        }
+        note = string.Join("；", tried);
+        return null;
+    }
+
+    private static string HexLines(byte[] d)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < d.Length; i += 16)
+        {
+            sb.Append($"      {i:X4}: ");
+            for (int j = i; j < Math.Min(i + 16, d.Length); j++)
+                sb.Append(d[j].ToString("X2")).Append(' ');
+            sb.AppendLine();
+        }
+        return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>取设备/配置等标准描述符（虚拟/重定向总线通常只转发这几类）。</summary>
+    internal static byte[]? FetchDescriptor(IntPtr hub, int connectionIndex,
+        byte bmRequest, ushort descriptorType, ushort descriptorIndex, ushort wIndex, ushort wLength)
     {
         // USB_DESCRIPTOR_REQUEST：ConnectionIndex@0 + SetupPacket@4（bmRequest/bRequest/wValue/wIndex/wLength）
-        const int dataLen = 4096;
         var req = new byte[12];
         BitConverter.GetBytes(connectionIndex).CopyTo(req, 0);
-        req[4] = 0x80;   // bmRequest：设备 → 主机
+        req[4] = bmRequest;
         req[5] = 0x06;   // bRequest：GET_DESCRIPTOR
-        BitConverter.GetBytes((ushort)0x2200).CopyTo(req, 6);   // wValue：类型 0x22（HID 报告描述符），索引 0
-        BitConverter.GetBytes((ushort)iface).CopyTo(req, 8);    // wIndex：接口号
-        BitConverter.GetBytes((ushort)dataLen).CopyTo(req, 10); // wLength
+        BitConverter.GetBytes((ushort)((descriptorType << 8) | descriptorIndex)).CopyTo(req, 6);   // wValue
+        BitConverter.GetBytes(wIndex).CopyTo(req, 8);
+        BitConverter.GetBytes(wLength).CopyTo(req, 10);
 
-        var outBuf = new byte[12 + dataLen];
+        var outBuf = new byte[12 + wLength];
         if (!DeviceIoControl(hub, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, req, (uint)req.Length, outBuf, (uint)outBuf.Length, out uint returned, IntPtr.Zero))
             return null;
         if (returned <= 12)
             return null;
 
-        byte[] desc = new byte[returned - 12];
-        Array.Copy(outBuf, 12, desc, 0, desc.Length);
-        return desc;
+        byte[] data = new byte[returned - 12];
+        Array.Copy(outBuf, 12, data, 0, data.Length);
+        return data;
+    }
+
+    /// <summary>
+    /// 拿不到报告描述符时的降级信息：读设备/配置描述符，把 VID/PID、接口数、以及配置描述符里
+    /// HID 描述符声明的「报告描述符长度」摘出来（重定向总线一般会转发这两个）。
+    /// 返回 null 表示连这些也读不到。
+    /// </summary>
+    public static string? TryDescribeStandard(string hidPath)
+    {
+        Match m = Regex.Match(hidPath, @"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})", RegexOptions.IgnoreCase);
+        if (!m.Success)
+            return null;
+        ushort vid = Convert.ToUInt16(m.Groups[1].Value, 16);
+        ushort pid = Convert.ToUInt16(m.Groups[2].Value, 16);
+
+        foreach (string instanceId in EnumDeviceIds())
+        {
+            if (!instanceId.StartsWith($"USB\\VID_{vid:X4}&PID_{pid:X4}", StringComparison.OrdinalIgnoreCase)
+                && !instanceId.StartsWith($"USB\\VID_{vid:x4}&PID_{pid:x4}", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (CM_Locate_DevNodeW(out uint devInst, instanceId, 0) != CrSuccess)
+                continue;
+            if (GetUInt32Property(devInst, CmDrpAddress) is not uint port || port == 0)
+                continue;
+            if (CM_Get_Parent(out uint hubInst, devInst, 0) != CrSuccess)
+                continue;
+            string hubId = GetDeviceId(hubInst);
+            string? hubPath = hubId.Length == 0 ? null : HubInterfacePath(hubId);
+            if (hubPath is null)
+                continue;
+
+            IntPtr hub = HidApi.Open(hubPath, out _);
+            if (!HidApi.Ok(hub))
+                continue;
+            try
+            {
+                byte[]? dev = FetchDescriptor(hub, (int)port, 0x80, 0x01, 0, 0, 18);
+                byte[]? cfg = FetchDescriptor(hub, (int)port, 0x80, 0x02, 0, 0, 512);
+                if (cfg is null)
+                    continue;
+
+                var sb = new System.Text.StringBuilder();
+                if (dev is { Length: >= 12 })
+                    sb.Append($"设备描述符：VID_{BitConverter.ToUInt16(dev, 8):X4}&PID_{BitConverter.ToUInt16(dev, 10):X4} USB{BitConverter.ToUInt16(dev, 2):X4} {dev[17]} 个配置；");
+                if (cfg.Length >= 9)
+                    sb.Append($"配置描述符：总长 {BitConverter.ToUInt16(cfg, 2)} 字节，{cfg[4]} 个接口；");
+
+                // 在配置描述符里逐个找 HID 描述符(0x21)：它声明报告描述符长度
+                int off = 0;
+                int n = 1;
+                while (off + 2 <= cfg.Length)
+                {
+                    int len = cfg[off];
+                    byte type = cfg[off + 1];
+                    if (len == 0)
+                        break;
+                    if (type == 0x21 && off + 9 <= cfg.Length)
+                    {
+                        int rdLen = cfg[off + 7] | (cfg[off + 8] << 8);
+                        sb.Append($"HID 描述符#{n}：报告描述符长度 = {rdLen} 字节（bcdHID 0x{BitConverter.ToUInt16(cfg, off + 2):X4}，国家码 {cfg[off + 4]}）；");
+                        n++;
+                    }
+                    off += len;
+                }
+                return sb.Length > 0 ? sb.ToString().TrimEnd('；') : null;
+            }
+            finally
+            {
+                HidApi.Close(hub);
+            }
+        }
+        return null;
     }
 }

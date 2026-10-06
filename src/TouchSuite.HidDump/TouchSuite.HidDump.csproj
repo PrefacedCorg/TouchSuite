@@ -2,15 +2,27 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <!-- net462：Win10 1607+ 自带（免装运行时）；Win7 SP1 / 8.1 需装一次 .NET Framework 4.6.2 安装包。
+         .NET 8/9/10 已不支持 Win7，所以想覆盖 Win7 只能用 .NET Framework。 -->
+    <TargetFramework>net462</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <UseWPF>true</UseWPF>
     <RootNamespace>TouchSuite.HidDump</RootNamespace>
     <AssemblyName>TouchSuite.HidDump</AssemblyName>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Product>TouchSuite HidDump</Product>
+    <Deterministic>true</Deterministic>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 没装 .NET Framework 目标包的机器也能编译 -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <!-- net462 无内置 ValueTuple（C# 元组需要） -->
+    <PackageReference Include="System.ValueTuple" Version="4.5.0" />
+  </ItemGroup>
 
 </Project>

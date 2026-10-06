@@ -27,7 +27,8 @@ internal interface ITouchSink
 /// 与 TouchInjector 的 user32 合成指针完全独立（可并存，互不影响）。
 ///
 /// 驱动的报告描述符里 Width/Height 单位是 0.01mm、压感 0..1024、X/Y 为 0..32767 归一化，
-/// 所以这里把平板的归一化接触尺寸换算成毫米后上报 —— Windows / WPF 拿到的就是真面积。
+/// 接触朝向 Azimuth 为 0..359 度（可选用法，无角度信息填 0），
+/// 所以这里把平板的归一化接触尺寸换算成毫米后上报 —— Windows / WPF 拿到的就是真面积与朝向。
 /// </summary>
 internal sealed class VhidSender : ITouchSink, IDisposable
 {
@@ -54,6 +55,7 @@ internal sealed class VhidSender : ITouchSink, IDisposable
         public uint Y;
         public uint WidthMm100;
         public uint HeightMm100;
+        public uint AzimuthDeg;      // 接触朝向 0..359 度（无角度信息填 0）
         public uint Pressure;
     }
 
@@ -201,12 +203,14 @@ internal sealed class VhidSender : ITouchSink, IDisposable
                 Y = uy,
                 WidthMm100 = (uint)Math.Clamp(Math.Round(wMm * 100.0), 0, 32767),
                 HeightMm100 = (uint)Math.Clamp(Math.Round(hMm * 100.0), 0, 32767),
+                AzimuthDeg = (uint)Math.Clamp(Math.Round(NormalizeAzimuth(p.OrientationDeg)), 0, 359),
                 Pressure = (uint)Math.Clamp(Math.Round(MapPressure(p.Pressure)), 0, 1024),
             };
             if (n == 0)
             {
                 first = $"槽{slot} X={ux} Y={uy} W={vf.Contacts[slot].WidthMm100} "
-                    + $"H={vf.Contacts[slot].HeightMm100} P={vf.Contacts[slot].Pressure}";
+                    + $"H={vf.Contacts[slot].HeightMm100} A={vf.Contacts[slot].AzimuthDeg}° "
+                    + $"P={vf.Contacts[slot].Pressure}";
             }
             n++;
         }
@@ -260,6 +264,22 @@ internal sealed class VhidSender : ITouchSink, IDisposable
             (double cw0, double ch0) = mapper.ScaleContact(p0.ContactW, p0.ContactH);
             _lastSummary = $"id{p0.Id} 归一({p0.X:0.###},{p0.Y:0.###}) →0..32767 面积 {cw0:0.#}×{ch0:0.#}px 压感 {MapPressure(p0.Pressure):0}";
         }
+    }
+
+    /// <summary>
+    /// 平板角度（度，可能为 NaN/无穷）→ HID Azimuth 语义的 0..359。
+    /// 约定换算：Android getOrientation() 是「相对竖直方向、顺时针」，
+    /// 而 HID Azimuth(0x0D:0x3F) 官方定义是「绕 Z 轴【逆时针】旋转」
+    /// （MS：The counter-clockwise rotation of the cursor about the Z-axis），
+    /// 参考轴同为竖直、方向相反 → 取 360 - a。无角度信息给 0。
+    /// </summary>
+    private static double NormalizeAzimuth(float deg)
+    {
+        if (float.IsNaN(deg) || float.IsInfinity(deg))
+            return 0;
+        double d = deg % 360.0;
+        if (d < 0) d += 360.0;
+        return d == 0 ? 0 : 360.0 - d;
     }
 
     /// <summary>平板原始压感 → 0..1024（与 user32 注入端同一套映射）。</summary>

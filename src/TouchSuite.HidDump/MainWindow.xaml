@@ -9,8 +9,12 @@
             <StackPanel>
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="设备：" VerticalAlignment="Center"/>
-                    <ComboBox x:Name="DeviceCombo" Width="640" SelectionChanged="OnDevicePicked"/>
+                    <ComboBox x:Name="DeviceCombo" Width="620" SelectionChanged="OnDevicePicked"/>
+                    <CheckBox x:Name="ShowAllCheck" Content="显示非触摸设备" Margin="10,0,0,0" VerticalAlignment="Center"
+                              Checked="OnShowAllChanged" Unchecked="OnShowAllChanged"/>
                     <Button Content="重新扫描" Margin="10,0,0,0" Padding="10,3" Click="OnRescan"/>
+                    <Button Content="导出报告" Margin="8,0,0,0" Padding="10,3" Click="OnExportReport"/>
+                    <Button Content="打开报告文件夹" Margin="8,0,0,0" Padding="10,3" Click="OnOpenLogFolder"/>
                     <CheckBox x:Name="RealPosCheck" Content="红圈按真实屏幕位置（1:1）" IsChecked="True"
                               Margin="14,0,0,0" VerticalAlignment="Center"
                               Checked="OnRealPosChanged" Unchecked="OnRealPosChanged"/>
@@ -40,7 +44,7 @@
                     <Canvas x:Name="RawCanvas" IsHitTestVisible="False"/>
                     <Canvas x:Name="TouchCanvas" IsHitTestVisible="False"/>
                     <TextBlock x:Name="TouchHint"
-                               Text="在这块区域上触摸 / 手掌按压（触摸屏设备选中时生效）&#x0a;灰框 = 整屏缩放示意，红圈落在框里的真实屏幕位置&#x0a;蓝点 = WPF 触摸位置（本面板内的实际坐标）"
+                               Text="在这块区域上触摸 / 手掌按压（触摸屏设备选中时生效）&#x0a;灰框 = 整屏缩放示意，红圈落在框里的真实屏幕位置&#x0a;红圈 = 设备上报接触盒（逐指各一个），橙针 = 方位角 0x3F（逆时针，⬆=0°）&#x0a;蓝点 = WPF 触摸位置（本面板内的实际坐标）"
                                Foreground="#FF6B6F7A" FontSize="14" TextAlignment="Center"
                                HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False"/>
                 </Grid>
