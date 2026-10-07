@@ -6,6 +6,7 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 using TouchSuite.App.Eraser;
 
 namespace TouchSuite.App;
@@ -63,6 +64,8 @@ public partial class MainWindow : Window
     private readonly List<double> _fingerPressures = new();
 
     private long _lastSampleLogTicks;   // 样本日志节流：≥250ms 才记一行，避免刷屏
+    private long _lastSampleTicks;      // 最近一次收到任何样本的时刻（抬手后用它把实时读数归零）
+    private DispatcherTimer? _uiTick;   // 抬手检测：静默超过新鲜窗口就把「当前接触/压感」清成 —
     private long _lastInfoBarTicks;     // 信息栏刷新节流（实时压感 60Hz，节流后才看得清）
     private double? _liveAreaPx2;       // 手掌/手指实时接触面积（物理像素²）
     private double? _livePressure;      // 手掌/手指实时压感（来自 WPF Stylus）
@@ -98,7 +101,6 @@ public partial class MainWindow : Window
         // 默认两项都判"准"（对应界面 RadioButton 的默认选中），首次标尺即按 EDID 原样
         _result.WidthRulerOk = true;
         _result.HeightRulerOk = true;
-
         TraceCanvas.DefaultDrawingAttributes = new DrawingAttributes
         {
             Width = 3,
@@ -122,6 +124,79 @@ public partial class MainWindow : Window
         Log.Info($"原始HID 触摸注册 = {ok}；HID 设备 {_hidDevices.Count} 个（触摸类 {_hidDevices.Count(d => d.IsTouchScreen)} 个）");
         foreach (HidReader.HidDeviceInfo d in _hidDevices.Where(d => d.IsTouchScreen))
             Log.Info($"HID(raw): {d.DeviceName} | W={d.HasWidth} H={d.HasHeight} P={d.HasPressure} | 宽:{d.WidthDetail} 高:{d.HeightDetail} 压感:{d.PressureDetail} | {d.XYDetail}");
+
+        // 多块触摸屏：把触摸类设备喂给预览页下拉（第 1 项固定"自动"）
+        PushHidDevices();
+    }
+
+    /// <summary>把扫到的触摸类 HID 设备喂给三处「HID 触摸屏」下拉（索引 0 固定"自动"）。</summary>
+    private void PushHidDevices()
+    {
+        _hidDeviceKeys.Clear();
+        foreach (HidReader.HidDeviceInfo d in _hidDevices.Where(d => d.IsTouchScreen))
+            _hidDeviceKeys.Add(d.DeviceName);
+
+        _suppressDeviceUi = true;
+        foreach (ComboBox? combo in new[] { PalmHidDeviceCombo, FingerHidDeviceCombo })
+        {
+            if (combo is null)
+                continue;
+            combo.Items.Clear();
+            combo.Items.Add("自动（第一块出数的触摸屏）");
+            foreach (HidReader.HidDeviceInfo d in _hidDevices.Where(d => d.IsTouchScreen))
+                combo.Items.Add(ShortName(d.DeviceName));
+            combo.SelectedIndex = 0;
+        }
+        _suppressDeviceUi = false;
+
+        if (EraserPage is not null)
+            EraserPage.SetHidDevices(_hidDevices.Where(d => d.IsTouchScreen)
+                .Select(d => (Key: d.DeviceName, Label: ShortName(d.DeviceName))).ToList());
+
+        SyncHidDeviceUi();
+    }
+
+    private readonly List<string> _hidDeviceKeys = new();
+    private bool _suppressDeviceUi;
+
+    private void OnPalmHidDeviceChanged(object sender, SelectionChangedEventArgs e)
+        => ApplyHidDeviceChange(((ComboBox)sender).SelectedIndex);
+
+    private void OnFingerHidDeviceChanged(object sender, SelectionChangedEventArgs e)
+        => ApplyHidDeviceChange(((ComboBox)sender).SelectedIndex);
+
+    /// <summary>三处「HID 触摸屏」下拉任一改动：落到引擎，再把三处同步一致。</summary>
+    private void ApplyHidDeviceChange(int index)
+    {
+        if (_suppressDeviceUi || EraserPage is null)
+            return;
+        string key = index >= 1 && index - 1 < _hidDeviceKeys.Count ? _hidDeviceKeys[index - 1] : "";
+        EraserPage.Engine.SetRawHidDevice(key);
+        SyncHidDeviceUi();
+    }
+
+    /// <summary>把引擎当前指定的 HID 触摸屏同步到三处下拉。</summary>
+    private void SyncHidDeviceUi()
+    {
+        if (EraserPage is null)
+            return;
+        string key = EraserPage.Engine.RawHidDeviceKey;
+        int idx = 0;
+        for (int i = 0; i < _hidDeviceKeys.Count; i++)
+            if (string.Equals(_hidDeviceKeys[i], key, StringComparison.OrdinalIgnoreCase))
+            {
+                idx = i + 1;
+                break;
+            }
+
+        _suppressDeviceUi = true;
+        if (PalmHidDeviceCombo is { Items.Count: > 0 } pc)
+            pc.SelectedIndex = Math.Min(idx, pc.Items.Count - 1);
+        if (FingerHidDeviceCombo is { Items.Count: > 0 } fc)
+            fc.SelectedIndex = Math.Min(idx, fc.Items.Count - 1);
+        _suppressDeviceUi = false;
+
+        EraserPage.SyncHidDevice(key);
     }
 
     private const int WM_INPUT = 0x00FF;
@@ -136,6 +211,7 @@ public partial class MainWindow : Window
             if (r == HidReader.WmInputResult.UnknownDevice && HidReader.TryBeginAutoRescan())
             {
                 _hidDevices = HidReader.Scan();
+                PushHidDevices();
                 HidReader.TryHandleWmInput(lParam, out sample);
             }
 
@@ -148,25 +224,35 @@ public partial class MainWindow : Window
     /// <summary>原始HID 样本：只取「接触尺寸→面积」与「压感」，封装成 TouchSample 走同一条处理链。</summary>
     private void HandleHidSample(HidReader.RawTouchSample s)
     {
-        if (s.WidthMm is not double w || s.HeightMm is not double h)
-            return;   // 没尺寸的帧不带面积（空槽位/占位值）
+        // 多块触摸屏：与预览页共用同一把设备闸门（指定那台 / 自动锁第一台出数的），
+        // 保证「标定采样」和「预览」用的是同一块屏，别让第二块屏的样本污染 K。
+        if (EraserPage is not null && !EraserPage.Engine.AcceptHidDevice(s.DeviceName))
+            return;
+
+        // 尺寸只需要计数 + 该轴逻辑量程（空槽位/占位帧两样都没有才丢帧）。不需要 mm。
+        bool hasLog = s.WidthLogical > 0 && s.HeightLogical > 0 && s.WidthLogMax > 0 && s.HeightLogMax > 0;
+        if (!hasLog)
+            return;
 
         long now = Environment.TickCount64;
         _lastHidTicks = now;
         if (now - _lastHidLogTicks >= 100)
         {
             _lastHidLogTicks = now;
-            Log.Info($"原始HID: 设备={ShortName(s.DeviceName)} W={s.WidthLogical}/{s.WidthLogMax}({Precision.Fmt(w)}mm) H={s.HeightLogical}/{s.HeightLogMax}({Precision.Fmt(h)}mm)"
+            Log.Info($"原始HID: 设备={ShortName(s.DeviceName)} 生效槽位L={s.LinkCollection} W={s.WidthLogical}/{s.WidthLogMax} H={s.HeightLogical}/{s.HeightLogMax}"
                  + $" X={s.XLogical}/{s.XLogMax}({Precision.Fmt(s.XNorm, 4)}) Y={s.YLogical}/{s.YLogMax}({Precision.Fmt(s.YNorm, 4)})"
                  + $" 压感={Precision.Fmt(s.Pressure01, 3)} raw=[{s.Hex}]");
+            Log.Info($"原始HID 有数据槽位: {s.LinksDetail}");
         }
 
         OnSample(new TouchSample("RawHID", s.WidthMm, s.HeightMm, s.Pressure01,
-            Detail: $"W={s.WidthLogical}/{s.WidthLogMax} H={s.HeightLogical}/{s.HeightLogMax} raw=[{s.Hex}]",
+            Detail: $"L={s.LinkCollection} W={s.WidthLogical}/{s.WidthLogMax} H={s.HeightLogical}/{s.HeightLogMax} raw=[{s.Hex}]",
             WidthLogical: s.WidthLogical, HeightLogical: s.HeightLogical,
             XNorm: s.XNorm, YNorm: s.YNorm,
             XLogMax: s.XLogMax, YLogMax: s.YLogMax,
-            WidthLogMax: s.WidthLogMax, HeightLogMax: s.HeightLogMax));
+            WidthLogMax: s.WidthLogMax, HeightLogMax: s.HeightLogMax,
+            XPhysMm: s.XPhysMm, YPhysMm: s.YPhysMm,
+            DeviceKey: s.DeviceName));
     }
 
     /// <summary>原始HID 设备换算表（映射表）文字，只读展示。</summary>
@@ -188,49 +274,39 @@ public partial class MainWindow : Window
     // ================= 来源下拉 =================
 
     private void OnPalmSourceModeChanged(object sender, SelectionChangedEventArgs e)
-        => ApplySourceUi(((ComboBox)sender).SelectedIndex, null);
+        => ApplySourceUi(((ComboBox)sender).SelectedIndex);
 
     private void OnFingerSourceModeChanged(object sender, SelectionChangedEventArgs e)
-        => ApplySourceUi(((ComboBox)sender).SelectedIndex, null);
+        => ApplySourceUi(((ComboBox)sender).SelectedIndex);
 
-    private void OnPalmHidMmChanged(object sender, SelectionChangedEventArgs e)
-        => ApplySourceUi(null, ((ComboBox)sender).SelectedIndex);
-
-    private void OnFingerHidMmChanged(object sender, SelectionChangedEventArgs e)
-        => ApplySourceUi(null, ((ComboBox)sender).SelectedIndex);
-
-    /// <summary>把某个下拉的改动落实到引擎，再把所有下拉同步成引擎当前状态。</summary>
-    private void ApplySourceUi(int? modeIndex, int? mmIndex)
+    /// <summary>把来源下拉的改动落实到引擎，再把所有下拉同步成引擎当前状态。</summary>
+    private void ApplySourceUi(int modeIndex)
     {
         if (_suppressSourceUi || !IsLoaded || EraserPage is null)
             return;
-        if (modeIndex is int mi)
-            EraserPage.Engine.SetMode((SourceMode)Math.Clamp(mi, 0, 2));
-        if (mmIndex is int hi)
-            EraserPage.Engine.SetHidSizeSource((HidSizeSource)Math.Clamp(hi, 0, 1));
+        EraserPage.Engine.SetMode((SourceMode)Math.Clamp(modeIndex, 0, 2));
         SyncSourceUi();
     }
 
-    /// <summary>按引擎当前来源状态刷新三处下拉与 HID 尺寸取法面板可见性。</summary>
+    /// <summary>按引擎当前来源状态刷新下拉与 HID 面板可见性。</summary>
     private void SyncSourceUi()
     {
         if (PalmSourceCombo is null || EraserPage is null)
             return;
 
         SourceMode mode = EraserPage.Engine.Mode;
-        HidSizeSource mm = EraserPage.Engine.HidSizeSource;
-        Visibility hidVis = mode == SourceMode.RawHid ? Visibility.Visible : Visibility.Collapsed;
+        // 自适应可能锁到 HID、手动原始HID 必用 HID —— 两种情况都把 HID 面板亮出来
+        Visibility hidVis = mode != SourceMode.SoftwareWpf ? Visibility.Visible : Visibility.Collapsed;
 
         _suppressSourceUi = true;
         if (FingerSourceCombo is not null) FingerSourceCombo.SelectedIndex = (int)mode;
         PalmSourceCombo.SelectedIndex = (int)mode;
-        if (PalmHidMmCombo is not null) PalmHidMmCombo.SelectedIndex = (int)mm;
-        if (FingerHidMmCombo is not null) FingerHidMmCombo.SelectedIndex = (int)mm;
         if (PalmHidMmPanel is not null) PalmHidMmPanel.Visibility = hidVis;
         if (FingerHidMmPanel is not null) FingerHidMmPanel.Visibility = hidVis;
         _suppressSourceUi = false;
 
-        EraserPage.SyncSourceSelection(mode, mm);
+        EraserPage.SyncSourceSelection(mode);
+        SyncHidDeviceUi();
         UpdateSourceInfoText();
     }
 
@@ -305,7 +381,25 @@ public partial class MainWindow : Window
 
         SyncSourceUi();
 
-        // 启动时若存在上次保存的标定，询问是否载入（载入则直接跳到结果页）
+        // 抬手检测：静默超过新鲜窗口 → 把「当前接触/压感」清成 —（否则会一直停在最后一个值）
+        _uiTick = new DispatcherTimer(TimeSpan.FromMilliseconds(250), DispatcherPriority.Background, (_, _) =>
+        {
+            long now = Environment.TickCount64;
+            if (now - _lastSampleTicks <= EraserEngine.SourceFreshMs)
+                return;
+            if (_liveAreaPx2 is null && _livePressure is null)
+                return;
+
+            _liveAreaPx2 = null;
+            _livePressure = null;
+            if (_step == 4)
+                PalmLiveText.Text = LiveText();
+            else if (_step == 5)
+                FingerLiveText.Text = LiveText();
+            RefreshInfoBar();
+        }, Dispatcher);
+        _uiTick.Start();
+
         if (!TryLoadSaved())
             ShowStep(0);
     }
@@ -368,6 +462,11 @@ public partial class MainWindow : Window
 
         // 恢复预览页的开关/滑块/形状/长宽比/面积公式（老版本 JSON 无这些字段时保持默认）
         EraserPage.ApplySettings(saved);
+
+        // 恢复 HID 触摸屏（老版本 JSON 无则保持默认"自动"）
+        if (!string.IsNullOrEmpty(saved.HidDeviceKey))
+            EraserPage.Engine.SetRawHidDevice(saved.HidDeviceKey);
+        SyncSourceUi();
     }
 
     private void UpdateDpi()
@@ -764,7 +863,7 @@ public partial class MainWindow : Window
             case 3:
                 if (_result.PalmAreaPx2 <= 0)
                 {
-                    SetStatus("请先描一圈，或在右侧填入手掌宽/高（物理像素 px）。");
+                    SetStatus("请在右侧填入手掌宽/高（物理像素 px）——不描摹也行；想用描摹凹面积 a3 再描一圈。");
                     return;
                 }
                 ShowStep(4);
@@ -880,11 +979,15 @@ public partial class MainWindow : Window
         _result.PalmAreaFormula = f.ToString();
         _result.PalmAreaPx2 = EraserEngine.PalmAreaFrom(f, w, h, _traceAreaPx2);
 
+        // 选了 a3 但没描摹 → 自动退回 a1×a2（不描摹也能过，用右侧默认/手填的宽高即可）
+        bool traceFallback = f == AreaFormula.Trace && !(_traceAreaPx2 > 0) && w > 0 && h > 0;
+
         PalmSizeText.Text = _result.PalmAreaPx2 > 0
             ? $"宽 a2 = {Precision.Fmt(w)} px × 高 a1 = {Precision.Fmt(h)} px\n"
-              + $"描摹凹面积 a3 = {Precision.Fmt(_traceAreaPx2, 0)} px²\n"
-              + $"取面积（{SourceNames.OfFormula(f)}）= {Precision.Fmt(_result.PalmAreaPx2, 0)} px²"
-            : "面积：—（描一圈或在右侧填入宽/高）";
+              + $"描摹凹面积 a3 = {Precision.Fmt(_traceAreaPx2, 0)} px²"
+              + (_traceAreaPx2 > 0 ? "" : "（没描摹；不影响，取面积用下面这条）") + "\n"
+              + $"取面积（{SourceNames.OfFormula(f)}{(traceFallback ? " → 无描摹，退回 a1×a2" : "")}）= {Precision.Fmt(_result.PalmAreaPx2, 0)} px²"
+            : "面积：—（在右侧填入手掌宽/高 px 即可，描摹可选）";
 
         SyncEraserPage();
         RefreshInfoBar();
@@ -895,6 +998,7 @@ public partial class MainWindow : Window
     private void OnSample(TouchSample s)
     {
         long nowTicks = Environment.TickCount64;
+        _lastSampleTicks = nowTicks;
         if (nowTicks - _lastSampleLogTicks >= 250)
         {
             _lastSampleLogTicks = nowTicks;
@@ -965,10 +1069,11 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>样本的接触面积（物理像素²）：RawHID 按当前「HID 尺寸取法」换算（逻辑量程→屏幕分辨率等）；WPF 用接触框（DIP × DPI 缩放）。</summary>
+    /// <summary>样本的接触面积（物理像素²）：RawHID = 宽高计数换算后的 px 乘积；WPF = 接触框（DIP × DPI）。
+    /// 面积与宽高换算方式无关（面积因子恒等）。</summary>
     private double? SampleAreaPx2(TouchSample s)
-        => SamplePx.AreaPx2(s, EraserPage?.Engine.HidSizeSource ?? HidSizeSource.LogicalToScreen,
-            _result.ResX, _result.ResY, _result.MmPerPxX, _result.MmPerPxY, _dpiScaleX, _dpiScaleY);
+        => SamplePx.AreaPx2(s, _result.ResX, _result.ResY,
+            EraserPage?.Engine.SizeScale ?? HidSizeScale.Stretch, _dpiScaleX, _dpiScaleY);
 
     /// <summary>
     /// 该样本是否参与标定采样。Stylus 只带压感、不参与面积，始终放行；
@@ -1029,9 +1134,10 @@ public partial class MainWindow : Window
         return n % 2 == 1 ? a[n / 2] : (a[n / 2 - 1] + a[n / 2]) / 2.0;
     }
 
-    private static string Describe(TouchSample s)
+    private string Describe(TouchSample s)
     {
-        string area = s.AreaMm2 is double a ? Precision.Fmt(a, 0) + " mm²" : "无尺寸";
+        double? px2 = SampleAreaPx2(s);
+        string area = px2 is double a ? Precision.Fmt(a, 0) + " px²" : "无尺寸";
         string multi = s.Contacts is { Count: > 1 } cs ? $"（{cs.Count} 指）" : "";
         string p = s.Pressure01 is double v ? $"，压感 {Precision.Fmt(v, 2)}" : "";
         if (s.PressureRaw is int raw)
@@ -1103,7 +1209,7 @@ public partial class MainWindow : Window
             _result.PalmWidthPx, _result.PalmHeightPx, _result.PalmTraceAreaPx2,
             _result.PalmContactAreaPx2 ?? 0, _result.FingerContactAreaPx2 ?? 0,
             _result.PalmPressure, _result.FingerPressure,
-            _result.ResX, _result.ResY, _result.MmPerPxX, _result.MmPerPxY);
+            _result.ResX, _result.ResY);
     }
 
     private void OnSaveRequested()
@@ -1122,6 +1228,8 @@ public partial class MainWindow : Window
             _result.WritingUsesPressure = set.WritingUsesPressure;
             _result.FollowSize = set.FollowSize;
             _result.LockPalmSize = set.LockPalmSize;
+            _result.SmoothJitter = set.SmoothJitter;
+            _result.PalmFloorEnabled = set.PalmFloorEnabled;
             _result.AreaThresholdEnabled = set.AreaThresholdEnabled;
             _result.WritingFollowSize = set.WritingFollowSize;
             _result.EraserShape = set.Shape.ToString();
@@ -1129,6 +1237,8 @@ public partial class MainWindow : Window
             _result.AspectW = set.CustomAspectW;
             _result.AspectH = set.CustomAspectH;
             _result.PalmAreaFormula = set.Formula.ToString();
+            _result.HidSizeScale = set.SizeScale.ToString();
+            _result.HidDeviceKey = EraserPage.Engine.RawHidDeviceKey.Length > 0 ? EraserPage.Engine.RawHidDeviceKey : null;
             _result.K = EraserPage.Engine.ComputeK() is double k && k > 0 ? Precision.Round(k) : null;
             _result.PalmAreaPx2 = EraserPage.Engine.PalmAreaPx2;
 
@@ -1183,9 +1293,19 @@ public partial class MainWindow : Window
             // ④ K 定值 + 当前实时值
             + $"K 定值（手掌像素面积 ÷ 触摸尺寸乘积）= {kText}"
             + $"    当前接触：{(_liveAreaPx2 is double la ? Precision.Fmt(la, 0) + " px²" : "—")}"
-            + $"    当前压感：{(_livePressure is double lp ? Precision.Fmt(lp, 2) : "—")}\n"
-            // ⑤ 原始HID 映射表（设备换算表，只读展示）
-            + HidTableText();
+            + $"    当前压感：{(_livePressure is double lp ? Precision.Fmt(lp, 2) : "—")}";
+
+        // ⑤ 原始HID 映射表：默认不显示，勾上「显示原始HID映射表」才附在末尾
+        if (ShowHidTableCheck?.IsChecked == true)
+            InfoBar.Text += "\n" + HidTableText();
+    }
+
+    /// <summary>「显示原始HID映射表」开关：切换后立即刷新信息栏。</summary>
+    private void OnShowHidTableChanged(object sender, RoutedEventArgs e)
+    {
+        if (ShowHidTableCheck is null || InfoBar is null)
+            return;   // XAML 解析期事件早于字段赋值
+        RefreshInfoBar();
     }
 
     private static string FmtPressureVal(double? p) => p is double v ? Precision.Fmt(v, 2) : "—";

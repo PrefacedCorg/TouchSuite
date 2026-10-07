@@ -15,6 +15,9 @@
                     <CheckBox x:Name="HighPrecisionCheck" Content="高精度模式（后端双精度不取整 + 显示按有效位）"
                               Foreground="#FFE0E0E0" IsChecked="True" Margin="16,0,0,0" VerticalAlignment="Center"
                               Checked="OnHighPrecisionChanged" Unchecked="OnHighPrecisionChanged" />
+                    <CheckBox x:Name="ShowHidTableCheck" Content="显示原始HID映射表"
+                              Foreground="#FFE0E0E0" IsChecked="False" Margin="16,0,0,0" VerticalAlignment="Center"
+                              Checked="OnShowHidTableChanged" Unchecked="OnShowHidTableChanged" />
                 </StackPanel>
                 <TextBlock x:Name="InfoBar" Foreground="#FFE0E0E0" FontFamily="Consolas" FontSize="12"
                            TextWrapping="Wrap" Margin="0,4,0,0" Text="正在读取 EDID ..." />
@@ -168,11 +171,10 @@
                                 <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                             </ComboBox>
                             <StackPanel x:Name="PalmHidMmPanel" Margin="0,4,0,0" Visibility="Collapsed">
-                                <TextBlock Text="HID 尺寸取法：" FontSize="12" Foreground="#FF444444" />
-                                <ComboBox x:Name="PalmHidMmCombo" SelectedIndex="0" Margin="0,2,0,0"
-                                          SelectionChanged="OnPalmHidMmChanged">
-                                    <ComboBoxItem Content="逻辑量程 → 屏幕分辨率（推荐）" />
-                                    <ComboBoxItem Content="物理量程（mm）→ 屏幕换算" />
+                                <TextBlock Text="HID 触摸屏（多块时用哪一块）：" FontSize="12" Foreground="#FF444444" />
+                                <ComboBox x:Name="PalmHidDeviceCombo" SelectedIndex="0" Margin="0,2,0,0"
+                                          SelectionChanged="OnPalmHidDeviceChanged">
+                                    <ComboBoxItem Content="自动（第一块出数的触摸屏）" />
                                 </ComboBox>
                             </StackPanel>
                             <TextBlock x:Name="PalmSourceInfoText" FontFamily="Consolas" FontSize="11"
@@ -209,11 +211,10 @@
                                 <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                             </ComboBox>
                             <StackPanel x:Name="FingerHidMmPanel" Margin="0,4,0,0" Visibility="Collapsed">
-                                <TextBlock Text="HID 尺寸取法：" FontSize="12" Foreground="#FF444444" />
-                                <ComboBox x:Name="FingerHidMmCombo" SelectedIndex="0" Margin="0,2,0,0"
-                                          SelectionChanged="OnFingerHidMmChanged">
-                                    <ComboBoxItem Content="逻辑量程 → 屏幕分辨率（推荐）" />
-                                    <ComboBoxItem Content="物理量程（mm）→ 屏幕换算" />
+                                <TextBlock Text="HID 触摸屏（多块时用哪一块）：" FontSize="12" Foreground="#FF444444" />
+                                <ComboBox x:Name="FingerHidDeviceCombo" SelectedIndex="0" Margin="0,2,0,0"
+                                          SelectionChanged="OnFingerHidDeviceChanged">
+                                    <ComboBoxItem Content="自动（第一块出数的触摸屏）" />
                                 </ComboBox>
                             </StackPanel>
                             <TextBlock x:Name="FingerSourceInfoText" FontFamily="Consolas" FontSize="11"

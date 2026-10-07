@@ -59,12 +59,15 @@ public partial class EraserPreviewPage : UserControl
     {
         Engine.FollowSize = FollowSizeCheck.IsChecked == true;
         Engine.LockPalmSize = LockPalmSizeCheck.IsChecked == true;
+        Engine.SmoothJitter = SmoothJitterCheck.IsChecked == true;
+        Engine.PalmFloorEnabled = PalmFloorCheck.IsChecked == true;
         Engine.PalmPressureEnabled = PalmPressureCheck.IsChecked == true;
         Engine.AreaThresholdEnabled = AreaThresholdCheck.IsChecked == true;
         Engine.WritingUsesPressure = WritingPressureCheck.IsChecked == true;
         Engine.WritingFollowSize = WritingFollowSizeCheck.IsChecked == true;
         Engine.Shape = ShapeCircle.IsChecked == true ? EraserShape.Circle : EraserShape.Rectangle;
         Engine.Aspect = AspectCustom.IsChecked == true ? AspectSource.Custom : AspectSource.Contact;
+        Engine.SetSizeScale(SizeScaleCombo.SelectedIndex == 1 ? HidSizeScale.Isotropic : HidSizeScale.Stretch);
         Engine.Formula = FormulaTrace.IsChecked == true ? AreaFormula.Trace
             : FormulaEllipse.IsChecked == true ? AreaFormula.Ellipse : AreaFormula.Rect;
         Engine.KTrim = KTrimSlider.Value;
@@ -87,7 +90,7 @@ public partial class EraserPreviewPage : UserControl
         double palmWidthPx, double palmHeightPx, double palmTraceAreaPx2,
         double palmContactAreaPx2, double fingerContactAreaPx2,
         double? palmPressure, double? fingerPressure,
-        int resX, int resY, double mmPerPxX, double mmPerPxY)
+        int resX, int resY)
     {
         Engine.PxPerDiuX = pxPerDiuX > 0 ? pxPerDiuX : 1;
         Engine.PxPerDiuY = pxPerDiuY > 0 ? pxPerDiuY : 1;
@@ -98,22 +101,20 @@ public partial class EraserPreviewPage : UserControl
         Engine.FingerContactAreaPx2 = fingerContactAreaPx2;
         _resX = resX;
         _resY = resY;
-        _mmPerPxX = mmPerPxX;
-        _mmPerPxY = mmPerPxY;
 
-        // ① 擦/写切换阈值：绝对区间 [手指按压面积, 手掌按压面积]，默认中值
+        // ① 擦/写切换阈值：绝对区间 [0, 手掌按压面积]，默认中值 (手掌+手指)/2
+        //    下限放到 0：允许把阈值压到手指按压面积以下（那样指按大小的接触也算手掌擦，面积仍按标定手掌算）
         if (Engine.HasThresholdRange)
         {
-            double lo = Math.Min(palmContactAreaPx2, fingerContactAreaPx2);
             double hi = Math.Max(palmContactAreaPx2, fingerContactAreaPx2);
             _suppressSlider = true;   // 改 Minimum/Maximum 会把当前值钳进新范围并触发事件，这里要静默
-            AreaThresholdSlider.Minimum = lo;
+            AreaThresholdSlider.Minimum = 0;
             AreaThresholdSlider.Maximum = hi;
             _suppressSlider = false;
             AreaThresholdSlider.IsEnabled = true;
             _defAreaThr = Engine.AutoThresholdAreaPx2;
             SetSliderSuppress(AreaThresholdSlider,
-                !_areaTouched ? _defAreaThr : Math.Clamp(AreaThresholdSlider.Value, lo, hi));
+                !_areaTouched ? _defAreaThr : Math.Clamp(AreaThresholdSlider.Value, 0, hi));
             Engine.AreaThresholdPx2 = AreaThresholdSlider.Value;
         }
         else
@@ -140,7 +141,6 @@ public partial class EraserPreviewPage : UserControl
     }
 
     private int _resX, _resY;
-    private double _mmPerPxX, _mmPerPxY;
 
     // 各滑块的"自动默认值"与"用户是否动过"标记（动过后 Setup 不再覆盖，只做范围夹取）
     private double _defAreaThr, _defPalmThr = EraserEngine.SimulatedPressure01, _defWritingThr = EraserEngine.SimulatedPressure01;
@@ -159,6 +159,8 @@ public partial class EraserPreviewPage : UserControl
     {
         if (r.FollowSize is bool fs) FollowSizeCheck.IsChecked = fs;
         if (r.LockPalmSize is bool lp) LockPalmSizeCheck.IsChecked = lp;
+        if (r.SmoothJitter is bool sj) SmoothJitterCheck.IsChecked = sj;
+        if (r.PalmFloorEnabled is bool pf) PalmFloorCheck.IsChecked = pf;
         if (r.AreaThresholdEnabled is bool at) AreaThresholdCheck.IsChecked = at;
         if (r.WritingFollowSize is bool wf) WritingFollowSizeCheck.IsChecked = wf;
         if (r.PalmPressureEnabled is bool pp) PalmPressureCheck.IsChecked = pp;
@@ -170,13 +172,8 @@ public partial class EraserPreviewPage : UserControl
         if (r.WritingNormMax is double wm) WritingMaxSlider.Value = Math.Clamp(wm, 1, 3);
         if (r.ThresholdAreaPx2 is double ta && AreaThresholdSlider.IsEnabled)
             AreaThresholdSlider.Value = Math.Clamp(ta, AreaThresholdSlider.Minimum, AreaThresholdSlider.Maximum);
-        if (r.AspectSource is not null)
-        {
-            AspectCustom.IsChecked = r.AspectSource == "Custom";
-            AspectContact.IsChecked = r.AspectSource != "Custom";
-        }
-        if (r.AspectW is double aw && aw > 0) AspectWInput.Text = aw.ToString("0.###");
-        if (r.AspectH is double ah && ah > 0) AspectHInput.Text = ah.ToString("0.###");
+
+        // 先定形状（会按形状给"自定义长宽比"默认值），再灌入保存的自定义长宽比，避免被默认值覆盖
         if (r.EraserShape is not null)
         {
             bool circle = string.Equals(r.EraserShape, "Circle", StringComparison.OrdinalIgnoreCase);
@@ -190,6 +187,22 @@ public partial class EraserPreviewPage : UserControl
                 "Trace" => AreaFormula.Trace,
                 _ => AreaFormula.Rect,
             });
+        if (r.AspectSource is not null)
+        {
+            AspectCustom.IsChecked = r.AspectSource == "Custom";
+            AspectContact.IsChecked = r.AspectSource != "Custom";
+        }
+        if (r.AspectW is double aw && aw > 0) AspectWInput.Text = aw.ToString("0.###");
+        if (r.AspectH is double ah && ah > 0) AspectHInput.Text = ah.ToString("0.###");
+        ParseAspect();
+        if (r.HidSizeScale is not null)
+        {
+            bool iso = string.Equals(r.HidSizeScale, "Isotropic", StringComparison.OrdinalIgnoreCase);
+            _suppressSizeUi = true;
+            SizeScaleCombo.SelectedIndex = iso ? 1 : 0;
+            _suppressSizeUi = false;
+            Engine.SetSizeScale(iso ? HidSizeScale.Isotropic : HidSizeScale.Stretch);
+        }
 
         SyncEnableStates();
         UpdateValueTexts();
@@ -204,12 +217,13 @@ public partial class EraserPreviewPage : UserControl
             double.TryParse(AspectWInput.Text.Trim(), out double aw);
             double.TryParse(AspectHInput.Text.Trim(), out double ah);
             return new EraserSettings(
-                Engine.FollowSize, Engine.LockPalmSize, Engine.PalmPressureEnabled, Engine.AreaThresholdEnabled,
+                Engine.FollowSize, Engine.LockPalmSize, Engine.SmoothJitter, Engine.PalmFloorEnabled,
+                Engine.PalmPressureEnabled, Engine.AreaThresholdEnabled,
                 Engine.WritingUsesPressure, Engine.WritingFollowSize,
                 Engine.KTrim, Engine.AreaThresholdPx2,
                 Engine.PalmPressureThreshold, Engine.PalmNormMax,
                 Engine.WritingPressureThreshold, Engine.WritingNormMax,
-                Engine.Shape, Engine.Aspect, aw, ah, Engine.Formula);
+                Engine.Shape, Engine.Aspect, aw, ah, Engine.Formula, Engine.SizeScale);
         }
     }
 
@@ -221,15 +235,14 @@ public partial class EraserPreviewPage : UserControl
     private bool _suppressSourceUi;
 
     /// <summary>按引擎当前来源状态刷新预览页下拉（宿主同步用；不会反向触发 <see cref="SourceSelectionChanged"/>）。</summary>
-    public void SyncSourceSelection(SourceMode mode, HidSizeSource hidSize)
+    public void SyncSourceSelection(SourceMode mode)
     {
         if (SourceModeCombo is null)
             return;
         _suppressSourceUi = true;
         SourceModeCombo.SelectedIndex = (int)mode;
-        HidSizeCombo.SelectedIndex = (int)hidSize;
-        HidSizePanel.Visibility = mode == SourceMode.RawHid ? Visibility.Visible : Visibility.Collapsed;
         _suppressSourceUi = false;
+        UpdateHidDeviceVisibility();
     }
 
     private void OnSourceModeChanged(object sender, SelectionChangedEventArgs e)
@@ -237,17 +250,74 @@ public partial class EraserPreviewPage : UserControl
         if (_suppressSourceUi || SourceModeCombo is null)
             return;
         Engine.SetMode((SourceMode)Math.Clamp(SourceModeCombo.SelectedIndex, 0, 2));
-        if (HidSizePanel is not null)
-            HidSizePanel.Visibility = Engine.Mode == SourceMode.RawHid ? Visibility.Visible : Visibility.Collapsed;
+        UpdateHidDeviceVisibility();
         SourceSelectionChanged?.Invoke();
     }
 
-    private void OnHidSizeChanged(object sender, SelectionChangedEventArgs e)
+    // ---- HID 触摸屏（多块时的选择）----
+
+    private readonly List<(string Key, string Label)> _hidDevices = new();
+    private bool _suppressDeviceUi;
+
+    /// <summary>宿主把扫到的触摸类 HID 设备喂进来（第 1 项固定是"自动"）。</summary>
+    public void SetHidDevices(IReadOnlyList<(string Key, string Label)> devices)
     {
-        if (_suppressSourceUi || HidSizeCombo is null)
+        _hidDevices.Clear();
+        _hidDevices.AddRange(devices);
+
+        _suppressDeviceUi = true;
+        HidDeviceCombo.Items.Clear();
+        HidDeviceCombo.Items.Add("自动（第一块出数的触摸屏）");
+        foreach ((string _, string label) in _hidDevices)
+            HidDeviceCombo.Items.Add(label);
+        // 保留当前选择（重扫设备时别把用户手动选的屏清掉）
+        int idx = 0;
+        for (int i = 0; i < _hidDevices.Count; i++)
+            if (string.Equals(_hidDevices[i].Key, Engine.RawHidDeviceKey, StringComparison.OrdinalIgnoreCase))
+            {
+                idx = i + 1;
+                break;
+            }
+        HidDeviceCombo.SelectedIndex = idx;
+        _suppressDeviceUi = false;
+
+        UpdateHidDeviceVisibility();
+    }
+
+    /// <summary>按引擎当前指定的设备刷新下拉（宿主同步用）。</summary>
+    public void SyncHidDevice(string key)
+    {
+        if (HidDeviceCombo is null)
             return;
-        Engine.SetHidSizeSource((HidSizeSource)Math.Clamp(HidSizeCombo.SelectedIndex, 0, 1));
+        _suppressDeviceUi = true;
+        int idx = 0;
+        for (int i = 0; i < _hidDevices.Count; i++)
+            if (string.Equals(_hidDevices[i].Key, key, StringComparison.OrdinalIgnoreCase))
+            {
+                idx = i + 1;
+                break;
+            }
+        HidDeviceCombo.SelectedIndex = idx;
+        _suppressDeviceUi = false;
+    }
+
+    private void OnHidDeviceChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressDeviceUi || HidDeviceCombo is null)
+            return;
+        int i = HidDeviceCombo.SelectedIndex;
+        string key = i >= 1 && i - 1 < _hidDevices.Count ? _hidDevices[i - 1].Key : "";
+        Engine.SetRawHidDevice(key);
         SourceSelectionChanged?.Invoke();
+    }
+
+    /// <summary>HID 触摸屏下拉：只在与 HID 相关（自适应可能锁到 HID / 手动原始HID）且确实扫到设备时才显示。</summary>
+    private void UpdateHidDeviceVisibility()
+    {
+        if (HidDevicePanel is null)
+            return;
+        HidDevicePanel.Visibility = _hidDevices.Count > 0 && Engine.Mode != SourceMode.SoftwareWpf
+            ? Visibility.Visible : Visibility.Collapsed;
     }
 
     // ================= 触摸样本 → 引擎 =================
@@ -255,10 +325,42 @@ public partial class EraserPreviewPage : UserControl
     /// <summary>最近一次喂入的样本（抬手后仍显示最后看到的值）。</summary>
     private TouchSample? _lastSample;
 
+    /// <summary>
+    /// 只为「触摸信息」面板留档：**只记录当前生效来源的样本**。
+    /// 锁到 HID 后 WPF 的帧不再进面板（否则两路的数值在面板里互相顶替 → 文字一直闪）。
+    /// 另：指定了 HID 触摸屏时，也只留那一台的样本。
+    /// </summary>
+    private void NoteSampleForInfo(TouchSample s)
+    {
+        // 生效来源：手动模式 = 指定那路；自适应 = 已锁定那路，未锁定才按引擎实际生效
+        ContactSource eff = Engine.Mode switch
+        {
+            SourceMode.RawHid => ContactSource.RawHid,
+            SourceMode.SoftwareWpf => ContactSource.Wpf,
+            _ => Engine.LockedSource != ContactSource.None ? Engine.LockedSource : Engine.ActiveSource,
+        };
+
+        if (eff != ContactSource.None)
+        {
+            bool ok = eff == ContactSource.RawHid
+                ? s.Source == "RawHID"
+                : s.Source is "WPF" or "STYLUS";   // STYLUS 只带压感，跟 WPF 一路
+            if (!ok)
+                return;
+        }
+
+        // 指定了 HID 触摸屏：别的设备的帧不进面板
+        if (s.Source == "RawHID" && Engine.RawHidDeviceKey.Length > 0
+            && !string.Equals(s.DeviceKey, Engine.RawHidDeviceKey, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        _lastSample = s;
+    }
+
     /// <summary>把一次触摸样本换算成物理像素矩形后交给引擎（多指=逐根各喂一次，各画各的框）。</summary>
     public void SubmitSample(TouchSample s)
     {
-        _lastSample = s;
+        NoteSampleForInfo(s);
 
         // 实时压感喂给引擎（压感归一用它放大擦除区/书写点）
         Engine.NotePressure(s.Pressure01);
@@ -305,7 +407,7 @@ public partial class EraserPreviewPage : UserControl
     /// Xn/Yn 为数字化器归一化坐标 → 虚拟桌面 DIP → 预览区局部坐标。</summary>
     private void SubmitHidRect(TouchSample s)
     {
-        (double? wPx, double? hPx) = HidScale.ContactPx(s, Engine.HidSizeSource, _resX, _resY, _mmPerPxX, _mmPerPxY);
+        (double? wPx, double? hPx) = HidScale.ContactPx(s, _resX, _resY, Engine.SizeScale);
         if (wPx is not double w || hPx is not double h || !(w > 0) || !(h > 0))
             return;
 
@@ -337,8 +439,9 @@ public partial class EraserPreviewPage : UserControl
         Engine.Submit(ContactSource.RawHid, 0,
             new Rect(cx - w / 2, cy - h / 2, w, h),
             applyThreshold: false,
-            detail: $"HID（{SourceNames.OfHidSize(Engine.HidSizeSource)}） {Precision.Fmt(w)}×{Precision.Fmt(h)} px "
-                  + $"= {Precision.Fmt(w * h, 0)} px²");
+            detail: $"HID 计数 {s.WidthLogical}/{s.WidthLogMax}、{s.HeightLogical}/{s.HeightLogMax}"
+                  + $" ÷ 量程 × 分辨率({_resX}×{_resY}) = {Precision.Fmt(w)}×{Precision.Fmt(h)} px = {Precision.Fmt(w * h, 0)} px²",
+            deviceKey: s.DeviceKey);
     }
 
     // ================= 参数控件 =================
@@ -507,7 +610,21 @@ public partial class EraserPreviewPage : UserControl
         if (Engine.Formula != AreaFormula.Trace)
             SetFormulaRadio(Engine.Shape == EraserShape.Rectangle ? AreaFormula.Rect : AreaFormula.Ellipse);
 
+        // 自定义长宽比也按形状给默认：矩形 9:14、椭圆 1:1
+        SetAspectDefault(Engine.Shape);
+
         Engine.NotifyChanged();
+    }
+
+    /// <summary>按形状给「自定义长宽比」默认值：矩形 9:14、椭圆 1:1（改文本框会触发 OnAspectTextChanged → 落到引擎）。</summary>
+    private void SetAspectDefault(EraserShape shape)
+    {
+        if (AspectWInput is null || AspectHInput is null)
+            return;
+        (string w, string h) = shape == EraserShape.Circle ? ("1", "1") : ("9", "14");
+        if (AspectWInput.Text != w) AspectWInput.Text = w;
+        if (AspectHInput.Text != h) AspectHInput.Text = h;
+        ParseAspect();
     }
 
     private void SetFormulaRadio(AreaFormula f)
@@ -554,6 +671,16 @@ public partial class EraserPreviewPage : UserControl
             Engine.CustomAspect = w / h;
     }
 
+    private bool _suppressSizeUi;
+
+    /// <summary>宽高换算下拉：归一（按屏幕拉伸）/ 不归一（1:1）。只影响擦除区形状，面积不变。</summary>
+    private void OnSizeScaleChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressSizeUi || SizeScaleCombo is null)
+            return;
+        Engine.SetSizeScale(SizeScaleCombo.SelectedIndex == 1 ? HidSizeScale.Isotropic : HidSizeScale.Stretch);
+    }
+
     private void OnFollowSizeChanged(object sender, RoutedEventArgs e)
     {
         if (FollowSizeCheck is null)
@@ -567,6 +694,22 @@ public partial class EraserPreviewPage : UserControl
         if (LockPalmSizeCheck is null)
             return;
         Engine.LockPalmSize = LockPalmSizeCheck.IsChecked == true;
+        Engine.NotifyChanged();
+    }
+
+    private void OnSmoothJitterChanged(object sender, RoutedEventArgs e)
+    {
+        if (SmoothJitterCheck is null)
+            return;
+        Engine.SmoothJitter = SmoothJitterCheck.IsChecked == true;
+        Engine.NotifyChanged();
+    }
+
+    private void OnPalmFloorChanged(object sender, RoutedEventArgs e)
+    {
+        if (PalmFloorCheck is null)
+            return;
+        Engine.PalmFloorEnabled = PalmFloorCheck.IsChecked == true;
         Engine.NotifyChanged();
     }
 
@@ -594,7 +737,8 @@ public partial class EraserPreviewPage : UserControl
 
     // ================= 触摸信息面板 =================
 
-    /// <summary>把当前样本的原始值整成一段文字：来源 / 状态 / 坐标 / 尺寸（px）/ 手指数 / 压感 / 分指明细。</summary>
+    /// <summary>把当前样本的原始值整成一段文字（**内容稳定**：不含帧号/时刻，数值取整；
+    /// 与原文字相同则不重写，避免每帧刷屏闪动）。</summary>
     private string BuildTouchInfo()
     {
         var sb = new System.Text.StringBuilder();
@@ -606,11 +750,8 @@ public partial class EraserPreviewPage : UserControl
             return sb.ToString();
         }
 
-        sb.Append("来源: ").Append(s.Source).Append("   帧=").Append(s.FrameId)
-          .Append("   t=").Append(s.TimeMs > 0 ? s.TimeMs + "ms" : "—").Append('\n');
-
-        bool live = Engine.HasLiveContact;
-        sb.Append("触摸状态: ").Append(live ? "按下（有活动接触）" : "抬起 / 无接触").Append('\n');
+        sb.Append("来源: ").Append(s.Source).Append("    触摸状态: ")
+          .Append(Engine.HasLiveContact ? "按下" : "抬起 / 无接触").Append('\n');
 
         int n = s.Contacts?.Count ?? (s.DiuRect is not null || s.WidthMm is not null ? 1 : 0);
         sb.Append($"当前手指数: {n}").Append('\n');
@@ -618,21 +759,24 @@ public partial class EraserPreviewPage : UserControl
         sb.Append("坐标: ").Append(FmtPos(s)).Append('\n');
 
         if (s.Pressure01 is double p01)
-            sb.Append($"压感: {Precision.Fmt(p01, 4)}（0~1，来自 {s.Source}）\n");
+            sb.Append($"压感: {p01:0.000}（0~1，来自 {s.Source}）\n");
         else
             sb.Append("压感: 无\n");
 
-        double? areaPx2 = SamplePx.AreaPx2(s, Engine.HidSizeSource, _resX, _resY,
-            _mmPerPxX, _mmPerPxY, Engine.PxPerDiuX, Engine.PxPerDiuY);
-        (double W, double H)? size = SamplePx.SizePx(s, Engine.HidSizeSource, _resX, _resY,
-            _mmPerPxX, _mmPerPxY, Engine.PxPerDiuX, Engine.PxPerDiuY);
+        double? areaPx2 = SamplePx.AreaPx2(s, _resX, _resY, Engine.SizeScale, Engine.PxPerDiuX, Engine.PxPerDiuY);
+        (double W, double H)? size = SamplePx.SizePx(s, _resX, _resY, Engine.SizeScale, Engine.PxPerDiuX, Engine.PxPerDiuY);
         if (size is not null)
-            sb.Append($"尺寸（px）= {Precision.Fmt(size.Value.W)}×{Precision.Fmt(size.Value.H)}"
-                    + $" → 面积 {Precision.Fmt(areaPx2 ?? 0, 0)} px²\n");
+            sb.Append($"尺寸（px）= {size.Value.W:0.#}×{size.Value.H:0.#}"
+                    + $" → 面积 {(areaPx2 ?? 0):0} px²\n");
 
         if (s.Source == "RawHID")
-            sb.Append($"HID 原始: W={s.WidthLogical}/{s.WidthLogMax}  H={s.HeightLogical}/{s.HeightLogMax}"
-                    + $"（物理 {Precision.Fmt(s.WidthMm)}×{Precision.Fmt(s.HeightMm)} mm）\n");
+        {
+            (double fw, double fh) = HidScale.Factors(s.WidthLogMax, s.HeightLogMax, _resX, _resY, Engine.SizeScale);
+            sb.Append($"HID 计数: W={s.WidthLogical}/{s.WidthLogMax}  H={s.HeightLogical}/{s.HeightLogMax}\n");
+            sb.Append($"换算（{SourceNames.OfSizeScale(Engine.SizeScale)}）:"
+                    + $" 每计数 {fw:0.######}/{fh:0.######} px"
+                    + $" → {s.WidthLogical * fw:0.#}×{s.HeightLogical * fh:0.#} px\n");
+        }
 
         if (s.Contacts is { Count: > 0 } cs)
         {
@@ -641,10 +785,10 @@ public partial class EraserPreviewPage : UserControl
             {
                 sb.Append("  #").Append(c.Id).Append("  ");
                 if (c.DiuRect is Rect r)
-                    sb.Append($"框 {Precision.Fmt(r.X)}，{Precision.Fmt(r.Y)} {Precision.Fmt(r.Width)}×{Precision.Fmt(r.Height)} DIP"
-                            + $" = {Precision.Fmt(r.Width * Engine.PxPerDiuX)}×{Precision.Fmt(r.Height * Engine.PxPerDiuY)} px");
+                    sb.Append($"框 {r.X:0.#},{r.Y:0.#} {r.Width:0.#}×{r.Height:0.#} DIP"
+                            + $" = {r.Width * Engine.PxPerDiuX:0.#}×{r.Height * Engine.PxPerDiuY:0.#} px");
                 if (c.P01 is double cp)
-                    sb.Append($"  P {Precision.Fmt(cp, 4)}");
+                    sb.Append($"  P {cp:0.000}");
                 sb.Append('\n');
             }
         }
@@ -656,13 +800,20 @@ public partial class EraserPreviewPage : UserControl
     private static string FmtPos(TouchSample s)
     {
         if (s.XNorm is double xn && s.YNorm is double yn)
-            return $"归一化 {Precision.Fmt(xn, 4)}，{Precision.Fmt(yn, 4)}";
+            return $"归一化 {xn:0.####}，{yn:0.####}";
         if (s.ScreenPxX is double sx && s.ScreenPxY is double sy)
-            return $"屏幕 {Precision.Fmt(sx, 1)}，{Precision.Fmt(sy, 1)} px";
+            return $"屏幕 {sx:0.#}，{sy:0.#} px";
         return "—（该来源不带坐标）";
     }
 
     // ================= 重画 =================
+
+    /// <summary>内容没变就不重写（TextBlock 赋值会触发布局/重绘，每帧重写会让文字闪动）。</summary>
+    private static void SetText(System.Windows.Controls.TextBlock tb, string text)
+    {
+        if (tb is not null && tb.Text != text)
+            tb.Text = text;
+    }
 
     private void Redraw()
     {
@@ -670,13 +821,13 @@ public partial class EraserPreviewPage : UserControl
             return;
 
         Overlay.Children.Clear();
-        SourceInfoText.Text = Engine.SourceInfo();
-        KText.Text = Engine.KInfo();
-        AreaThresholdText.Text = Engine.AreaThresholdInfo();
-        PressureInfoText.Text = Engine.PressureInfo();
-        JudgeText.Text = Engine.JudgeInfo();
-        EraserInfoText.Text = string.IsNullOrEmpty(Engine.SizeHint) ? Engine.EraserInfo() : Engine.SizeHint;
-        HidInfoText.Text = BuildTouchInfo();
+        SetText(SourceInfoText, Engine.SourceInfo());
+        SetText(KText, Engine.KInfo());
+        SetText(AreaThresholdText, Engine.AreaThresholdInfo());
+        SetText(PressureInfoText, Engine.PressureInfo());
+        SetText(JudgeText, Engine.JudgeInfo());
+        SetText(EraserInfoText, string.IsNullOrEmpty(Engine.SizeHint) ? Engine.EraserInfo() : Engine.SizeHint);
+        SetText(HidInfoText, BuildTouchInfo());
         AreaThresholdValueText.Text = Engine.HasThresholdRange
             ? $"当前 {Precision.Fmt(Engine.AreaThresholdPx2, 0)} px²"
             : "—（待标定）";

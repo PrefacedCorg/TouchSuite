@@ -46,7 +46,8 @@ public sealed class EraserEngine
     /// <summary>手掌像素面积（K 的分子）：a1×a2 / π/4×a1×a2 / a3，末页三选一。</summary>
     public double PalmAreaPx2 => PalmAreaFrom(Formula, PalmWidthPx, PalmHeightPx, PalmTraceAreaPx2);
 
-    /// <summary>三选一的面积公式（末页与主窗口共用同一实现）。</summary>
+    /// <summary>三选一的面积公式（末页与主窗口共用同一实现）。
+    /// 选了 a3（描摹凹面积）但**没描摹**（a3 ≤ 0）时退回 a1×a2 —— 允许不描摹直接用默认宽高。</summary>
     public static double PalmAreaFrom(AreaFormula f, double w, double h, double trace) => f switch
     {
         AreaFormula.Ellipse when w > 0 && h > 0 => Math.PI / 4 * w * h,
@@ -64,8 +65,17 @@ public sealed class EraserEngine
     /// <summary>自适应已锁定的来源（None = 还在识别中）；锁定后不再切换，另一个来源一律忽略。</summary>
     public ContactSource LockedSource => _locked;
 
-    /// <summary>HID 模式下接触尺寸（物理像素）的取法。</summary>
-    public HidSizeSource HidSizeSource { get; private set; } = HidSizeSource.LogicalToScreen;
+    /// <summary>当前实际生效的来源（None = 无）。</summary>
+    public ContactSource ActiveSource => _active;
+
+    /// <summary>
+    /// 指定用哪一台 HID 触摸屏（设备键 = HidReader 的设备名路径，来自下拉）。
+    /// 空 = 自动：用**第一台**持续出有效接触的 HID 设备（多块触摸屏时避免两台的样本互相顶替、尺寸来回跳）。
+    /// </summary>
+    public string RawHidDeviceKey { get; private set; } = "";
+
+    /// <summary>HID 宽/高计数 → 像素的换算方式（只影响擦除区形状；面积因子恒等，与它无关）。</summary>
+    public HidSizeScale SizeScale { get; private set; } = HidSizeScale.Stretch;
 
     public EraserShape Shape { get; set; } = EraserShape.Rectangle;
 
@@ -89,6 +99,13 @@ public sealed class EraserEngine
 
     /// <summary>锁定手掌大小：手掌擦的擦除区「只增不减」——同一次按压内取最大值，抬手后再重来。按指独立。</summary>
     public bool LockPalmSize { get; set; } = false;
+
+    /// <summary>平滑抖动：对压感做指数平滑、对擦除区尺寸加死区，避免轻微抖动导致擦除区一直闪。默认开。</summary>
+    public bool SmoothJitter { get; set; } = true;
+
+    /// <summary>手掌下限：判为手掌擦后擦除区不小于「手掌面积 × K 倍率」（可等于、可放大、不能缩小）。默认开。
+    /// 关掉后「随尺寸」就是纯比例（接触面积 × K），接触小擦除区就小 —— 想看到真正的"按多大擦多大"就关它。</summary>
+    public bool PalmFloorEnabled { get; set; } = true;
 
     /// <summary>启用面积阈值：接触面积低于阈值判为「书写」；关闭则一律按手掌擦处理。</summary>
     public bool AreaThresholdEnabled { get; set; } = true;
@@ -121,15 +138,35 @@ public sealed class EraserEngine
 
     private long _lastPressureTicks;
 
-    /// <summary>喂入一次实时压力；null 表示该样本不带压感（保留上一值，但会随新鲜窗口过期成 0）。</summary>
+    /// <summary>喂入一次实时压力；null 表示该样本不带压感（保留上一值，但会随新鲜窗口过期成 0）。
+    /// 开启「平滑抖动」时对压感做指数平滑（EMA），避免轻微抖动被 g² 放大成擦除区一直闪。</summary>
     public void NotePressure(double? p)
     {
-        if (p is double v)
+        if (p is not double v)
+            return;
+
+        v = Math.Clamp(v, 0, 1);
+        if (SmoothJitter)
         {
-            CurrentPressure = v;
-            _lastPressureTicks = Environment.TickCount64;
+            double s = _smoothPressure is double prev ? prev + PressureSmoothAlpha * (v - prev) : v;
+            if (_smoothPressure is not double || Math.Abs(s - _smoothPressure.Value) >= PressureDeadband)
+                _smoothPressure = s;
+            CurrentPressure = _smoothPressure;
         }
+        else
+        {
+            _smoothPressure = v;
+            CurrentPressure = v;
+        }
+        _lastPressureTicks = Environment.TickCount64;
     }
+
+    private double? _smoothPressure;
+
+    /// <summary>压感指数平滑系数（越小越稳、越滞后）。</summary>
+    public const double PressureSmoothAlpha = 0.20;
+    /// <summary>平滑后的压感变化小于此值就不更新（抑制闪动）。</summary>
+    public const double PressureDeadband = 0.004;
 
     /// <summary>生效压感：只有新鲜窗口内收到过压感才算数，抬手/停报后一律按 0。</summary>
     public double EffectivePressure01 =>
@@ -172,6 +209,7 @@ public sealed class EraserEngine
         public double PeakPxW, PeakPxH;
         public double LockedAreaPx2;     // 锁定模式：本指本次按压内见过的最大擦除区面积
         public bool PalmLatched;         // 锁定模式：本指已判定为手掌擦（保持到抬手，不再退回书写）
+        public double ShownW, ShownH;    // 平滑抖动：上次画出来的擦除区尺寸（px），微动沿用
     }
 
     private readonly Dictionary<int, Track> _tracks = new();
@@ -219,6 +257,7 @@ public sealed class EraserEngine
     private readonly Dictionary<ContactSource, long> _validSince = new();
     private ContactSource _active = ContactSource.None;
     private ContactSource _locked = ContactSource.None;
+    private string _hidDevice = "";   // 自动模式下锁定的 HID 设备键（空 = 还没锁）
     private long _lastContactTicks;
     private bool _driverSizeWarned;
 
@@ -235,25 +274,68 @@ public sealed class EraserEngine
         Log.Info($"接触来源模式 = {mode}");
         _locked = ContactSource.None;
         _active = ContactSource.None;
+        _hidDevice = "";
         _validSince.Clear();
         _tracks.Clear();
         Raise();
     }
 
-    /// <summary>HID 尺寸取法（逻辑量程→屏幕分辨率 / 物理量程→屏幕换算）；切换后重置滤波。</summary>
-    public void SetHidSizeSource(HidSizeSource src)
+    /// <summary>宽/高换算方式（只影响形状）。切换后重置滤波并重画。</summary>
+    public void SetSizeScale(HidSizeScale scale)
     {
-        HidSizeSource = src;
-        Log.Info($"HID 尺寸取法 = {src}");
+        SizeScale = scale;
+        Log.Info($"宽高换算 = {scale}");
         _tracks.Clear();
         Raise();
+    }
+
+    /// <summary>指定 HID 触摸屏（空 = 自动：锁第一台出数的设备）。切换后重置滤波与设备锁定。</summary>
+    public void SetRawHidDevice(string deviceKey)
+    {
+        RawHidDeviceKey = deviceKey ?? "";
+        _hidDevice = "";   // 重新挑设备
+        Log.Info($"HID 触摸屏 = {(RawHidDeviceKey.Length == 0 ? "自动（第一台出数的）" : RawHidDeviceKey)}");
+        _tracks.Clear();
+        Raise();
+    }
+
+    /// <summary>HID 设备闸门：手动指定则只认那一台；自动则锁第一台出数的，其余忽略。
+    /// 宿主与预览页共用同一把闸门，保证「标定采样」和「预览」用同一台触摸屏。</summary>
+    public bool AcceptHidDevice(string deviceKey)
+    {
+        if (RawHidDeviceKey.Length > 0)
+            return string.Equals(deviceKey, RawHidDeviceKey, StringComparison.OrdinalIgnoreCase);
+
+        if (deviceKey.Length == 0)
+            return true;   // 未带设备信息（旧通路）不拦
+
+        if (_hidDevice.Length == 0)
+        {
+            _hidDevice = deviceKey;
+            Log.Info($"HID 自动锁定触摸屏 = {deviceKey}");
+        }
+        return string.Equals(deviceKey, _hidDevice, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>当前生效的 HID 设备键（手动指定的那台，或自动锁定的那台；空 = 未定）。</summary>
+    public string EffectiveHidDevice => RawHidDeviceKey.Length > 0 ? RawHidDeviceKey : _hidDevice;
+
+    /// <summary>设备键的短名（取路径末段，够区分是哪台即可）。</summary>
+    public static string ShortDevice(string key)
+    {
+        if (string.IsNullOrEmpty(key))
+            return "—";
+        string[] parts = key.Split('#');
+        return parts.Length >= 3 ? $"{parts[1]}#{parts[2]}" : (key.Length <= 40 ? key : "…" + key[^40..]);
     }
 
     // ================= 统一入口：两路来源仲裁 =================
 
     /// <summary>提交一根接触的矩形（**物理像素**）。contactId 标识是哪根手指，
-    /// 多根手指各调各的、各画各的框。applyThreshold=false 时不套尺寸阈值（原始 HID 的真值）。</summary>
-    public void Submit(ContactSource src, int contactId, Rect rectPx, bool applyThreshold, string detail)
+    /// 多根手指各调各的、各画各的框。applyThreshold=false 时不套尺寸阈值（原始 HID 的真值）。
+    /// deviceKey = 该样本来自哪台 HID 触摸屏（见 <see cref="RawHidDeviceKey"/>）。</summary>
+    public void Submit(ContactSource src, int contactId, Rect rectPx, bool applyThreshold, string detail,
+        string deviceKey = "")
     {
         long now = Environment.TickCount64;
 
@@ -261,6 +343,10 @@ public sealed class EraserEngine
         // 若把它记成"该来源不可用"，高优先来源会被短暂降级，与低优先来源反复横跳，而每次切换都会
         // 清空中值滤波窗 → 擦除区尺寸抖动。故直接忽略，保留上次有效值直到自然过期。
         if (rectPx.Width <= 0 || rectPx.Height <= 0)
+            return;
+
+        // 多块触摸屏：手动指定就只认那一台；自动模式就锁在第一台出数的设备上（再来的算另一台，忽略）
+        if (src == ContactSource.RawHid && !AcceptHidDevice(deviceKey))
             return;
 
         bool eligible = true;
@@ -489,16 +575,23 @@ public sealed class EraserEngine
     public double LinearFactor() => Math.Sqrt(EffectiveK());
 
     /// <summary>擦除区面积（px²）。随尺寸 = max(接触面积 × 生效 K, 手掌面积 × K 倍率) × 压感倍数²
-    /// ——达到阈值判为手掌擦后「不能比手掌小」：接触 = 标定手掌大小时可以等于，更大时可以放大；
+    /// ——达到阈值判为手掌擦后「不能比手掌小」。
+    /// <para>「不缩小」的下限 = 手掌面积 × K 倍率 = **(标定时手掌按压尺寸乘积 b1×b2) × 生效 K**，
+    /// 也就是"当时校准按手掌时算出来的那个值"，与当前接触多大无关；
+    /// 所以接触刚过阈值（甚至阈值压到手指按压面积以下）时也不会显示成当前接触那一小块。</para>
     /// 否则固定手掌面积 × 倍率 × 压感倍数²。</summary>
     private double EraserAreaRawPx2(Rect c)
     {
         double g = PalmGain;
         double trim = Math.Clamp(KTrim, 0.5, 2.0);
-        double floorArea = PalmAreaPx2 * trim;   // 手掌下限（未填手掌尺寸则为 0，不加限制）
-        double area = FollowSize
-            ? Math.Max(c.Width * c.Height * EffectiveK(), floorArea)
-            : floorArea;
+        // 手掌下限：标定手掌面积（a1×a2 等）× K 倍率；等价于 校准时手掌按压 b1×b2 × 生效 K
+        double floorArea = PalmAreaPx2 * trim;
+        double scaled = c.Width * c.Height * EffectiveK();     // 纯比例：按多大擦多大
+        double area;
+        if (!FollowSize)
+            area = floorArea;                                  // 固定手掌面积
+        else
+            area = PalmFloorEnabled ? Math.Max(scaled, floorArea) : scaled;   // 下限可选
         return area * g * g;
     }
 
@@ -508,13 +601,15 @@ public sealed class EraserEngine
             ? t.LockedAreaPx2
             : EraserAreaRawPx2(c);
 
-    /// <summary>该接触当前的长宽比 W/H：自定义优先；否则跟随触摸尺寸；固定/无尺寸时用手掌比例。</summary>
+    /// <summary>该接触当前的长宽比 W/H：
+    /// 自定义优先；否则**跟随触摸尺寸**（与「随尺寸」开关无关——那个只管面积）；
+    /// 量不到接触尺寸时才退回手掌比例。</summary>
     private double AspectFor(Rect? c)
     {
         double aspect;
         if (Aspect == AspectSource.Custom && CustomAspect > 0)
             aspect = CustomAspect;
-        else if (FollowSize && c is Rect cc && cc.Height > 0)
+        else if (c is Rect cc && cc.Height > 0)
             aspect = cc.Width / cc.Height;
         else if (PalmAspect > 0)
             aspect = PalmAspect;
@@ -523,48 +618,58 @@ public sealed class EraserEngine
         return aspect > 0 && double.IsFinite(aspect) ? aspect : 1;
     }
 
-    /// <summary>某根接触的擦除区尺寸（DIU）：
-    /// 矩形 = W×H 面积即目标面积；椭圆 = π/4×W×H = 目标面积（1:1 时就是正圆）。</summary>
+    /// <summary>某根接触的擦除区尺寸（DIU）：矩形 = W×H 面积即目标面积；椭圆 = π/4×W×H = 目标面积。
+    /// 与 <see cref="SizePx"/> 共用同一套抖动死区（同一帧内两者结果一致）。</summary>
     public (double w, double h) SizeDiu(int id, Rect c)
     {
         if (PxPerDiuX <= 0 || PxPerDiuY <= 0)
             return (0, 0);
 
-        double areaPx2 = EraserAreaPx2(id, c);
-        if (!(areaPx2 > 0))
+        (double wPx, double hPx) = SizePx(id, c);
+        if (!(wPx > 0) || !(hPx > 0))
             return (0, 0);
-
-        double aspect = AspectFor(c);
-        double wPx, hPx;
-        if (Shape == EraserShape.Circle)
-        {
-            hPx = Math.Sqrt(4 * areaPx2 / (Math.PI * aspect));
-            wPx = aspect * hPx;
-        }
-        else
-        {
-            hPx = Math.Sqrt(areaPx2 / aspect);
-            wPx = aspect * hPx;
-        }
 
         double w = wPx / PxPerDiuX;
         double h = hPx / PxPerDiuY;
         return double.IsFinite(w) && double.IsFinite(h) && w > 0 && h > 0 ? (w, h) : (0, 0);
     }
 
-    /// <summary>擦除区尺寸（物理像素，界面文字用）。</summary>
+    /// <summary>擦除区尺寸（物理像素）。开启「平滑抖动」时加尺寸死区：
+    /// 新尺寸和上一次画出来的差不到 <see cref="SizeHysteresisTol"/> 就保持不变，避免一直闪。</summary>
     public (double w, double h) SizePx(int id, Rect c)
     {
         double areaPx2 = EraserAreaPx2(id, c);
         if (!(areaPx2 > 0))
             return (0, 0);
+
         double aspect = AspectFor(c);
         double hPx = Shape == EraserShape.Circle
             ? Math.Sqrt(4 * areaPx2 / (Math.PI * aspect))
             : Math.Sqrt(areaPx2 / aspect);
         double wPx = aspect * hPx;
-        return double.IsFinite(wPx) && double.IsFinite(hPx) && wPx > 0 && hPx > 0 ? (wPx, hPx) : (0, 0);
+        if (!double.IsFinite(wPx) || !double.IsFinite(hPx) || wPx <= 0 || hPx <= 0)
+            return (0, 0);
+
+        if (SmoothJitter && _tracks.TryGetValue(id, out Track? t))
+        {
+            if (t.ShownW > 0 && t.ShownH > 0
+                && Math.Abs(wPx - t.ShownW) <= t.ShownW * SizeHysteresisTol
+                && Math.Abs(hPx - t.ShownH) <= t.ShownH * SizeHysteresisTol)
+            {
+                wPx = t.ShownW;          // 抖动太小 → 沿用上次画出来的尺寸
+                hPx = t.ShownH;
+            }
+            else
+            {
+                t.ShownW = wPx;
+                t.ShownH = hPx;
+            }
+        }
+        return (wPx, hPx);
     }
+
+    /// <summary>擦除区尺寸死区：相对变化小于它就不改（抑制闪动）。</summary>
+    public const double SizeHysteresisTol = 0.015;
 
     /// <summary>界面改了形状/倍率/压感等设置后，通知重画。</summary>
     public void NotifyChanged() => Raise();
@@ -574,12 +679,14 @@ public sealed class EraserEngine
         _tracks.Clear();
         _lastContactTicks = 0;
         CurrentPressure = null;
+        _smoothPressure = null;
         _lastPressureTicks = 0;
         _driverSizeWarned = false;
         _state.Clear();
         _detail.Clear();
         _active = ContactSource.None;
         _locked = ContactSource.None;
+        _hidDevice = "";
         _validSince.Clear();
         SizeHint = "已清除。用真触摸屏按一下手掌即可实时显示擦除区。";
         Raise();
@@ -623,6 +730,7 @@ public sealed class EraserEngine
 
     // ================= 文字（界面直接显示） =================
 
+    /// <summary>来源状态文字（**只用稳定信息**：谁在生效、谁有数据；不含每帧变化的数值，避免刷屏闪动）。</summary>
     public string SourceInfo()
     {
         long now = Environment.TickCount64;
@@ -630,18 +738,21 @@ public sealed class EraserEngine
         string mode = Mode != SourceMode.Auto
             ? $"手动：{SourceNames.OfMode(Mode)}"
             : (_locked != ContactSource.None
-                ? $"自适应：已锁定 {SourceNames.Of(_locked)}（不再切换，另一个来源已忽略）"
+                ? $"自适应：已锁定 {SourceNames.Of(_locked)}（不再切换）"
                 : "自适应：识别中…");
         sb.Append(mode).Append("   |   生效: ").Append(SourceNames.Of(_active));
+        if (EffectiveHidDevice.Length > 0)
+            sb.Append("   |   触摸屏 ").Append(RawHidDeviceKey.Length > 0 ? "（手动指定）" : "（自动锁定）")
+              .Append(' ').Append(ShortDevice(EffectiveHidDevice));
 
         foreach (ContactSource s in PriorityOrder)
         {
-            bool active = s == _active;
+            if (_locked != ContactSource.None && s != _locked)
+                continue;   // 锁定后不再列出另一个来源（不碍眼）
+
             bool fresh = _state.TryGetValue(s, out var st) && now - st.Time <= SourceFreshMs;
-            string val = _detail.TryGetValue(s, out string? d) ? d : "（无）";
-            sb.Append('\n').Append(active ? "▶ " : "   ").Append(SourceNames.Of(s)).Append(": ").Append(val);
-            if (!fresh && _state.ContainsKey(s)) sb.Append("  (旧)");
-            if (_locked != ContactSource.None && s != _locked) sb.Append("  (已忽略)");
+            sb.Append('\n').Append(s == _active ? "▶ " : "   ").Append(SourceNames.Of(s))
+              .Append(fresh ? "：有数据" : "：无数据");
         }
         return sb.ToString();
     }
@@ -678,10 +789,9 @@ public sealed class EraserEngine
     {
         if (!HasThresholdRange)
             return "自动 = (手掌按压面积 + 手指按压面积) ÷ 2\n待第 5、6 步记录手掌与手指按压";
-        double lo = Math.Min(PalmContactAreaPx2, FingerContactAreaPx2);
         double hi = Math.Max(PalmContactAreaPx2, FingerContactAreaPx2);
         return $"自动 = {Precision.Fmt(AutoThresholdAreaPx2, 0)} px²（中值）\n"
-             + $"可调范围 = {Precision.Fmt(lo, 0)}（手指）~ {Precision.Fmt(hi, 0)}（手掌）px²\n"
+             + $"可调范围 = 0 ~ {Precision.Fmt(hi, 0)} px²（手掌按压面积）；可低于手指按压面积\n"
              + $"当前阈值 = {Precision.Fmt(AreaThresholdPx2, 0)} px²";
     }
 
@@ -707,7 +817,7 @@ public sealed class EraserEngine
         if (AreaThresholdPx2 <= 0)
             return "判定：手掌擦（面积阈值未标定）";
 
-        string head = $"阈值 {Precision.Fmt(AreaThresholdPx2, 0)} px² → ";
+        string head = $"阈值 {Precision.FmtFixed(AreaThresholdPx2, 0)} px² → ";
         var parts = new List<string>(list.Count);
         bool anyWriting = false;
         foreach ((int id, Rect c) in list)
@@ -716,14 +826,14 @@ public sealed class EraserEngine
             bool writing = IsWriting(id);
             anyWriting |= writing;
             parts.Add(list.Count > 1
-                ? $"#{id} {Precision.Fmt(area, 0)}px² {(writing ? "书写" : "手掌擦")}"
-                : $"{Precision.Fmt(area, 0)}px² {(writing ? "书写" : "手掌擦")}");
+                ? $"#{id} {Precision.FmtFixed(area, 0)}px² {(writing ? "书写" : "手掌擦")}"
+                : $"{Precision.FmtFixed(area, 0)}px² {(writing ? "书写" : "手掌擦")}");
         }
 
         string press = anyWriting
             ? (WritingUsesPressure
-                ? $"（压感 实测 {Precision.Fmt(WritingPressure01, 3)} → ×{Precision.Fmt(WritingGain, 2)}）"
-                : $"（压感 模拟 {SimulatedPressureRaw:0}/1024 = {Precision.Fmt(SimulatedPressure01, 3)}）")
+                ? $"（压感 实测 {Precision.FmtFixed(WritingPressure01, 3)} → ×{Precision.FmtFixed(WritingGain, 2)}）"
+                : $"（压感 模拟 {SimulatedPressureRaw:0}/1024 = {Precision.FmtFixed(SimulatedPressure01, 3)}）")
             : "";
         return "判定：" + head + string.Join(" ｜ ", parts) + press;
     }
@@ -742,8 +852,8 @@ public sealed class EraserEngine
             contactSum += c.Width * c.Height;
             eraseSum += EraserAreaPx2(id, c);
             per.Add(list.Count > 1
-                ? $"#{id} {Precision.Fmt(c.Width)}×{Precision.Fmt(c.Height)}px → 擦 {Precision.Fmt(w, 0)}×{Precision.Fmt(h, 0)}px"
-                : $"{Precision.Fmt(c.Width)}×{Precision.Fmt(c.Height)}px → 擦 {Precision.Fmt(w, 0)}×{Precision.Fmt(h, 0)}px");
+                ? $"#{id} {Precision.FmtFixed(c.Width, 0)}×{Precision.FmtFixed(c.Height, 0)}px → 擦 {Precision.FmtFixed(w, 0)}×{Precision.FmtFixed(h, 0)}px"
+                : $"{Precision.FmtFixed(c.Width, 0)}×{Precision.FmtFixed(c.Height, 0)}px → 擦 {Precision.FmtFixed(w, 0)}×{Precision.FmtFixed(h, 0)}px");
         }
 
         double k = ComputeK();
@@ -753,17 +863,23 @@ public sealed class EraserEngine
             : "K 未标定（按 1 计：触摸报多少就多大）";
 
         string sizeText = FollowSize
-            ? $"随接触尺寸: Σ {Precision.Fmt(contactSum, 0)} px² × K（{kText}）"
-              + $"\n下限 = 手掌面积 {Precision.Fmt(PalmAreaPx2, 0)} px²：判为手掌擦后不小于它（可等于、可放大，不能缩小）"
+            ? $"随接触尺寸（接触面积 × K）: Σ {Precision.Fmt(contactSum, 0)} px²（{kText}）"
+              + (PalmFloorEnabled
+                  ? $"\n手掌下限 开：不小于手掌面积 {Precision.Fmt(PalmAreaPx2, 0)} px²（可等于、可放大、不能缩小）"
+                  : "\n手掌下限 关：纯比例，接触小擦除区就小")
             : $"固定手掌面积: {Precision.Fmt(PalmAreaPx2, 0)} px² × 倍率 {Precision.Fmt(KTrim, 2)}";
 
         string pressText = PalmPressureEnabled
-            ? $"\n手掌擦压感: p {Precision.Fmt(PalmPressure01, 3)}（阈值 {Precision.Fmt(PalmPressureThreshold, 2)}）→ 倍数 ×{Precision.Fmt(PalmGain, 3)}"
+            ? $"\n手掌擦压感: p {Precision.FmtFixed(PalmPressure01, 3)}（阈值 {Precision.FmtFixed(PalmPressureThreshold, 2)}）→ 倍数 ×{Precision.FmtFixed(PalmGain, 3)}"
             : "\n手掌擦压感: 关闭（模拟 512/1024 = 0.5）";
 
         string shapeText = Shape == EraserShape.Circle ? "各指等面积椭圆（π/4×W×H）" : "各指矩形";
+        string scaleText = SizeScale == HidSizeScale.Isotropic ? "宽高1:1(不归一)" : "宽高归一(按屏幕拉伸)";
+        string smoothText = SmoothJitter ? " + 平滑抖动" : " + 不平滑(跟手但会闪)";
+        string floorText = !FollowSize ? "" : (PalmFloorEnabled ? " + 手掌下限" : " + 无下限(纯比例)");
         return $"模式: {(FollowSize ? "随尺寸" : "固定手掌")}{(LockPalmSize ? " + 锁定大小(只增不减)" : "")}"
-             + $"{(Aspect == AspectSource.Custom ? $" + 长宽比 {Precision.Fmt(CustomAspect, 2)}:1" : " + 长宽比跟随触摸")}\n"
+             + $"{(Aspect == AspectSource.Custom ? $" + 长宽比 {Precision.Fmt(CustomAspect, 2)}:1" : " + 长宽比跟随触摸")}"
+             + $" + {scaleText}{floorText}{smoothText}\n"
              + sizeText + pressText
              + $"\n擦除区: Σ {Precision.Fmt(eraseSum, 0)} px²（{shapeText}，见预览区）";
     }

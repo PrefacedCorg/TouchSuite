@@ -17,15 +17,17 @@ public enum ContactSource { None, Wpf, RawHid }
 /// </summary>
 public enum SourceMode { Auto, RawHid, SoftwareWpf }
 
-/// <summary>
-/// HID 接触尺寸（物理像素）的取法：
-/// <para>LogicalToScreen = 逻辑计数 ÷ 该轴逻辑量程（不是恒定的 0..32767）× 屏幕对应分辨率（推荐）；</para>
-/// <para>PhysicalRange = 设备声明的物理量程 → mm，再按屏幕标定 mm/px 换成物理像素。</para>
-/// </summary>
-public enum HidSizeSource { LogicalToScreen, PhysicalRange }
-
 /// <summary>擦除区形状（两种形状都按"显示面积 = 目标面积"画：椭圆的显示面积 = π/4×W×H）。</summary>
 public enum EraserShape { Rectangle, Circle }
+
+/// <summary>
+/// HID 宽/高计数 → 屏幕像素的换算方式（**只影响擦除区形状，不影响面积**）。
+/// <para>Stretch（归一）= 宽按屏宽拉伸、高按屏高拉伸（宽 0..量程 → 0..ResX，高 → 0..ResY）；
+/// 屏幕不是 16:9 时正圆会被拉成椭圆（倍数 = ResX/ResY）。</para>
+/// <para>Isotropic（不归一）= 两轴用同一因子（1:1），正圆就是正圆。</para>
+/// 两种方式的"面积因子"相同（f·f = f_w·f_h），所以切换只改形状、不改面积，K/阈值无需重标。
+/// </summary>
+public enum HidSizeScale { Stretch, Isotropic }
 
 /// <summary>长宽比来源：跟随触摸尺寸（接触框 w/h）/ 自定义（W:H 输入框；1:1 就是正圆）。</summary>
 public enum AspectSource { Contact, Custom }
@@ -57,10 +59,16 @@ public static class SourceNames
         _ => "自适应（自动锁定）",
     };
 
-    public static string OfHidSize(HidSizeSource m) => m switch
+    public static string OfAspect(AspectSource a) => a switch
     {
-        HidSizeSource.PhysicalRange => "物理量程（mm）→ 屏幕换算",
-        _ => "逻辑量程 → 屏幕分辨率（推荐）",
+        AspectSource.Custom => "自定义",
+        _ => "跟随触摸尺寸",
+    };
+
+    public static string OfSizeScale(HidSizeScale s) => s switch
+    {
+        HidSizeScale.Isotropic => "不归一 —— 1:1（两轴同比例，圆就是圆）",
+        _ => "归一 —— 按屏幕拉伸（宽→屏宽、高→屏高）",
     };
 
     public static string OfFormula(AreaFormula f) => f switch
@@ -72,51 +80,51 @@ public static class SourceNames
 }
 
 /// <summary>
-/// HID 接触尺寸 → 物理像素的换算（<see cref="TouchSample"/> 里的原始计数/量程 + 屏幕标定）。
-/// 两条路互为兜底，都不可用才返回 null。
+/// HID 接触尺寸 → 物理像素（**全程不碰 mm**）。
+/// 宽/高的逻辑量程直接映射到屏幕分辨率：宽 0..WidthLogMax → 0..ResX，高 0..HeightLogMax → 0..ResY。
 /// </summary>
 public static class HidScale
 {
-    /// <summary>
-    /// 接触宽高（物理像素）。
-    /// <para>LogicalToScreen：计数 ÷ 该轴逻辑量程 × 屏幕分辨率（Width→ResX，Height→ResY）；</para>
-    /// <para>PhysicalRange：设备声明物理量程换算出的 mm ÷ 屏幕标定 mm/px。</para>
-    /// </summary>
-    public static (double? W, double? H) ContactPx(TouchSample s, HidSizeSource src,
-        int resX, int resY, double mmPerPxX, double mmPerPxY)
+    /// <summary>两轴的「每计数多少像素」因子。
+    /// <para>Stretch：fw = ResX/宽量程、fh = ResY/高量程（按屏幕拉伸）；</para>
+    /// <para>Isotropic：两轴同因子 f = √(fw·fh)（1:1）。注意 f·f == fw·fh → 面积因子恒等。</para></summary>
+    public static (double fw, double fh) Factors(int wLogMax, int hLogMax, int resX, int resY, HidSizeScale scale)
     {
-        double? w = src == HidSizeSource.LogicalToScreen ? FromLogical(s.WidthLogical, s.WidthLogMax, resX) : null;
-        double? h = src == HidSizeSource.LogicalToScreen ? FromLogical(s.HeightLogical, s.HeightLogMax, resY) : null;
+        if (wLogMax <= 0 || hLogMax <= 0 || resX <= 0 || resY <= 0)
+            return (0, 0);
 
-        if (w is null) w = FromPhysical(s.WidthMm, mmPerPxX);
-        if (h is null) h = FromPhysical(s.HeightMm, mmPerPxY);
-
-        // 物理量程也缺（或屏幕未标定）→ 仍可退回逻辑量程映射，保证流程不卡死
-        if (w is null) w = FromLogical(s.WidthLogical, s.WidthLogMax, resX);
-        if (h is null) h = FromLogical(s.HeightLogical, s.HeightLogMax, resY);
-
-        return (w, h);
+        double fw = resX / (double)wLogMax;
+        double fh = resY / (double)hLogMax;
+        if (scale == HidSizeScale.Isotropic)
+        {
+            double f = Math.Sqrt(fw * fh);   // 各向同性，且 f·f == fw·fh（面积不变）
+            fw = f;
+            fh = f;
+        }
+        return (fw, fh);
     }
 
-    /// <summary>逻辑计数 → 物理像素：计数 ÷ 该轴逻辑量程 × 屏幕分辨率。量程为 0（未声明）返回 null。</summary>
-    private static double? FromLogical(int logical, int logMax, int res)
-        => logMax > 0 && res > 0 ? logical / (double)logMax * res : null;
-
-    /// <summary>物理量程 mm → 物理像素：mm ÷ 屏幕标定 mm/px。</summary>
-    private static double? FromPhysical(double? mm, double mmPerPx)
-        => mm is double v && mmPerPx > 0 ? v / mmPerPx : null;
+    /// <summary>接触宽高（物理像素）。stretch 见 <see cref="HidSizeScale"/>。</summary>
+    public static (double? W, double? H) ContactPx(TouchSample s, int resX, int resY, HidSizeScale scale)
+    {
+        (double fw, double fh) = Factors(s.WidthLogMax, s.HeightLogMax, resX, resY, scale);
+        if (fw <= 0 || fh <= 0)
+            return (null, null);
+        return (s.WidthLogical * fw, s.HeightLogical * fh);
+    }
 }
 
 /// <summary>把一次触摸样本换算成物理像素（RawHID 走 <see cref="HidScale"/>，WPF 走 DIP × DPI 缩放）。</summary>
 public static class SamplePx
 {
-    /// <summary>样本的接触面积（px²）：RawHID = 尺寸乘积；WPF = 分指接触框面积之和（手掌多接触不被拆散低估）。</summary>
-    public static double? AreaPx2(TouchSample s, HidSizeSource src, int resX, int resY,
-        double mmPerPxX, double mmPerPxY, double pxPerDiuX, double pxPerDiuY)
+    /// <summary>样本的接触面积（px²）：RawHID = 宽×高（px）；WPF = 分指接触框面积之和。
+    /// 面积与 <see cref="HidSizeScale"/> 无关（面积因子恒等），只是为了统一签名传进来。</summary>
+    public static double? AreaPx2(TouchSample s, int resX, int resY, HidSizeScale scale,
+        double pxPerDiuX, double pxPerDiuY)
     {
         if (s.Source == "RawHID")
         {
-            (double? w, double? h) = HidScale.ContactPx(s, src, resX, resY, mmPerPxX, mmPerPxY);
+            (double? w, double? h) = HidScale.ContactPx(s, resX, resY, scale);
             return w is double wv && h is double hv ? wv * hv : null;
         }
 
@@ -139,12 +147,12 @@ public static class SamplePx
     }
 
     /// <summary>样本最大那根接触的宽高（px）；量不到返回 null。</summary>
-    public static (double W, double H)? SizePx(TouchSample s, HidSizeSource src, int resX, int resY,
-        double mmPerPxX, double mmPerPxY, double pxPerDiuX, double pxPerDiuY)
+    public static (double W, double H)? SizePx(TouchSample s, int resX, int resY, HidSizeScale scale,
+        double pxPerDiuX, double pxPerDiuY)
     {
         if (s.Source == "RawHID")
         {
-            (double? w, double? h) = HidScale.ContactPx(s, src, resX, resY, mmPerPxX, mmPerPxY);
+            (double? w, double? h) = HidScale.ContactPx(s, resX, resY, scale);
             return w is double wv && h is double hv ? (wv, hv) : null;
         }
 
@@ -169,21 +177,23 @@ public static class SamplePx
 
 /// <summary>预览页当前设置的快照（保存进 calibration.json；载入时原样灌回）。</summary>
 public sealed record EraserSettings(
-    bool FollowSize, bool LockPalmSize, bool PalmPressureEnabled, bool AreaThresholdEnabled,
+    bool FollowSize, bool LockPalmSize, bool SmoothJitter, bool PalmFloorEnabled,
+    bool PalmPressureEnabled, bool AreaThresholdEnabled,
     bool WritingUsesPressure, bool WritingFollowSize,
     double KTrim, double AreaThresholdPx2,
     double PalmPressureThreshold, double PalmNormMax,
     double WritingPressureThreshold, double WritingNormMax,
     EraserShape Shape, AspectSource Aspect, double CustomAspectW, double CustomAspectH,
-    AreaFormula Formula)
+    AreaFormula Formula, HidSizeScale SizeScale)
 {
     /// <summary>设置齐全的默认值（引擎未标定/未载入时用）。</summary>
     public static EraserSettings Default { get; } = new(
-        FollowSize: true, LockPalmSize: false, PalmPressureEnabled: true, AreaThresholdEnabled: true,
+        FollowSize: true, LockPalmSize: false, SmoothJitter: true, PalmFloorEnabled: true,
+        PalmPressureEnabled: true, AreaThresholdEnabled: true,
         WritingUsesPressure: true, WritingFollowSize: false,
         KTrim: 1.0, AreaThresholdPx2: 0,
         PalmPressureThreshold: 0.5, PalmNormMax: 2,
         WritingPressureThreshold: 0.5, WritingNormMax: 2,
         Shape: EraserShape.Rectangle, Aspect: AspectSource.Contact, CustomAspectW: 1, CustomAspectH: 1,
-        Formula: AreaFormula.Rect);
+        Formula: AreaFormula.Rect, SizeScale: HidSizeScale.Stretch);
 }

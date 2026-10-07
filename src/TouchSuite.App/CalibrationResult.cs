@@ -52,12 +52,17 @@ public sealed class CalibrationResult
     public bool? WritingUsesPressure { get; set; }        // 书写压感开关（关 → 模拟 512/1024）
     public bool? FollowSize { get; set; }                 // 手掌擦随触摸尺寸（按多大擦多大）
     public bool? LockPalmSize { get; set; }               // 禁止手掌擦缩小（擦时只增不减）
+    public bool? SmoothJitter { get; set; }               // 平滑抖动（压感/尺寸微动不改擦除区）
+    public bool? PalmFloorEnabled { get; set; }            // 手掌下限（判为手掌擦后不小于手掌面积）
     public bool? AreaThresholdEnabled { get; set; }       // 启用面积阈值判 擦/写
     public bool? WritingFollowSize { get; set; }          // 书写也随触摸尺寸
     public string? EraserShape { get; set; }              // Rectangle / Circle（椭圆）
+    public string? HidSizeScale { get; set; }             // Stretch（归一，按屏幕拉伸）/ Isotropic（不归一，1:1）
     public string? AspectSource { get; set; }             // Contact / Custom
     public double? AspectW { get; set; }                  // 自定义长宽比 W
     public double? AspectH { get; set; }                  // 自定义长宽比 H
+    /// <summary>指定的 HID 触摸屏设备键（多块触摸屏时用哪一块）；空 = 自动（第一台出数的）。</summary>
+    public string? HidDeviceKey { get; set; }
 
     /// <summary>默认保存到 exe 同级的 calibration.json；不可写则退回 %LOCALAPPDATA%。</summary>
     public static string DefaultPath()

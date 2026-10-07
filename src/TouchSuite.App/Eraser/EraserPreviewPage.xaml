@@ -33,12 +33,11 @@
                         <ComboBoxItem Content="原始HID（设备上报尺寸）" />
                         <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                     </ComboBox>
-                    <StackPanel x:Name="HidSizePanel" Margin="0,4,0,0" Visibility="Collapsed">
-                        <TextBlock Text="HID 尺寸取法：" Foreground="#FF444444" />
-                        <ComboBox x:Name="HidSizeCombo" SelectedIndex="0" Margin="0,2,0,0"
-                                  SelectionChanged="OnHidSizeChanged">
-                            <ComboBoxItem Content="逻辑量程 → 屏幕分辨率（推荐）" />
-                            <ComboBoxItem Content="物理量程（mm）→ 屏幕换算" />
+                    <StackPanel x:Name="HidDevicePanel" Margin="0,4,0,0" Visibility="Collapsed">
+                        <TextBlock Text="HID 触摸屏（多块时用哪一块）：" Foreground="#FF444444" />
+                        <ComboBox x:Name="HidDeviceCombo" SelectedIndex="0" Margin="0,2,0,0"
+                                  SelectionChanged="OnHidDeviceChanged">
+                            <ComboBoxItem Content="自动（第一块出数的触摸屏）" />
                         </ComboBox>
                     </StackPanel>
                     <TextBlock x:Name="SourceInfoText" Text="当前来源: 无" Margin="0,6,0,0" FontFamily="Consolas"
@@ -51,14 +50,14 @@
                     <TextBlock x:Name="SavePathText" Margin="0,8,0,0" FontSize="11"
                                Foreground="#FF888888" TextWrapping="Wrap" />
 
-                    <!-- 底部：触摸原始信息回显 -->
-                    <Expander Header="触摸信息（原始值）" Margin="0,14,0,0" IsExpanded="True"
+                    <!-- 底部：触摸原始信息回显（内容稳定：不带帧号/时刻，数值固定小数位） -->
+                    <Expander Header="触摸信息（样本 / 换算明细）" Margin="0,14,0,0" IsExpanded="True"
                               Foreground="#FF1E1E1E">
                         <Border Background="#FFEDEDED" BorderBrush="#FFCCCCCC" BorderThickness="1"
                                 Padding="8" Margin="0,6,0,0">
                             <TextBlock x:Name="HidInfoText" FontFamily="Consolas" FontSize="11"
                                        Foreground="#FF0A5A9A" TextWrapping="Wrap"
-                                       Text="在预览区按一下：列出当前触摸样本的来源 / 状态 / 坐标 / 尺寸 / 手指数 / 压感 / 分指明细。" />
+                                       Text="在预览区按一下：列出当前触摸样本的来源 / 状态 / 坐标 / 尺寸 / 手指数 / 压感 / 换算明细。" />
                         </Border>
                     </Expander>
                 </StackPanel>
@@ -183,14 +182,20 @@
                                              Margin="12,0,0,0" Checked="OnAspectChanged" />
                             </StackPanel>
                             <StackPanel Orientation="Horizontal" Margin="24,4,0,0">
-                                <TextBox x:Name="AspectWInput" Width="52" Text="1" TextChanged="OnAspectTextChanged"
+                                <TextBox x:Name="AspectWInput" Width="52" Text="9" TextChanged="OnAspectTextChanged"
                                          VerticalContentAlignment="Center" />
                                 <TextBlock Text=" : " VerticalAlignment="Center" />
-                                <TextBox x:Name="AspectHInput" Width="52" Text="1" TextChanged="OnAspectTextChanged"
+                                <TextBox x:Name="AspectHInput" Width="52" Text="14" TextChanged="OnAspectTextChanged"
                                          VerticalContentAlignment="Center" />
-                                <TextBlock Text="（W : H；矩形与椭圆都按它画）" VerticalAlignment="Center"
+                                <TextBlock Text="（W : H；矩形与椭圆都按它画。矩形默认 9:14，椭圆默认 1:1）" VerticalAlignment="Center"
                                            Foreground="#FF888888" FontSize="11" Margin="6,0,0,0" />
                             </StackPanel>
+                            <TextBlock Text="宽高换算（只改形状，不改面积）" Foreground="#FF444444" Margin="0,8,0,0" />
+                            <ComboBox x:Name="SizeScaleCombo" SelectedIndex="0" Margin="0,2,0,0"
+                                      SelectionChanged="OnSizeScaleChanged">
+                                <ComboBoxItem Content="归一 —— 按屏幕拉伸（宽→屏宽、高→屏高）" />
+                                <ComboBoxItem Content="不归一 —— 1:1（两轴同比例，圆就是圆）" />
+                            </ComboBox>
                             <TextBlock Text="手掌像素面积取法（三选一）" Foreground="#FF444444" Margin="0,8,0,0" />
                             <RadioButton x:Name="FormulaRect" Content="a1×a2（矩形，默认）" GroupName="Formula"
                                          IsChecked="True" Checked="OnFormulaChanged" />
@@ -203,7 +208,17 @@
 
                     <CheckBox x:Name="FollowSizeCheck" Content="手掌擦启用触摸尺寸跟随（按多大擦多大）" IsChecked="True"
                               Margin="0,10,0,0" Checked="OnFollowSizeChanged" Unchecked="OnFollowSizeChanged" />
-                    <TextBlock Text="判为手掌擦后擦除区不小于手掌面积（可等于、可放大，不能缩小）；关闭则固定为手掌面积 × K 倍率，不随接触大小变。"
+                    <TextBlock Text="开启：擦除区随接触尺寸变（接触面积 × K）。关闭：固定为「手掌面积 × K 倍率」。注意：若下面「手掌擦 · 压感」还开着，按压轻重会在此基础上再放大。"
+                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
+
+                    <CheckBox x:Name="PalmFloorCheck" Content="手掌下限（判为手掌擦后不小于手掌面积）" IsChecked="True"
+                              Margin="0,8,0,0" Checked="OnPalmFloorChanged" Unchecked="OnPalmFloorChanged" />
+                    <TextBlock Text="开启：擦除区不小于「手掌面积 × K 倍率」（可等于、可放大、不能缩小）—— 因为你的手掌接触尺寸本来就在标定值附近，开了它「随尺寸」就看不出变化。想看到真正的随尺寸缩放，把它关掉。"
+                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
+
+                    <CheckBox x:Name="SmoothJitterCheck" Content="平滑抖动（压感/尺寸微动不改变擦除区）" IsChecked="True"
+                              Margin="0,8,0,0" Checked="OnSmoothJitterChanged" Unchecked="OnSmoothJitterChanged" />
+                    <TextBlock Text="对压感做指数平滑、并对擦除区尺寸加 1.5% 死区：轻微抖动不再让擦除区一直闪。关掉则完全跟手（会闪）。"
                                TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
 
                     <CheckBox x:Name="LockPalmSizeCheck" Content="禁止手掌擦缩小（擦时只增不减）" IsChecked="False"

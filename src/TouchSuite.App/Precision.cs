@@ -38,4 +38,14 @@ public static class Precision
 
     public static string Fmt(double? v, int normalDecimals = 1)
         => v is double d ? Fmt(d, normalDecimals) : "—";
+
+    /// <summary>固定小数位格式化（高精度模式也强制取整）。专给"每帧都在变的实时读数"用：
+    /// 用 <see cref="Fmt"/> 会给出约 7 位有效数字，末位每帧抖动 → 界面文字闪动。</summary>
+    public static string FmtFixed(double? v, int decimals = 0)
+    {
+        if (v is not double d || double.IsNaN(d) || double.IsInfinity(d))
+            return "—";
+        string fmt = decimals <= 0 ? "0" : "0." + new string('0', Math.Clamp(decimals, 1, 8));
+        return d.ToString(fmt);
+    }
 }
