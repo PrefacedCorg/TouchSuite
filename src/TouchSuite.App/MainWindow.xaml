@@ -124,7 +124,7 @@
 
                 <Border Grid.Column="0" Background="White" BorderBrush="#FFCCCCCC" BorderThickness="1">
                     <Grid>
-                        <TextBlock Text="在这块白板上描一圈手掌（含手指），或直接在右侧填数值"
+                        <TextBlock Text="沿手掌外轮廓一笔描一圈（含手指）：宽高自动填右侧，描摹凹面积 a3 自动取好；也可直接在右侧填数值"
                                    Foreground="#FFB0B0B0" HorizontalAlignment="Center" VerticalAlignment="Center"
                                    FontSize="14" TextWrapping="Wrap" TextAlignment="Center" />
                         <InkCanvas x:Name="TraceCanvas" Background="Transparent" StrokeCollected="OnStrokeCollected" />
@@ -132,11 +132,11 @@
                 </Border>
 
                 <StackPanel Grid.Column="1" Margin="12,0,0,0">
-                    <TextBlock Text="手掌尺寸" FontWeight="Bold" FontSize="15" />
-                    <TextBlock Text="宽（横向，cm）" Margin="0,10,0,2" Foreground="#FF444444" />
-                    <TextBox x:Name="PalmWidthInput" Text="12" VerticalContentAlignment="Center" TextChanged="OnPalmSizeChanged" />
-                    <TextBlock Text="长（纵向，cm）" Margin="0,10,0,2" Foreground="#FF444444" />
-                    <TextBox x:Name="PalmHeightInput" Text="18" VerticalContentAlignment="Center" TextChanged="OnPalmSizeChanged" />
+                    <TextBlock Text="手掌尺寸（物理像素 px）" FontWeight="Bold" FontSize="15" />
+                    <TextBlock Text="宽 a2（横向，px）" Margin="0,10,0,2" Foreground="#FF444444" />
+                    <TextBox x:Name="PalmWidthInput" Text="120" VerticalContentAlignment="Center" TextChanged="OnPalmSizeChanged" />
+                    <TextBlock Text="高 a1（纵向，px）" Margin="0,10,0,2" Foreground="#FF444444" />
+                    <TextBox x:Name="PalmHeightInput" Text="180" VerticalContentAlignment="Center" TextChanged="OnPalmSizeChanged" />
                     <Button Content="清除描摹" Margin="0,12,0,0" Padding="4,3" Click="OnClearTrace" />
                     <TextBlock x:Name="PalmSizeText" Margin="0,14,0,0" FontFamily="Consolas" FontSize="12"
                                Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="面积：—" />
@@ -168,11 +168,11 @@
                                 <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                             </ComboBox>
                             <StackPanel x:Name="PalmHidMmPanel" Margin="0,4,0,0" Visibility="Collapsed">
-                                <TextBlock Text="HID mm 来源：" FontSize="12" Foreground="#FF444444" />
+                                <TextBlock Text="HID 尺寸取法：" FontSize="12" Foreground="#FF444444" />
                                 <ComboBox x:Name="PalmHidMmCombo" SelectedIndex="0" Margin="0,2,0,0"
                                           SelectionChanged="OnPalmHidMmChanged">
-                                    <ComboBoxItem Content="映射表上报（设备声明 mm）" />
-                                    <ComboBoxItem Content="校准时取得（按屏幕标定换算）" />
+                                    <ComboBoxItem Content="逻辑量程 → 屏幕分辨率（推荐）" />
+                                    <ComboBoxItem Content="物理量程（mm）→ 屏幕换算" />
                                 </ComboBox>
                             </StackPanel>
                             <TextBlock x:Name="PalmSourceInfoText" FontFamily="Consolas" FontSize="11"
@@ -209,11 +209,11 @@
                                 <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
                             </ComboBox>
                             <StackPanel x:Name="FingerHidMmPanel" Margin="0,4,0,0" Visibility="Collapsed">
-                                <TextBlock Text="HID mm 来源：" FontSize="12" Foreground="#FF444444" />
+                                <TextBlock Text="HID 尺寸取法：" FontSize="12" Foreground="#FF444444" />
                                 <ComboBox x:Name="FingerHidMmCombo" SelectedIndex="0" Margin="0,2,0,0"
                                           SelectionChanged="OnFingerHidMmChanged">
-                                    <ComboBoxItem Content="映射表上报（设备声明 mm）" />
-                                    <ComboBoxItem Content="校准时取得（按屏幕标定换算）" />
+                                    <ComboBoxItem Content="逻辑量程 → 屏幕分辨率（推荐）" />
+                                    <ComboBoxItem Content="物理量程（mm）→ 屏幕换算" />
                                 </ComboBox>
                             </StackPanel>
                             <TextBlock x:Name="FingerSourceInfoText" FontFamily="Consolas" FontSize="11"

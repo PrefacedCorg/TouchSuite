@@ -33,6 +33,7 @@ public static class HidReader
         double? WidthMm, double? HeightMm, double? XNorm, double? YNorm, double? Pressure01,
         int WidthLogical, int HeightLogical,
         int XLogical, int YLogical, int XLogMax, int YLogMax,
+        int WidthLogMax, int HeightLogMax,
         string Hex);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -269,7 +270,7 @@ public static class HidReader
             double? yNorm = ctx.YLogMax > 0 ? (double)y / ctx.YLogMax : null;
 
             sample = new RawTouchSample(ctx.Name, wMm, hMm, xNorm, yNorm, p01, (int)w, (int)h,
-                (int)x, (int)y, ctx.XLogMax, ctx.YLogMax, ToHex(report));
+                (int)x, (int)y, ctx.XLogMax, ctx.YLogMax, ctx.WLogMax, ctx.HLogMax, ToHex(report));
             return WmInputResult.Handled;
         }
         finally

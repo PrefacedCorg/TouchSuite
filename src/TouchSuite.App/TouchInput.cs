@@ -26,7 +26,8 @@ public sealed record TouchSample(string Source, double? WidthMm, double? HeightM
     Rect? DiuRect = null,
     int FrameId = 0, uint TimeMs = 0,
     IReadOnlyList<ContactRect>? Contacts = null,
-    int XLogMax = 0, int YLogMax = 0)
+    int XLogMax = 0, int YLogMax = 0,
+    int WidthLogMax = 0, int HeightLogMax = 0)
 {
     /// <summary>接触面积：带分指列表时 = 各指面积之和（手掌多接触不被拆散低估）；单指退化为 W×H。</summary>
     public double? AreaMm2
