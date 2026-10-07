@@ -17,7 +17,7 @@
 | [src/TouchSuite.Receiver](src/TouchSuite.Receiver) | Windows 接收端（控制台，.NET 9） | 收平板触摸帧并注入桌面；`--vhid` 时喂给虚拟 HID 触摸屏驱动 |
 | [android/](android) | 安卓端 App | 把平板触摸面通过网络发给 PC |
 | [driver/](driver) | 虚拟 HID 触摸屏驱动（VHF，C） | 装上后 Windows 才认成"真的触摸屏"，接触面积/压感才有意义 |
-| [src/TouchSuite.HidDump](src/TouchSuite.HidDump) | 触摸屏 HID 查看工具（WPF，.NET 10） | 左边触摸框、右边表格：列出全部 HID usage（页/usage/Link/范围/Report Count）并实时显示当前值；可选设备、看原始报告描述符逐项、带诊断日志 |
+| [src/TouchSuite.HidDump](src/TouchSuite.HidDump) | 触摸屏 HID 查看工具（WPF，.NET Framework 4.6.2，兼容 Win7） | 左边触摸框、右边表格：列出全部 HID usage（页/usage/Link/范围/Report Count）并实时显示当前值；可选设备、看原始报告描述符逐项、带诊断日志 |
 | [src/TouchSuite.App.old](src/TouchSuite.App.old) | 旧主项目（历史 Demo） | 之前的手掌擦 Demo，一般不用；其 `README.md`/`TESTING.md` 内容仍是旧名 TouchErase |
 
 > 为什么需要驱动：`user32` 合成指针注入的触摸**不带接触面积**，也基本不吃压感。要让应用看到真实的面积/压感，得走虚拟 HID 触摸屏（`--vhid`）。

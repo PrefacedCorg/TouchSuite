@@ -14,8 +14,7 @@ namespace TouchSuite.App.Eraser;
 public sealed class EraserEngine
 {
     public const long SourceFreshMs = 300;        // 来源新鲜窗口
-    public const long SourceLockObserveMs = 300;  // 自适应：连续有效达到此时长才锁定
-    public const long SourceLockReleaseMs = 1500; // 自适应：锁定来源静默超过此时长则解锁
+    public const long SourceLockObserveMs = 300;  // 自适应：连续有效达到此时长就锁定，锁后不再切换
     public const int ContactHistoryMax = 5;       // 中值滤波窗口
     public const double MinContactPx = 0.5;       // 小于此像素尺寸视为"驱动未上报有效接触面积"
 
@@ -61,6 +60,9 @@ public sealed class EraserEngine
     // ================= 设置（界面绑定） =================
 
     public SourceMode Mode { get; private set; } = SourceMode.Auto;
+
+    /// <summary>自适应已锁定的来源（None = 还在识别中）；锁定后不再切换，另一个来源一律忽略。</summary>
+    public ContactSource LockedSource => _locked;
 
     /// <summary>HID 模式下接触尺寸（物理像素）的取法。</summary>
     public HidSizeSource HidSizeSource { get; private set; } = HidSizeSource.LogicalToScreen;
@@ -320,7 +322,7 @@ public sealed class EraserEngine
     private bool IsUsable(ContactSource s, long now)
         => _state.TryGetValue(s, out var st) && st.Eligible && now - st.Time <= SourceFreshMs;
 
-    /// <summary>手动指定则只认那一路；自适应则稳定识别后锁定。</summary>
+    /// <summary>手动指定则只认那一路；自适应则稳定识别后**永久锁定**（锁定后另一个来源直接忽略，不再切换）。</summary>
     private ContactSource ResolveSource(long now)
     {
         if (Mode != SourceMode.Auto)
@@ -334,14 +336,10 @@ public sealed class EraserEngine
             return want != ContactSource.None && IsUsable(want, now) ? want : ContactSource.None;
         }
 
-        // 已锁定：一直跟随，直到它静默太久（抬手/失效）才解锁重新识别
+        // 已锁定：一直用它，绝不再切换（另一个来源直接忽略；抬手/静默也不解锁，
+        // 想换来源只能手动改模式或点「清除预览」）
         if (_locked != ContactSource.None)
-        {
-            if (_state.TryGetValue(_locked, out var st) && st.Eligible && now - st.Time <= SourceLockReleaseMs)
-                return _locked;
-            _locked = ContactSource.None;
-            _validSince.Clear();
-        }
+            return _locked;
 
         // 未锁定：按优先级找"连续有效 ≥ 观察期"的来源并锁定
         foreach (ContactSource s in PriorityOrder)
@@ -490,13 +488,17 @@ public sealed class EraserEngine
     /// <summary>生效 K 开到边长上的倍数（√K）：触摸报的 w/h 各乘它 = 擦除区 w/h。</summary>
     public double LinearFactor() => Math.Sqrt(EffectiveK());
 
-    /// <summary>擦除区面积（px²）。随尺寸 = 接触面积 × 生效 K × 压感倍数²；否则固定手掌面积 × 倍率 × 压感倍数²。</summary>
+    /// <summary>擦除区面积（px²）。随尺寸 = max(接触面积 × 生效 K, 手掌面积 × K 倍率) × 压感倍数²
+    /// ——达到阈值判为手掌擦后「不能比手掌小」：接触 = 标定手掌大小时可以等于，更大时可以放大；
+    /// 否则固定手掌面积 × 倍率 × 压感倍数²。</summary>
     private double EraserAreaRawPx2(Rect c)
     {
         double g = PalmGain;
+        double trim = Math.Clamp(KTrim, 0.5, 2.0);
+        double floorArea = PalmAreaPx2 * trim;   // 手掌下限（未填手掌尺寸则为 0，不加限制）
         double area = FollowSize
-            ? c.Width * c.Height * EffectiveK()
-            : PalmAreaPx2 * Math.Clamp(KTrim, 0.5, 2.0);
+            ? Math.Max(c.Width * c.Height * EffectiveK(), floorArea)
+            : floorArea;
         return area * g * g;
     }
 
@@ -628,7 +630,7 @@ public sealed class EraserEngine
         string mode = Mode != SourceMode.Auto
             ? $"手动：{SourceNames.OfMode(Mode)}"
             : (_locked != ContactSource.None
-                ? $"自适应：已锁定 {SourceNames.Of(_locked)}"
+                ? $"自适应：已锁定 {SourceNames.Of(_locked)}（不再切换，另一个来源已忽略）"
                 : "自适应：识别中…");
         sb.Append(mode).Append("   |   生效: ").Append(SourceNames.Of(_active));
 
@@ -639,6 +641,7 @@ public sealed class EraserEngine
             string val = _detail.TryGetValue(s, out string? d) ? d : "（无）";
             sb.Append('\n').Append(active ? "▶ " : "   ").Append(SourceNames.Of(s)).Append(": ").Append(val);
             if (!fresh && _state.ContainsKey(s)) sb.Append("  (旧)");
+            if (_locked != ContactSource.None && s != _locked) sb.Append("  (已忽略)");
         }
         return sb.ToString();
     }
@@ -751,6 +754,7 @@ public sealed class EraserEngine
 
         string sizeText = FollowSize
             ? $"随接触尺寸: Σ {Precision.Fmt(contactSum, 0)} px² × K（{kText}）"
+              + $"\n下限 = 手掌面积 {Precision.Fmt(PalmAreaPx2, 0)} px²：判为手掌擦后不小于它（可等于、可放大，不能缩小）"
             : $"固定手掌面积: {Precision.Fmt(PalmAreaPx2, 0)} px² × 倍率 {Precision.Fmt(KTrim, 2)}";
 
         string pressText = PalmPressureEnabled

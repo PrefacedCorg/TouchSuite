@@ -972,7 +972,8 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// 该样本是否参与标定采样。Stylus 只带压感、不参与面积，始终放行；
-    /// 手动指定来源时只认那一路；自适应时 HID 新鲜就忽略 WPF 的面积，避免两路面积互相打架。
+    /// 手动指定来源时只认那一路；自适应时跟随引擎的锁定来源（锁了谁就只认谁，另一个直接忽略），
+    /// 还没锁定时 HID 优先、HID 静默才用 WPF 垫着。
     /// </summary>
     private bool Accept(TouchSample s)
     {
@@ -983,6 +984,13 @@ public partial class MainWindow : Window
         if (mode == SourceMode.RawHid)
             return s.Source == "RawHID";
         if (mode == SourceMode.SoftwareWpf)
+            return s.Source == "WPF";
+
+        // 自适应：引擎一旦锁定，就只用锁定来源的样本
+        ContactSource locked = EraserPage?.Engine.LockedSource ?? ContactSource.None;
+        if (locked == ContactSource.RawHid)
+            return s.Source == "RawHID";
+        if (locked == ContactSource.Wpf)
             return s.Source == "WPF";
 
         if (s.Source == "RawHID")

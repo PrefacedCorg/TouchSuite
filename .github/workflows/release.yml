@@ -35,7 +35,7 @@ on:
         type: boolean
         default: true
       hidump:
-        description: '⑤ TouchSuite.HidDump（HID 能力/报告描述符查看工具，win-x64 单文件）'
+        description: '⑤ TouchSuite.HidDump（HID 能力/报告描述符查看工具，net462 兼容 Win7）'
         type: boolean
         default: false
       driver:
@@ -272,12 +272,11 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Publish（自包含单文件 win-x64）
+      # HidDump 是 net462（为兼容 Win7 保留 .NET Framework），单文件/自包含发布只支持 .NET Core，
+      # 故这里走框架依赖发布，产物为 exe + config + System.ValueTuple.dll 一起打包
+      - name: Publish（net462 框架依赖）
         run: >
-          dotnet publish src/TouchSuite.HidDump/TouchSuite.HidDump.csproj -c Release -r win-x64
-          --self-contained true
-          -p:PublishSingleFile=true
-          -p:IncludeNativeLibrariesForSelfExtract=true
+          dotnet publish src/TouchSuite.HidDump/TouchSuite.HidDump.csproj -c Release
           -p:DebugType=none
           -p:Version=${{ needs.prepare.outputs.version }}
           -o publish/hidump
