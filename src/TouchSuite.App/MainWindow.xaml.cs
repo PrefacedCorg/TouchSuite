@@ -69,8 +69,6 @@ public partial class MainWindow : Window
     private long _lastInfoBarTicks;     // 信息栏刷新节流（实时压感 60Hz，节流后才看得清）
     private double? _liveAreaPx2;       // 手掌/手指实时接触面积（物理像素²）
     private double? _livePressure;      // 手掌/手指实时压感（来自 WPF Stylus）
-    private long _lastPressTicks;       // 上一次收到样本的时刻（判"抬手"用）
-    private const long PressGapMs = 350;   // 静默超过此时长视为抬手，下一次样本算新的一次按压
 
     // 原始HID（RawInput）：设备上报的接触尺寸→面积 + 压感；映射表只读展示
     private IntPtr _hwnd;
@@ -1035,17 +1033,10 @@ public partial class MainWindow : Window
         if (area is double la) _liveAreaPx2 = la;
         if (press is double lp) _livePressure = lp;
 
-        // 峰值只算"当前这一次按压"：抬手静默超过 PressGapMs 后再有样本 → 视为新的一次按压，清空重算
-        bool newPress = nowTicks - _lastPressTicks > PressGapMs;
-        _lastPressTicks = nowTicks;
-
+        // 峰值 = 自上次「记录」以来的最大接触，抬手不清空：
+        // 点「记录」时手指落在按钮上的那一下小接触（远小于手掌）不会顶掉手掌的峰值。
         if (_step == 4)
         {
-            if (newPress)
-            {
-                _palmPeakAreaPx2 = null;
-                _palmPeakPressure = null;
-            }
             _palmActiveSource = s.Source;
             if (area is double a && a > (_palmPeakAreaPx2 ?? 0)) _palmPeakAreaPx2 = a;
             if (press is double p && p > (_palmPeakPressure ?? 0)) _palmPeakPressure = p;
@@ -1055,11 +1046,6 @@ public partial class MainWindow : Window
         }
         else
         {
-            if (newPress)
-            {
-                _fingerPeakAreaPx2 = null;
-                _fingerPeakPressure = null;
-            }
             _fingerActiveSource = s.Source;
             if (area is double a && a > (_fingerPeakAreaPx2 ?? 0)) _fingerPeakAreaPx2 = a;
             if (press is double p && p > (_fingerPeakPressure ?? 0)) _fingerPeakPressure = p;
