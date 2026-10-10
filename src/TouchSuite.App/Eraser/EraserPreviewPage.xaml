@@ -5,36 +5,33 @@
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*" />
             <ColumnDefinition Width="Auto" />
-            <ColumnDefinition Width="Auto" />
         </Grid.ColumnDefinitions>
 
-        <!-- 左：预览区（触摸样本统一由宿主窗口的 TouchInput 聚合后经 SubmitSample 喂入） -->
+        <!-- 左：预览区 -->
         <Grid Grid.Column="0">
             <Border x:Name="Host" Background="#FF101010">
-                <TextBlock Text="把手掌按在任意处：绿色擦除区会实时变成 触摸尺寸 × K 的像素面积"
+                <TextBlock Text="用真触摸屏按一下：绿色擦除区 = 接触尺寸 × K"
                            Foreground="#FF808080" HorizontalAlignment="Center" VerticalAlignment="Center"
                            TextWrapping="Wrap" TextAlignment="Center" FontSize="15" IsHitTestVisible="False" />
             </Border>
             <Canvas x:Name="Overlay" IsHitTestVisible="False" ClipToBounds="True" />
         </Grid>
 
-        <!-- 中：来源 / 自测 -->
-        <Border Grid.Column="1" Width="320" Background="#FFF5F5F5" BorderBrush="#FFCCCCCC" BorderThickness="1,0,0,0">
-            <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="12">
+        <!-- 右：来源 / 保存 / 触摸信息（原中栏）在最上面，下面是全部参数 -->
+        <Border Grid.Column="1" Width="470" Background="#FFF5F5F5" BorderBrush="#FFCCCCCC" BorderThickness="1,0,0,0">
+            <ScrollViewer VerticalScrollBarVisibility="Auto" PanningMode="VerticalOnly" Padding="12">
                 <StackPanel>
                     <TextBlock Text="面积擦预览" FontWeight="Bold" FontSize="15" Foreground="#FF1E1E1E" />
-                    <TextBlock Text="读系统上报的接触尺寸（物理像素）→ 乘 K → 实时画出擦除区（按多大，擦多大）"
-                               TextWrapping="Wrap" Foreground="#FF666666" Margin="0,4,0,0" />
 
-                    <TextBlock Text="接触来源：" Margin="0,6,0,0" Foreground="#FF444444" />
+                    <TextBlock Text="接触来源" Margin="0,10,0,0" Foreground="#FF444444" />
                     <ComboBox x:Name="SourceModeCombo" SelectedIndex="0" Margin="0,4,0,0"
                               SelectionChanged="OnSourceModeChanged">
                         <ComboBoxItem Content="自适应（自动锁定）" />
                         <ComboBoxItem Content="原始HID（设备上报尺寸）" />
-                        <ComboBoxItem Content="软件WPF（系统接触框 + 软件推算）" />
+                        <ComboBoxItem Content="软件WPF（系统接触框）" />
                     </ComboBox>
                     <StackPanel x:Name="HidDevicePanel" Margin="0,4,0,0" Visibility="Collapsed">
-                        <TextBlock Text="HID 触摸屏（多块时用哪一块）：" Foreground="#FF444444" />
+                        <TextBlock Text="HID 触摸屏（多块时用哪一块）" Foreground="#FF444444" />
                         <ComboBox x:Name="HidDeviceCombo" SelectedIndex="0" Margin="0,2,0,0"
                                   SelectionChanged="OnHidDeviceChanged">
                             <ComboBoxItem Content="自动（第一块出数的触摸屏）" />
@@ -43,208 +40,211 @@
                     <TextBlock x:Name="SourceInfoText" Text="当前来源: 无" Margin="0,6,0,0" FontFamily="Consolas"
                                FontSize="11" Foreground="#FF0A5A9A" TextWrapping="Wrap" />
 
-                    <!-- 保存结果到文件（宿主窗口订阅 SaveRequested 落盘） -->
                     <Border Height="1" Background="#FFCCCCCC" Margin="0,12,0,10" />
-                    <Button Content="保存结果到文件" Padding="14,5" HorizontalAlignment="Left"
-                            Click="OnSaveRequested" />
+                    <Button Content="保存结果到文件" Padding="14,5" HorizontalAlignment="Left" Click="OnSaveRequested" />
                     <TextBlock x:Name="SavePathText" Margin="0,8,0,0" FontSize="11"
                                Foreground="#FF888888" TextWrapping="Wrap" />
 
-                    <!-- 底部：触摸原始信息回显（内容稳定：不带帧号/时刻，数值固定小数位） -->
-                    <Expander Header="触摸信息（样本 / 换算明细）" Margin="0,14,0,0" IsExpanded="True"
-                              Foreground="#FF1E1E1E">
-                        <Border Background="#FFEDEDED" BorderBrush="#FFCCCCCC" BorderThickness="1"
-                                Padding="8" Margin="0,6,0,0">
+                    <Expander Header="触摸信息" Margin="0,14,0,0" IsExpanded="False" Foreground="#FF1E1E1E">
+                        <Border Background="#FFEDEDED" BorderBrush="#FFCCCCCC" BorderThickness="1" Padding="8"
+                                Margin="0,6,0,0">
                             <TextBlock x:Name="HidInfoText" FontFamily="Consolas" FontSize="11"
                                        Foreground="#FF0A5A9A" TextWrapping="Wrap"
-                                       Text="在预览区按一下：列出当前触摸样本的来源 / 状态 / 坐标 / 尺寸 / 手指数 / 压感 / 换算明细。" />
+                                       Text="按一下后显示来源 / 坐标 / 尺寸 / 压感 / 换算明细。" />
                         </Border>
                     </Expander>
-                </StackPanel>
-            </ScrollViewer>
-        </Border>
 
-        <!-- 右：K / 阈值 / 压感 / 形状与长宽比 / 面积公式 -->
-        <Border Grid.Column="2" Width="430" Background="#FFF5F5F5" BorderBrush="#FFCCCCCC" BorderThickness="1,0,0,0">
-            <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="12">
-                <StackPanel>
-                    <GroupBox Header="K 定值    手掌像素面积 ÷ 触摸尺寸乘积">
+                    <Border Height="1" Background="#FFCCCCCC" Margin="0,14,0,10" />
+
+                    <!-- K 定值 -->
+                    <GroupBox Header="K 定值">
                         <StackPanel Margin="6">
                             <TextBlock x:Name="KText" FontFamily="Consolas" FontSize="12"
                                        Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="…" />
-                            <TextBlock Text="K 倍率（×0.5 ~ ×2，直接乘在 K 上）" Foreground="#FF444444" Margin="0,8,0,0" />
-                            <Grid Margin="0,2,0,0">
+                            <Grid Margin="0,8,0,0">
                                 <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
-                                <Slider x:Name="KTrimSlider" Grid.Column="0" Minimum="0.5" Maximum="2" Value="1"
-                                        TickFrequency="0.01" ValueChanged="OnKTrimChanged" />
-                                <Button Grid.Column="1" Content="恢复默认" Padding="6,1" FontSize="11" Margin="8,0,0,0"
+                                <TextBlock Grid.Column="0" Text="K 倍率" VerticalAlignment="Center" Foreground="#FF444444" />
+                                <Slider x:Name="KTrimSlider" Grid.Column="1" Minimum="0.5" Maximum="2" Value="1"
+                                        TickFrequency="0.01" Margin="8,0,0,0" ValueChanged="OnKTrimChanged" />
+                                <Button Grid.Column="2" Content="恢复" Padding="6,1" FontSize="11" Margin="8,0,0,0"
                                         Click="OnResetKTrim" />
                             </Grid>
                             <TextBlock x:Name="KTrimValueText" FontSize="11" Foreground="#FF666666" Text="×1.00" />
                         </StackPanel>
                     </GroupBox>
 
-                    <GroupBox Header="擦 / 写 切换阈值    接触面积小于它 = 书写（px²）">
+                    <!-- 擦 / 写 切换阈值 -->
+                    <GroupBox Header="擦 / 写 切换阈值">
                         <StackPanel Margin="6">
-                            <TextBlock x:Name="AreaThresholdText" FontFamily="Consolas" FontSize="12"
-                                       Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="—" />
-                            <Grid Margin="0,4,0,0">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Slider x:Name="AreaThresholdSlider" Grid.Column="0" Minimum="0" Maximum="1" Value="0"
-                                        TickFrequency="1" ValueChanged="OnAreaThresholdSliderChanged" />
-                                <Button Grid.Column="1" Content="恢复默认" Padding="6,1" FontSize="11" Margin="8,0,0,0"
-                                        Click="OnResetAreaThreshold" />
-                            </Grid>
-                            <TextBlock x:Name="AreaThresholdValueText" FontSize="11" Foreground="#FF666666" Text="—" />
+                            <CheckBox x:Name="AreaThresholdCheck" Content="启用面积阈值（关闭 → 一律手掌擦）"
+                                      IsChecked="True" Checked="OnAreaThresholdCheckChanged"
+                                      Unchecked="OnAreaThresholdCheckChanged" />
+                            <StackPanel x:Name="AreaThresholdDetailPanel" Margin="0,6,0,0">
+                                <TextBlock x:Name="AreaThresholdText" FontFamily="Consolas" FontSize="12"
+                                           Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="—" />
+                                <Grid Margin="0,4,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <Slider x:Name="AreaThresholdSlider" Grid.Column="0" Minimum="0" Maximum="1" Value="0"
+                                            TickFrequency="1" ValueChanged="OnAreaThresholdSliderChanged" />
+                                    <Button Grid.Column="1" Content="恢复" Padding="6,1" FontSize="11" Margin="8,0,0,0"
+                                            Click="OnResetAreaThreshold" />
+                                </Grid>
+                                <TextBlock x:Name="AreaThresholdValueText" FontSize="11" Foreground="#FF666666" Text="—" />
+                            </StackPanel>
                         </StackPanel>
                     </GroupBox>
 
-                    <GroupBox Header="手掌擦 · 压感    [阈值..1] → 放大 [1×..max×]，不缩小">
+                    <!-- 手掌擦（尺寸跟随 + 限制 + 锁定 + 压感） -->
+                    <GroupBox Header="手掌擦">
                         <StackPanel Margin="6">
-                            <CheckBox x:Name="PalmPressureCheck" Content="手掌擦启用压感（关闭 → 模拟 512/1024 = 0.5）"
-                                      IsChecked="True" Checked="OnPalmPressureChanged" Unchecked="OnPalmPressureChanged" />
-                            <TextBlock Text="压感阈值（默认 = 手掌按压压感 b3）" Foreground="#FF444444" Margin="0,6,0,0" />
-                            <Grid Margin="0,2,0,0">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Slider x:Name="PalmThrSlider" Grid.Column="0" Minimum="0" Maximum="1" Value="0.5"
-                                        TickFrequency="0.01" ValueChanged="OnPalmThrChanged" />
-                                <Button Grid.Column="1" Content="恢复默认" Padding="6,1" FontSize="11" Margin="8,0,0,0"
-                                        Click="OnResetPalmThr" />
-                            </Grid>
-                            <TextBlock x:Name="PalmThrValueText" FontSize="11" Foreground="#FF666666" Text="0.50" />
-                            <TextBlock Text="归一 max（压感到 1 时最多放大到几倍）" Foreground="#FF444444" Margin="0,6,0,0" />
-                            <Grid Margin="0,2,0,0">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Slider x:Name="PalmMaxSlider" Grid.Column="0" Minimum="1" Maximum="3" Value="2"
-                                        TickFrequency="0.05" ValueChanged="OnPalmMaxChanged" />
-                                <Button Grid.Column="1" Content="恢复默认" Padding="6,1" FontSize="11" Margin="8,0,0,0"
-                                        Click="OnResetPalmMax" />
-                            </Grid>
-                            <TextBlock x:Name="PalmMaxValueText" FontSize="11" Foreground="#FF666666" Text="×2.00" />
+                            <CheckBox x:Name="FollowSizeCheck" Content="随触摸尺寸（按多大擦多大）" IsChecked="True"
+                                      Checked="OnFollowSizeChanged" Unchecked="OnFollowSizeChanged" />
+                            <StackPanel x:Name="PalmLimitPanel" Orientation="Horizontal" Margin="16,4,0,0">
+                                <TextBlock Text="限制" VerticalAlignment="Center" Foreground="#FF444444" />
+                                <RadioButton x:Name="PalmLimitNone" Content="不限" GroupName="PalmLimit"
+                                             Margin="8,0,0,0" Checked="OnPalmLimitChanged" />
+                                <RadioButton x:Name="PalmLimitFloor" Content="下限" GroupName="PalmLimit"
+                                             Margin="8,0,0,0" IsChecked="True" Checked="OnPalmLimitChanged" />
+                                <RadioButton x:Name="PalmLimitCap" Content="上限" GroupName="PalmLimit"
+                                             Margin="8,0,0,0" Checked="OnPalmLimitChanged" />
+                            </StackPanel>
+                            <CheckBox x:Name="LockPalmSizeCheck" Content="擦时只增不减" IsChecked="False"
+                                      Margin="0,4,0,0" Checked="OnLockPalmSizeChanged" Unchecked="OnLockPalmSizeChanged" />
+                            <CheckBox x:Name="MultiTouchPalmCheck" Content="多触点求和（多点 = 手掌擦）" IsChecked="True"
+                                      Margin="0,4,0,0" Checked="OnMultiTouchPalmChanged" Unchecked="OnMultiTouchPalmChanged" />
+                            <CheckBox x:Name="PalmPressureCheck" Content="启用压感" IsChecked="True"
+                                      Margin="0,4,0,0" Checked="OnPalmPressureChanged" Unchecked="OnPalmPressureChanged" />
+                            <StackPanel x:Name="PalmPressureDetailPanel" Margin="16,4,0,0">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="阈值" VerticalAlignment="Center" Foreground="#FF444444" />
+                                    <Slider x:Name="PalmThrSlider" Grid.Column="1" Minimum="0" Maximum="1" Value="0.5"
+                                            TickFrequency="0.01" Margin="8,0,0,0" ValueChanged="OnPalmThrChanged" />
+                                    <Button Grid.Column="2" Content="恢复" Padding="6,1" FontSize="11" Margin="8,0,0,0"
+                                            Click="OnResetPalmThr" />
+                                </Grid>
+                                <TextBlock x:Name="PalmThrValueText" FontSize="11" Foreground="#FF666666" Text="0.50" Margin="40,0,0,0" />
+                                <Grid Margin="0,4,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="最大放大" VerticalAlignment="Center" Foreground="#FF444444" />
+                                    <Slider x:Name="PalmMaxSlider" Grid.Column="1" Minimum="1" Maximum="3" Value="2"
+                                            TickFrequency="0.05" Margin="8,0,0,0" ValueChanged="OnPalmMaxChanged" />
+                                    <Button Grid.Column="2" Content="恢复" Padding="6,1" FontSize="11" Margin="8,0,0,0"
+                                            Click="OnResetPalmMax" />
+                                </Grid>
+                                <TextBlock x:Name="PalmMaxValueText" FontSize="11" Foreground="#FF666666" Text="×2.00" Margin="40,0,0,0" />
+                            </StackPanel>
                         </StackPanel>
                     </GroupBox>
 
-                    <GroupBox Header="书写 · 压感    [阈值..1] → 放大 [1×..max×]，不缩小">
+                    <!-- 书写（未启用阈值时整块隐藏） -->
+                    <GroupBox x:Name="WritingSection" Header="书写">
                         <StackPanel Margin="6">
-                            <CheckBox x:Name="WritingPressureCheck" Content="书写启用压感（关闭 → 模拟 512/1024 = 0.5）"
-                                      IsChecked="True" Checked="OnWritingPressureChanged" Unchecked="OnWritingPressureChanged" />
-                            <TextBlock Text="压感阈值（默认 = 手指按压压感 c3）" Foreground="#FF444444" Margin="0,6,0,0" />
-                            <Grid Margin="0,2,0,0">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Slider x:Name="WritingThrSlider" Grid.Column="0" Minimum="0" Maximum="1" Value="0.5"
-                                        TickFrequency="0.01" ValueChanged="OnWritingThrChanged" />
-                                <Button Grid.Column="1" Content="恢复默认" Padding="6,1" FontSize="11" Margin="8,0,0,0"
-                                        Click="OnResetWritingThr" />
-                            </Grid>
-                            <TextBlock x:Name="WritingThrValueText" FontSize="11" Foreground="#FF666666" Text="0.50" />
-                            <TextBlock Text="归一 max（压感到 1 时最多放大到几倍）" Foreground="#FF444444" Margin="0,6,0,0" />
-                            <Grid Margin="0,2,0,0">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <Slider x:Name="WritingMaxSlider" Grid.Column="0" Minimum="1" Maximum="3" Value="2"
-                                        TickFrequency="0.05" ValueChanged="OnWritingMaxChanged" />
-                                <Button Grid.Column="1" Content="恢复默认" Padding="6,1" FontSize="11" Margin="8,0,0,0"
-                                        Click="OnResetWritingMax" />
-                            </Grid>
-                            <TextBlock x:Name="WritingMaxValueText" FontSize="11" Foreground="#FF666666" Text="×2.00" />
+                            <CheckBox x:Name="WritingPressureCheck" Content="启用压感" IsChecked="True"
+                                      Checked="OnWritingPressureChanged" Unchecked="OnWritingPressureChanged" />
+                            <StackPanel x:Name="WritingPressureDetailPanel" Margin="16,4,0,0">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="阈值" VerticalAlignment="Center" Foreground="#FF444444" />
+                                    <Slider x:Name="WritingThrSlider" Grid.Column="1" Minimum="0" Maximum="1" Value="0.5"
+                                            TickFrequency="0.01" Margin="8,0,0,0" ValueChanged="OnWritingThrChanged" />
+                                    <Button Grid.Column="2" Content="恢复" Padding="6,1" FontSize="11" Margin="8,0,0,0"
+                                            Click="OnResetWritingThr" />
+                                </Grid>
+                                <TextBlock x:Name="WritingThrValueText" FontSize="11" Foreground="#FF666666" Text="0.50" Margin="40,0,0,0" />
+                                <Grid Margin="0,4,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="最大放大" VerticalAlignment="Center" Foreground="#FF444444" />
+                                    <Slider x:Name="WritingMaxSlider" Grid.Column="1" Minimum="1" Maximum="3" Value="2"
+                                            TickFrequency="0.05" Margin="8,0,0,0" ValueChanged="OnWritingMaxChanged" />
+                                    <Button Grid.Column="2" Content="恢复" Padding="6,1" FontSize="11" Margin="8,0,0,0"
+                                            Click="OnResetWritingMax" />
+                                </Grid>
+                                <TextBlock x:Name="WritingMaxValueText" FontSize="11" Foreground="#FF666666" Text="×2.00" Margin="40,0,0,0" />
+                            </StackPanel>
+                            <CheckBox x:Name="WritingFollowSizeCheck" Content="书写也随触摸尺寸" IsChecked="False"
+                                      Margin="0,4,0,0" Checked="OnWritingFollowSizeChanged"
+                                      Unchecked="OnWritingFollowSizeChanged" />
                         </StackPanel>
                     </GroupBox>
 
-                    <GroupBox Header="形状 / 长宽比 / 手掌面积公式">
+                    <!-- 形状 / 长宽比 -->
+                    <GroupBox Header="擦除区形状 · 长宽比">
                         <StackPanel Margin="6">
                             <StackPanel Orientation="Horizontal">
                                 <RadioButton x:Name="ShapeRect" Content="矩形" GroupName="Shape" IsChecked="True"
                                              Checked="OnShapeChanged" />
-                                <RadioButton x:Name="ShapeCircle" Content="椭圆（π/4×W×H；1:1 就是正圆）" GroupName="Shape"
-                                             Margin="12,0,0,0" Checked="OnShapeChanged" />
+                                <RadioButton x:Name="ShapeCircle" Content="椭圆" GroupName="Shape"
+                                             Margin="16,0,0,0" Checked="OnShapeChanged" />
                             </StackPanel>
-                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                                <RadioButton x:Name="AspectContact" Content="长宽比跟随触摸尺寸" GroupName="Aspect"
+                            <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                                <RadioButton x:Name="AspectContact" Content="跟随触摸尺寸" GroupName="Aspect"
                                              IsChecked="True" Checked="OnAspectChanged" />
+                                <RadioButton x:Name="AspectTrace" Content="手掌描摹" GroupName="Aspect"
+                                             Margin="16,0,0,0" Checked="OnAspectChanged" />
                                 <RadioButton x:Name="AspectCustom" Content="自定义" GroupName="Aspect"
-                                             Margin="12,0,0,0" Checked="OnAspectChanged" />
+                                             Margin="16,0,0,0" Checked="OnAspectChanged" />
                             </StackPanel>
-                            <StackPanel Orientation="Horizontal" Margin="24,4,0,0">
+                            <TextBlock x:Name="AspectTraceHint" Margin="16,2,0,0" FontSize="11" Foreground="#FFAA6600"
+                                       TextWrapping="Wrap" Visibility="Collapsed"
+                                       Text="「手掌描摹」需要先有手掌尺寸（描摹手掌 / 填 cm）。" />
+                            <StackPanel x:Name="AspectCustomPanel" Orientation="Horizontal" Margin="16,6,0,0"
+                                        Visibility="Collapsed">
                                 <TextBox x:Name="AspectWInput" Width="52" Text="9" TextChanged="OnAspectTextChanged"
                                          VerticalContentAlignment="Center" />
                                 <TextBlock Text=" : " VerticalAlignment="Center" />
                                 <TextBox x:Name="AspectHInput" Width="52" Text="14" TextChanged="OnAspectTextChanged"
                                          VerticalContentAlignment="Center" />
-                                <TextBlock Text="（W : H；矩形与椭圆都按它画。矩形默认 9:14，椭圆默认 1:1）" VerticalAlignment="Center"
-                                           Foreground="#FF888888" FontSize="11" Margin="6,0,0,0" />
+                                <TextBlock Text="（W : H）" VerticalAlignment="Center" Foreground="#FF888888"
+                                           FontSize="11" Margin="6,0,0,0" />
                             </StackPanel>
-                            <TextBlock Text="宽高换算（只改形状，不改面积）" Foreground="#FF444444" Margin="0,8,0,0" />
-                            <ComboBox x:Name="SizeScaleCombo" SelectedIndex="0" Margin="0,2,0,0"
-                                      SelectionChanged="OnSizeScaleChanged">
-                                <ComboBoxItem Content="归一 —— 按屏幕拉伸（宽→屏宽、高→屏高）" />
-                                <ComboBoxItem Content="不归一 —— 1:1（两轴同比例，圆就是圆）" />
-                            </ComboBox>
-                            <TextBlock Text="手掌像素面积取法（三选一）" Foreground="#FF444444" Margin="0,8,0,0" />
-                            <RadioButton x:Name="FormulaRect" Content="a1×a2（矩形，默认）" GroupName="Formula"
-                                         IsChecked="True" Checked="OnFormulaChanged" />
-                            <RadioButton x:Name="FormulaEllipse" Content="π/4×a1×a2（椭圆）" GroupName="Formula"
-                                         Margin="0,2,0,0" Checked="OnFormulaChanged" />
-                            <RadioButton x:Name="FormulaTrace" Content="a3（描摹凹面积）" GroupName="Formula"
-                                         Margin="0,2,0,0" Checked="OnFormulaChanged" />
+                            <StackPanel x:Name="SizeScalePanel" Margin="0,6,0,0">
+                                <TextBlock Text="触摸比例（只在「跟随触摸尺寸」时生效）" Foreground="#FF444444" />
+                                <ComboBox x:Name="SizeScaleCombo" SelectedIndex="0" Margin="0,2,0,0"
+                                          SelectionChanged="OnSizeScaleChanged">
+                                    <ComboBoxItem Content="归一（按屏幕拉伸）" />
+                                    <ComboBoxItem Content="不归一（1:1）" />
+                                </ComboBox>
+                            </StackPanel>
                         </StackPanel>
                     </GroupBox>
 
-                    <CheckBox x:Name="FollowSizeCheck" Content="手掌擦启用触摸尺寸跟随（按多大擦多大）" IsChecked="True"
-                              Margin="0,10,0,0" Checked="OnFollowSizeChanged" Unchecked="OnFollowSizeChanged" />
-                    <TextBlock Text="开启：擦除区随接触尺寸变（接触面积 × K）。关闭：固定为「手掌面积 × K 倍率」。注意：若下面「手掌擦 · 压感」还开着，按压轻重会在此基础上再放大。"
-                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
+                    <!-- 通用 -->
+                    <CheckBox x:Name="SmoothJitterCheck" Content="平滑抖动（防闪）" IsChecked="True"
+                              Margin="0,10,0,0" Checked="OnSmoothJitterChanged" Unchecked="OnSmoothJitterChanged" />
 
-                    <CheckBox x:Name="PalmFloorCheck" Content="手掌下限（判为手掌擦后不小于手掌面积）" IsChecked="True"
-                              Margin="0,8,0,0" Checked="OnPalmFloorChanged" Unchecked="OnPalmFloorChanged" />
-                    <TextBlock Text="开启：擦除区不小于「手掌面积 × K 倍率」（可等于、可放大、不能缩小）—— 因为你的手掌接触尺寸本来就在标定值附近，开了它「随尺寸」就看不出变化。想看到真正的随尺寸缩放，把它关掉。"
-                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
-
-                    <CheckBox x:Name="SmoothJitterCheck" Content="平滑抖动（压感/尺寸微动不改变擦除区）" IsChecked="True"
-                              Margin="0,8,0,0" Checked="OnSmoothJitterChanged" Unchecked="OnSmoothJitterChanged" />
-                    <TextBlock Text="对压感做指数平滑、并对擦除区尺寸加 1.5% 死区：轻微抖动不再让擦除区一直闪。关掉则完全跟手（会闪）。"
-                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
-
-                    <CheckBox x:Name="LockPalmSizeCheck" Content="禁止手掌擦缩小（擦时只增不减）" IsChecked="False"
-                              Margin="0,8,0,0" Checked="OnLockPalmSizeChanged" Unchecked="OnLockPalmSizeChanged" />
-                    <TextBlock Text="勾上后：同一次按压内擦除区只增不减；且一旦判为手掌擦，面积掉到阈值以下也保持手掌擦，直到抬手。"
-                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
-
-                    <CheckBox x:Name="AreaThresholdCheck" Content="启用面积阈值控制 擦/写" IsChecked="True"
-                              Margin="0,8,0,0" Checked="OnAreaThresholdCheckChanged" Unchecked="OnAreaThresholdCheckChanged" />
-                    <TextBlock Text="关闭则一律按手掌擦（不再区分书写）。"
-                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
-
-                    <CheckBox x:Name="WritingFollowSizeCheck" Content="书写也随触摸尺寸" IsChecked="False"
-                              Margin="0,8,0,0" Checked="OnWritingFollowSizeChanged" Unchecked="OnWritingFollowSizeChanged" />
-                    <TextBlock Text="勾上后：书写点大小 = 基准 14px × 压感倍数 × √(接触面积 ÷ 手掌按压面积)；关闭则只随压感。"
-                               TextWrapping="Wrap" FontSize="11" Foreground="#FF888888" Margin="12,2,0,0" />
-
+                    <!-- 状态 -->
                     <TextBlock x:Name="PressureInfoText" Margin="0,10,0,0" FontFamily="Consolas" FontSize="11"
                                Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="压感：—" />
-                    <TextBlock x:Name="JudgeText" Margin="0,8,0,0" FontFamily="Consolas" FontSize="12"
+                    <TextBlock x:Name="JudgeText" Margin="0,6,0,0" FontFamily="Consolas" FontSize="12"
                                Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="判定：—" />
-                    <Button Content="清除预览" Margin="0,10,0,0" Padding="4,3" Click="OnClearPreview" />
-
-                    <TextBlock x:Name="EraserInfoText" Margin="0,12,0,0" TextWrapping="Wrap" FontFamily="Consolas"
-                               Foreground="#FF0A5A9A"
-                               Text="在本页用真触摸屏按一下手掌，这里会实时显示接触面积与乘 K 后的擦除区。&#x0a;按住不放、改变按压轻重或手的角度，面积也会实时刷新（不抬手也变，取决于驱动是否上报）。" />
+                    <Button Content="清除预览" Margin="0,10,0,0" Padding="4,3" HorizontalAlignment="Left"
+                            Click="OnClearPreview" />
+                    <TextBlock x:Name="EraserInfoText" Margin="0,10,0,0" TextWrapping="Wrap" FontFamily="Consolas"
+                               Foreground="#FF0A5A9A" Text="—" />
                 </StackPanel>
             </ScrollViewer>
         </Border>

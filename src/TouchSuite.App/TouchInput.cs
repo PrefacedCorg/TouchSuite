@@ -64,6 +64,12 @@ public sealed class TouchInput : IDisposable
     public double MmPerDiuX { get; set; }
     public double MmPerDiuY { get; set; }
 
+    /// <summary>（诊断探针用）最近一次 WPF 触摸接触框（DIP）——拿来和原始HID 同刻对照。无则 null。</summary>
+    public Rect? LastWpfBounds { get; private set; }
+
+    /// <summary>（诊断探针用）最近一次 Stylus 压感。</summary>
+    public double? LastStylusPressure => _lastStylusPressure;
+
     private bool _disposed;
 
     /// <summary>诊断节拍：每秒打印一次 Stylus 通道计数。</summary>
@@ -149,6 +155,12 @@ public sealed class TouchInput : IDisposable
         string detail = touches.Count > 1
             ? $"{touches.Count} 指: {string.Join("，", list.Select(c => $"#{c.Id} {Precision.Fmt(c.WMm)}×{Precision.Fmt(c.HMm)} mm"))}"
             : $"Bounds {Precision.Fmt(onlyRect.Width, 3)}×{Precision.Fmt(onlyRect.Height, 3)} DIP → {Precision.Fmt(onlyW)}×{Precision.Fmt(onlyH)} mm";
+
+        // 记最大那根，供「通道对照」探针
+        LastWpfBounds = list.Where(c => c.DiuRect is not null)
+            .OrderByDescending(c => c.DiuRect!.Value.Width * c.DiuRect!.Value.Height)
+            .Select(c => c.DiuRect)
+            .FirstOrDefault();
 
         Sample?.Invoke(new TouchSample("WPF",
             touches.Count == 1 ? onlyW : null, touches.Count == 1 ? onlyH : null,

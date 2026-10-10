@@ -68,6 +68,11 @@ public static class Log
     public static void Warn(string message) => Write("WARN", message);
     public static void Error(string message) => Write("ERROR", message);
 
+    // 带异常的重载：把类型 / 消息 / 堆栈 / InnerException 一并写进日志（ex.ToString() 自带堆栈）。
+    public static void Warn(string message, Exception ex) => Write("WARN", $"{message}: {ex}");
+    public static void Error(string message, Exception ex) => Write("ERROR", $"{message}: {ex}");
+    public static void Error(Exception ex) => Write("ERROR", ex.ToString());
+
     public static void Flush()
     {
         lock (Gate)

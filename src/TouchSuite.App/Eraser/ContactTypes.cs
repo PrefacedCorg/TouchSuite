@@ -26,56 +26,51 @@ public enum EraserShape { Rectangle, Circle }
 /// 屏幕不是 16:9 时正圆会被拉成椭圆（倍数 = ResX/ResY）。</para>
 /// <para>Isotropic（不归一）= 两轴用同一因子（1:1），正圆就是正圆。</para>
 /// 两种方式的"面积因子"相同（f·f = f_w·f_h），所以切换只改形状、不改面积，K/阈值无需重标。
+/// 面积另由 <see cref="HidScale.AreaFactor"/> 显式给出（各向同性），与这里的选择完全无关。
 /// </summary>
 public enum HidSizeScale { Stretch, Isotropic }
 
-/// <summary>长宽比来源：跟随触摸尺寸（接触框 w/h）/ 自定义（W:H 输入框；1:1 就是正圆）。</summary>
-public enum AspectSource { Contact, Custom }
+/// <summary>长宽比来源：跟随触摸尺寸（接触框 w/h）/ 手掌描摹（手掌宽高比）/ 自定义（W:H 输入框）。</summary>
+public enum AspectSource { Contact, Trace, Custom }
 
-/// <summary>手掌像素面积（K 的分子）取值方式 —— 末页三选一。</summary>
-public enum AreaFormula
+/// <summary>随触摸尺寸时，擦除区大小相对「手掌标定面积」的限制方式。</summary>
+public enum PalmLimit
 {
-    /// <summary>a1×a2（矩形，默认）。</summary>
-    Rect,
-    /// <summary>π/4×a1×a2（椭圆）。</summary>
-    Ellipse,
-    /// <summary>a3（描摹凹面积）。</summary>
-    Trace,
+    /// <summary>不限：擦除区 = 接触面积 × K（可小可大）。</summary>
+    None,
+    /// <summary>下限：不小于手掌标定面积（只增不减）。</summary>
+    Floor,
+    /// <summary>上限：不超过手掌标定面积（只减不增）。</summary>
+    Cap,
 }
 
 public static class SourceNames
 {
     public static string Of(ContactSource s) => s switch
     {
-        ContactSource.RawHid => "原始HID（设备上报）",
-        ContactSource.Wpf => "WPF（系统接触框）",
+        ContactSource.RawHid => "原始HID",
+        ContactSource.Wpf => "软件WPF",
         _ => "无",
     };
 
     public static string OfMode(SourceMode m) => m switch
     {
-        SourceMode.RawHid => "原始HID（设备上报尺寸）",
-        SourceMode.SoftwareWpf => "软件WPF（系统接触框 + 软件推算）",
-        _ => "自适应（自动锁定）",
+        SourceMode.RawHid => "原始HID",
+        SourceMode.SoftwareWpf => "软件WPF",
+        _ => "自适应",
     };
 
     public static string OfAspect(AspectSource a) => a switch
     {
         AspectSource.Custom => "自定义",
-        _ => "跟随触摸尺寸",
+        AspectSource.Trace => "手掌描摹",
+        _ => "跟随触摸",
     };
 
     public static string OfSizeScale(HidSizeScale s) => s switch
     {
-        HidSizeScale.Isotropic => "不归一 —— 1:1（两轴同比例，圆就是圆）",
-        _ => "归一 —— 按屏幕拉伸（宽→屏宽、高→屏高）",
-    };
-
-    public static string OfFormula(AreaFormula f) => f switch
-    {
-        AreaFormula.Ellipse => "π/4×a1×a2（椭圆）",
-        AreaFormula.Trace => "a3（描摹凹面积）",
-        _ => "a1×a2（矩形）",
+        HidSizeScale.Isotropic => "不归一 1:1",
+        _ => "归一 按屏幕拉伸",
     };
 }
 
@@ -104,6 +99,15 @@ public static class HidScale
         return (fw, fh);
     }
 
+    /// <summary>两轴共用的「面积因子」（= 不归一/各向同性面积，最贴近设备实测）：= fw·fh。
+    /// 接触面积 = 宽计数 × 高计数 × 此因子，**固定用它**；切换形状比例不改它，所以 K/阈值无需重标。</summary>
+    public static double AreaFactor(int wLogMax, int hLogMax, int resX, int resY)
+    {
+        if (wLogMax <= 0 || hLogMax <= 0 || resX <= 0 || resY <= 0)
+            return 0;
+        return (resX / (double)wLogMax) * (resY / (double)hLogMax);
+    }
+
     /// <summary>接触宽高（物理像素）。stretch 见 <see cref="HidSizeScale"/>。</summary>
     public static (double? W, double? H) ContactPx(TouchSample s, int resX, int resY, HidSizeScale scale)
     {
@@ -117,15 +121,33 @@ public static class HidScale
 /// <summary>把一次触摸样本换算成物理像素（RawHID 走 <see cref="HidScale"/>，WPF 走 DIP × DPI 缩放）。</summary>
 public static class SamplePx
 {
-    /// <summary>样本的接触面积（px²）：RawHID = 宽×高（px）；WPF = 分指接触框面积之和。
-    /// 面积与 <see cref="HidSizeScale"/> 无关（面积因子恒等），只是为了统一签名传进来。</summary>
-    public static double? AreaPx2(TouchSample s, int resX, int resY, HidSizeScale scale,
-        double pxPerDiuX, double pxPerDiuY)
+    /// <summary>样本的接触面积（px²）：RawHID = 宽计数 × 高计数 × 面积因子（各向同性，与形状比例无关）；
+    /// WPF = 分指接触框面积之和。<paramref name="sumRawContacts"/> 为真且样本带分指列表时，RawHID 也按各接触求和。</summary>
+    public static double? AreaPx2(TouchSample s, int resX, int resY,
+        double pxPerDiuX, double pxPerDiuY, bool sumRawContacts = true)
     {
         if (s.Source == "RawHID")
         {
-            (double? w, double? h) = HidScale.ContactPx(s, resX, resY, scale);
-            return w is double wv && h is double hv ? wv * hv : null;
+            double af = HidScale.AreaFactor(s.WidthLogMax, s.HeightLogMax, resX, resY);
+            if (af <= 0)
+                return null;
+
+            if (sumRawContacts && s.Contacts is { Count: > 0 } rawList)
+            {
+                double sumRaw = 0;
+                bool anyRaw = false;
+                foreach (ContactRect c in rawList)
+                    if (c.WLogical > 0 && c.HLogical > 0)
+                    {
+                        sumRaw += (double)c.WLogical * c.HLogical * af;
+                        anyRaw = true;
+                    }
+                return anyRaw ? sumRaw : null;
+            }
+
+            if (s.WidthLogical <= 0 || s.HeightLogical <= 0)
+                return null;
+            return s.WidthLogical * s.HeightLogical * af;
         }
 
         if (s.Contacts is { Count: > 0 } list)
@@ -177,23 +199,23 @@ public static class SamplePx
 
 /// <summary>预览页当前设置的快照（保存进 calibration.json；载入时原样灌回）。</summary>
 public sealed record EraserSettings(
-    bool FollowSize, bool LockPalmSize, bool SmoothJitter, bool PalmFloorEnabled,
+    bool FollowSize, bool LockPalmSize, bool SmoothJitter, PalmLimit SizeLimit,
     bool PalmPressureEnabled, bool AreaThresholdEnabled,
     bool WritingUsesPressure, bool WritingFollowSize,
     double KTrim, double AreaThresholdPx2,
     double PalmPressureThreshold, double PalmNormMax,
     double WritingPressureThreshold, double WritingNormMax,
     EraserShape Shape, AspectSource Aspect, double CustomAspectW, double CustomAspectH,
-    AreaFormula Formula, HidSizeScale SizeScale)
+    HidSizeScale SizeScale, bool MultiTouchAsPalm)
 {
     /// <summary>设置齐全的默认值（引擎未标定/未载入时用）。</summary>
     public static EraserSettings Default { get; } = new(
-        FollowSize: true, LockPalmSize: false, SmoothJitter: true, PalmFloorEnabled: true,
+        FollowSize: true, LockPalmSize: false, SmoothJitter: true, SizeLimit: PalmLimit.Floor,
         PalmPressureEnabled: true, AreaThresholdEnabled: true,
         WritingUsesPressure: true, WritingFollowSize: false,
         KTrim: 1.0, AreaThresholdPx2: 0,
         PalmPressureThreshold: 0.5, PalmNormMax: 2,
         WritingPressureThreshold: 0.5, WritingNormMax: 2,
         Shape: EraserShape.Rectangle, Aspect: AspectSource.Contact, CustomAspectW: 1, CustomAspectH: 1,
-        Formula: AreaFormula.Rect, SizeScale: HidSizeScale.Stretch);
+        SizeScale: HidSizeScale.Stretch, MultiTouchAsPalm: true);
 }

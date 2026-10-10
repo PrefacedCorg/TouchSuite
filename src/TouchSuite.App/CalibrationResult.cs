@@ -27,9 +27,7 @@ public sealed class CalibrationResult
     // ---- 手掌尺寸（描摹自动填 / 右侧手填；物理像素）----
     public double PalmWidthPx { get; set; }        // a2 宽（横向）
     public double PalmHeightPx { get; set; }       // a1 高（纵向）
-    public double PalmTraceAreaPx2 { get; set; }   // a3 描摹凹面积（沿外轮廓一笔描一圈围出的面积）
-    public string PalmAreaFormula { get; set; } = "Rect";   // Rect / Ellipse / Trace 三选一
-    public double PalmAreaPx2 { get; set; }        // 手掌像素面积 = 三选一公式的结果（K 的分子）
+    public double PalmAreaPx2 { get; set; }        // 手掌像素面积 = a1×a2（K 的分子）
 
     // ---- 按压实测（物理像素面积 + 压感 0~1）----
     public double? PalmContactAreaPx2 { get; set; }      // b1×b2 手掌按压时系统上报的尺寸乘积
@@ -53,7 +51,9 @@ public sealed class CalibrationResult
     public bool? FollowSize { get; set; }                 // 手掌擦随触摸尺寸（按多大擦多大）
     public bool? LockPalmSize { get; set; }               // 禁止手掌擦缩小（擦时只增不减）
     public bool? SmoothJitter { get; set; }               // 平滑抖动（压感/尺寸微动不改擦除区）
-    public bool? PalmFloorEnabled { get; set; }            // 手掌下限（判为手掌擦后不小于手掌面积）
+    public bool? MultiTouchAsPalm { get; set; }           // 多触点求和（多点识别为手掌擦）
+    public string? PalmLimit { get; set; }                 // 随尺寸时的限制：None / Floor / Cap
+    public bool? PalmFloorEnabled { get; set; }            // 旧字段（仅兼容读取）：true=下限、false=不限
     public bool? AreaThresholdEnabled { get; set; }       // 启用面积阈值判 擦/写
     public bool? WritingFollowSize { get; set; }          // 书写也随触摸尺寸
     public string? EraserShape { get; set; }              // Rectangle / Circle（椭圆）

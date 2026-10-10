@@ -7,7 +7,7 @@ using System.Windows.Threading;
 namespace TouchSuite.App.Eraser;
 
 /// <summary>
-/// 「面积擦预览」页 —— 预览区 + 全部参数（6 滑块 + 2 压感开关 + 形状/长宽比/面积公式），
+/// 「面积擦预览」页 —— 预览区 + 全部参数（6 滑块 + 2 压感开关 + 形状/长宽比），
 /// 逻辑都在 <see cref="EraserEngine"/> 里，这里只负责摆放、绘制与把触摸样本喂给引擎。
 /// 尺寸单位全程用**物理像素 px**（DIU 只在绘制时换算）。
 /// </summary>
@@ -20,9 +20,6 @@ public partial class EraserPreviewPage : UserControl
 
     /// <summary>点「保存结果到文件」时触发（由宿主窗口负责落盘与结果组装）。</summary>
     public event Action? SaveRequested;
-
-    /// <summary>影响标定结果的设置变化（如手掌面积公式三选一）→ 宿主重算 K 与信息栏。</summary>
-    public event Action? SettingsChanged;
 
     /// <summary>保存结果提示（显示在本页按钮下方）。</summary>
     public string SavePathNotice
@@ -60,16 +57,17 @@ public partial class EraserPreviewPage : UserControl
         Engine.FollowSize = FollowSizeCheck.IsChecked == true;
         Engine.LockPalmSize = LockPalmSizeCheck.IsChecked == true;
         Engine.SmoothJitter = SmoothJitterCheck.IsChecked == true;
-        Engine.PalmFloorEnabled = PalmFloorCheck.IsChecked == true;
+        Engine.MultiTouchAsPalm = MultiTouchPalmCheck.IsChecked == true;
+        Engine.SizeLimit = CurrentPalmLimit();
         Engine.PalmPressureEnabled = PalmPressureCheck.IsChecked == true;
         Engine.AreaThresholdEnabled = AreaThresholdCheck.IsChecked == true;
         Engine.WritingUsesPressure = WritingPressureCheck.IsChecked == true;
         Engine.WritingFollowSize = WritingFollowSizeCheck.IsChecked == true;
         Engine.Shape = ShapeCircle.IsChecked == true ? EraserShape.Circle : EraserShape.Rectangle;
-        Engine.Aspect = AspectCustom.IsChecked == true ? AspectSource.Custom : AspectSource.Contact;
+        Engine.Aspect = AspectCustom.IsChecked == true ? AspectSource.Custom
+            : AspectTrace.IsChecked == true ? AspectSource.Trace
+            : AspectSource.Contact;
         Engine.SetSizeScale(SizeScaleCombo.SelectedIndex == 1 ? HidSizeScale.Isotropic : HidSizeScale.Stretch);
-        Engine.Formula = FormulaTrace.IsChecked == true ? AreaFormula.Trace
-            : FormulaEllipse.IsChecked == true ? AreaFormula.Ellipse : AreaFormula.Rect;
         Engine.KTrim = KTrimSlider.Value;
         Engine.PalmPressureThreshold = PalmThrSlider.Value;
         Engine.PalmNormMax = PalmMaxSlider.Value;
@@ -84,10 +82,9 @@ public partial class EraserPreviewPage : UserControl
 
     /// <summary>
     /// 把标定值喂给引擎（全部物理像素）。可重复调用：滑块只在"用户没动过"时才跟随新默认值。
-    /// 手掌面积公式（三选一）由本页单选决定，不在这里覆盖。
     /// </summary>
     public void Setup(double pxPerDiuX, double pxPerDiuY,
-        double palmWidthPx, double palmHeightPx, double palmTraceAreaPx2,
+        double palmWidthPx, double palmHeightPx,
         double palmContactAreaPx2, double fingerContactAreaPx2,
         double? palmPressure, double? fingerPressure,
         int resX, int resY)
@@ -96,7 +93,6 @@ public partial class EraserPreviewPage : UserControl
         Engine.PxPerDiuY = pxPerDiuY > 0 ? pxPerDiuY : 1;
         Engine.PalmWidthPx = palmWidthPx;
         Engine.PalmHeightPx = palmHeightPx;
-        Engine.PalmTraceAreaPx2 = palmTraceAreaPx2;
         Engine.PalmContactAreaPx2 = palmContactAreaPx2;
         Engine.FingerContactAreaPx2 = fingerContactAreaPx2;
         _resX = resX;
@@ -136,6 +132,7 @@ public partial class EraserPreviewPage : UserControl
         Engine.PalmPressureThreshold = PalmThrSlider.Value;
         Engine.WritingPressureThreshold = WritingThrSlider.Value;
 
+        SyncEnableStates();
         UpdateValueTexts();
         Redraw();
     }
@@ -160,7 +157,12 @@ public partial class EraserPreviewPage : UserControl
         if (r.FollowSize is bool fs) FollowSizeCheck.IsChecked = fs;
         if (r.LockPalmSize is bool lp) LockPalmSizeCheck.IsChecked = lp;
         if (r.SmoothJitter is bool sj) SmoothJitterCheck.IsChecked = sj;
-        if (r.PalmFloorEnabled is bool pf) PalmFloorCheck.IsChecked = pf;
+        if (r.MultiTouchAsPalm is bool mt) MultiTouchPalmCheck.IsChecked = mt;
+        PalmLimit limit;
+        if (!string.IsNullOrEmpty(r.PalmLimit) && Enum.TryParse(r.PalmLimit, out PalmLimit pl)) limit = pl;
+        else if (r.PalmFloorEnabled is bool pf) limit = pf ? PalmLimit.Floor : PalmLimit.None;
+        else limit = PalmLimit.Floor;
+        SetPalmLimitRadios(limit);
         if (r.AreaThresholdEnabled is bool at) AreaThresholdCheck.IsChecked = at;
         if (r.WritingFollowSize is bool wf) WritingFollowSizeCheck.IsChecked = wf;
         if (r.PalmPressureEnabled is bool pp) PalmPressureCheck.IsChecked = pp;
@@ -180,17 +182,11 @@ public partial class EraserPreviewPage : UserControl
             ShapeCircle.IsChecked = circle;
             ShapeRect.IsChecked = !circle;
         }
-        if (r.PalmAreaFormula is not null)
-            SetFormulaRadio(r.PalmAreaFormula switch
-            {
-                "Ellipse" => AreaFormula.Ellipse,
-                "Trace" => AreaFormula.Trace,
-                _ => AreaFormula.Rect,
-            });
         if (r.AspectSource is not null)
         {
             AspectCustom.IsChecked = r.AspectSource == "Custom";
-            AspectContact.IsChecked = r.AspectSource != "Custom";
+            AspectTrace.IsChecked = r.AspectSource == "Trace";
+            AspectContact.IsChecked = r.AspectSource != "Custom" && r.AspectSource != "Trace";
         }
         if (r.AspectW is double aw && aw > 0) AspectWInput.Text = aw.ToString("0.###");
         if (r.AspectH is double ah && ah > 0) AspectHInput.Text = ah.ToString("0.###");
@@ -217,13 +213,13 @@ public partial class EraserPreviewPage : UserControl
             double.TryParse(AspectWInput.Text.Trim(), out double aw);
             double.TryParse(AspectHInput.Text.Trim(), out double ah);
             return new EraserSettings(
-                Engine.FollowSize, Engine.LockPalmSize, Engine.SmoothJitter, Engine.PalmFloorEnabled,
+                Engine.FollowSize, Engine.LockPalmSize, Engine.SmoothJitter, Engine.SizeLimit,
                 Engine.PalmPressureEnabled, Engine.AreaThresholdEnabled,
                 Engine.WritingUsesPressure, Engine.WritingFollowSize,
                 Engine.KTrim, Engine.AreaThresholdPx2,
                 Engine.PalmPressureThreshold, Engine.PalmNormMax,
                 Engine.WritingPressureThreshold, Engine.WritingNormMax,
-                Engine.Shape, Engine.Aspect, aw, ah, Engine.Formula, Engine.SizeScale);
+                Engine.Shape, Engine.Aspect, aw, ah, Engine.SizeScale, Engine.MultiTouchAsPalm);
         }
     }
 
@@ -411,6 +407,28 @@ public partial class EraserPreviewPage : UserControl
         if (wPx is not double w || hPx is not double h || !(w > 0) || !(h > 0))
             return;
 
+        // 多触点求和（≥2 接触）且开关打开 → 整帧当一块手掌：面积取各接触之和，判手掌擦
+        bool multi = false;
+        if (Engine.MultiTouchAsPalm && s.Contacts is { Count: >= 2 } rc)
+        {
+            double af = HidScale.AreaFactor(s.WidthLogMax, s.HeightLogMax, _resX, _resY);
+            double sum = 0;
+            bool any = false;
+            foreach (ContactRect c in rc)
+                if (c.WLogical > 0 && c.HLogical > 0)
+                {
+                    sum += c.WLogical * (double)c.HLogical * af;
+                    any = true;
+                }
+            if (any && sum > 0)
+            {
+                double side = Math.Sqrt(sum);
+                w = side;
+                h = side;
+                multi = true;
+            }
+        }
+
         double sx = Engine.PxPerDiuX > 0 ? Engine.PxPerDiuX : 1;
         double sy = Engine.PxPerDiuY > 0 ? Engine.PxPerDiuY : 1;
 
@@ -439,9 +457,11 @@ public partial class EraserPreviewPage : UserControl
         Engine.Submit(ContactSource.RawHid, 0,
             new Rect(cx - w / 2, cy - h / 2, w, h),
             applyThreshold: false,
-            detail: $"HID 计数 {s.WidthLogical}/{s.WidthLogMax}、{s.HeightLogical}/{s.HeightLogMax}"
+            detail: multi
+                ? $"多触点求和 {s.Contacts!.Count} 指 → {Precision.Fmt(w * h, 0)} px²（判手掌擦）"
+                : $"HID 计数 {s.WidthLogical}/{s.WidthLogMax}、{s.HeightLogical}/{s.HeightLogMax}"
                   + $" ÷ 量程 × 分辨率({_resX}×{_resY}) = {Precision.Fmt(w)}×{Precision.Fmt(h)} px = {Precision.Fmt(w * h, 0)} px²",
-            deviceKey: s.DeviceKey);
+            deviceKey: s.DeviceKey, multiPalm: multi);
     }
 
     // ================= 参数控件 =================
@@ -458,16 +478,51 @@ public partial class EraserPreviewPage : UserControl
             : "—（待标定）";
     }
 
-    /// <summary>压感开关关掉后，对应的两个滑块灰掉不可点。</summary>
+    /// <summary>按勾选/选择同步控件：开关关掉就隐藏其内部的滑块；不相关的区块一并隐藏。
+    /// - 未勾「压感」→ 隐藏其阈值/max 滑块；未勾「书写压感」→ 隐藏书写压感滑块；
+    /// - 未启用「面积阈值」→ 隐藏阈值滑块 + 整个「书写」区块（永不书写）；
+    /// - 未「随触摸尺寸」→ 隐藏「手掌下限」；
+    /// - 长宽比未选「自定义」→ 收起 W:H 输入；选了「自定义」→ 「触摸比例」失效，收起它。</summary>
     private void SyncEnableStates()
     {
-        bool palmOn = PalmPressureCheck.IsChecked == true;
-        PalmThrSlider.IsEnabled = palmOn;
-        PalmMaxSlider.IsEnabled = palmOn;
-        bool writeOn = WritingPressureCheck.IsChecked == true;
-        WritingThrSlider.IsEnabled = writeOn;
-        WritingMaxSlider.IsEnabled = writeOn;
+        bool palmOn = PalmPressureCheck?.IsChecked == true;
+        bool writeOn = WritingPressureCheck?.IsChecked == true;
+        bool areaThrOn = AreaThresholdCheck?.IsChecked == true;
+        bool followSize = FollowSizeCheck?.IsChecked == true;
+        bool aspectCustom = AspectCustom?.IsChecked == true;
+        bool aspectContact = AspectContact?.IsChecked == true;
+
+        if (PalmThrSlider is not null) PalmThrSlider.IsEnabled = palmOn;
+        if (PalmMaxSlider is not null) PalmMaxSlider.IsEnabled = palmOn;
+        if (PalmPressureDetailPanel is not null) PalmPressureDetailPanel.Visibility = Vis(palmOn);
+
+        if (WritingThrSlider is not null) WritingThrSlider.IsEnabled = writeOn;
+        if (WritingMaxSlider is not null) WritingMaxSlider.IsEnabled = writeOn;
+        if (WritingPressureDetailPanel is not null) WritingPressureDetailPanel.Visibility = Vis(writeOn);
+
+        if (AreaThresholdDetailPanel is not null) AreaThresholdDetailPanel.Visibility = Vis(areaThrOn);
+        if (WritingSection is not null) WritingSection.Visibility = Vis(areaThrOn);
+
+        if (PalmLimitPanel is not null) PalmLimitPanel.Visibility = Vis(followSize);
+
+        if (AspectCustomPanel is not null) AspectCustomPanel.Visibility = Vis(aspectCustom);
+        if (SizeScalePanel is not null) SizeScalePanel.Visibility = Vis(aspectContact);
+
+        // 「手掌描摹」需要手掌尺寸；没有就灰掉并退回「跟随触摸尺寸」
+        bool palmKnown = Engine.PalmWidthPx > 0 && Engine.PalmHeightPx > 0;
+        if (AspectTrace is not null)
+        {
+            AspectTrace.IsEnabled = palmKnown;
+            if (!palmKnown && AspectTrace.IsChecked == true && AspectContact is not null)
+            {
+                AspectContact.IsChecked = true;
+                Engine.Aspect = AspectSource.Contact;
+            }
+        }
+        if (AspectTraceHint is not null) AspectTraceHint.Visibility = Vis(!palmKnown);
     }
+
+    private static Visibility Vis(bool on) => on ? Visibility.Visible : Visibility.Collapsed;
 
     private void OnKTrimChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
@@ -606,10 +661,6 @@ public partial class EraserPreviewPage : UserControl
             return;
         Engine.Shape = ShapeCircle.IsChecked == true ? EraserShape.Circle : EraserShape.Rectangle;
 
-        // 一般默认：矩形用 a1×a2、椭圆用 π/4×a1×a2；用户自己选了 a3 就不再联动
-        if (Engine.Formula != AreaFormula.Trace)
-            SetFormulaRadio(Engine.Shape == EraserShape.Rectangle ? AreaFormula.Rect : AreaFormula.Ellipse);
-
         // 自定义长宽比也按形状给默认：矩形 9:14、椭圆 1:1
         SetAspectDefault(Engine.Shape);
 
@@ -627,31 +678,15 @@ public partial class EraserPreviewPage : UserControl
         ParseAspect();
     }
 
-    private void SetFormulaRadio(AreaFormula f)
-    {
-        bool trace = f == AreaFormula.Trace;
-        bool ellipse = f == AreaFormula.Ellipse;
-        FormulaRect.IsChecked = !trace && !ellipse;
-        FormulaEllipse.IsChecked = ellipse;
-        FormulaTrace.IsChecked = trace;
-    }
-
-    private void OnFormulaChanged(object sender, RoutedEventArgs e)
-    {
-        if (FormulaTrace is null)
-            return;
-        Engine.Formula = FormulaTrace.IsChecked == true ? AreaFormula.Trace
-            : FormulaEllipse.IsChecked == true ? AreaFormula.Ellipse : AreaFormula.Rect;
-        SettingsChanged?.Invoke();
-        Engine.NotifyChanged();
-    }
-
     private void OnAspectChanged(object sender, RoutedEventArgs e)
     {
-        if (AspectCustom is null)
+        if (AspectCustom is null || AspectTrace is null || AspectContact is null)
             return;
-        Engine.Aspect = AspectCustom.IsChecked == true ? AspectSource.Custom : AspectSource.Contact;
+        Engine.Aspect = AspectCustom.IsChecked == true ? AspectSource.Custom
+            : AspectTrace.IsChecked == true ? AspectSource.Trace
+            : AspectSource.Contact;
         ParseAspect();
+        SyncEnableStates();
         Engine.NotifyChanged();
     }
 
@@ -686,6 +721,7 @@ public partial class EraserPreviewPage : UserControl
         if (FollowSizeCheck is null)
             return;
         Engine.FollowSize = FollowSizeCheck.IsChecked == true;
+        SyncEnableStates();
         Engine.NotifyChanged();
     }
 
@@ -705,12 +741,36 @@ public partial class EraserPreviewPage : UserControl
         Engine.NotifyChanged();
     }
 
-    private void OnPalmFloorChanged(object sender, RoutedEventArgs e)
+    private void OnMultiTouchPalmChanged(object sender, RoutedEventArgs e)
     {
-        if (PalmFloorCheck is null)
+        if (MultiTouchPalmCheck is null)
             return;
-        Engine.PalmFloorEnabled = PalmFloorCheck.IsChecked == true;
+        Engine.MultiTouchAsPalm = MultiTouchPalmCheck.IsChecked == true;
         Engine.NotifyChanged();
+    }
+
+    /// <summary>「限制」三选一：不限 / 下限 / 上限。</summary>
+    private void OnPalmLimitChanged(object sender, RoutedEventArgs e)
+    {
+        if (PalmLimitFloor is null)
+            return;
+        Engine.SizeLimit = CurrentPalmLimit();
+        Engine.NotifyChanged();
+    }
+
+    /// <summary>读当前选中的限制方式（XAML 解析期控件可能未就绪 → 默认下限；全程 null 安全）。</summary>
+    private PalmLimit CurrentPalmLimit()
+        => PalmLimitCap?.IsChecked == true ? PalmLimit.Cap
+         : PalmLimitNone?.IsChecked == true ? PalmLimit.None
+         : PalmLimit.Floor;
+
+    private void SetPalmLimitRadios(PalmLimit limit)
+    {
+        if (PalmLimitFloor is null)
+            return;
+        PalmLimitNone.IsChecked = limit == PalmLimit.None;
+        PalmLimitFloor.IsChecked = limit == PalmLimit.Floor;
+        PalmLimitCap.IsChecked = limit == PalmLimit.Cap;
     }
 
     private void OnAreaThresholdCheckChanged(object sender, RoutedEventArgs e)
@@ -718,6 +778,7 @@ public partial class EraserPreviewPage : UserControl
         if (AreaThresholdCheck is null)
             return;
         Engine.AreaThresholdEnabled = AreaThresholdCheck.IsChecked == true;
+        SyncEnableStates();
         Engine.NotifyChanged();
     }
 
@@ -763,7 +824,7 @@ public partial class EraserPreviewPage : UserControl
         else
             sb.Append("压感: 无\n");
 
-        double? areaPx2 = SamplePx.AreaPx2(s, _resX, _resY, Engine.SizeScale, Engine.PxPerDiuX, Engine.PxPerDiuY);
+        double? areaPx2 = SamplePx.AreaPx2(s, _resX, _resY, Engine.PxPerDiuX, Engine.PxPerDiuY, Engine.MultiTouchAsPalm);
         (double W, double H)? size = SamplePx.SizePx(s, _resX, _resY, Engine.SizeScale, Engine.PxPerDiuX, Engine.PxPerDiuY);
         if (size is not null)
             sb.Append($"尺寸（px）= {size.Value.W:0.#}×{size.Value.H:0.#}"

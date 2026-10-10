@@ -13,16 +13,32 @@ namespace TouchSuite.App;
 
 public partial class MainWindow : Window
 {
-    private static readonly string[] StepTitles =
+    /// <summary>校准流程里的步骤（具体顺序由所选方式决定）。</summary>
+    private enum FlowStep { Route, ScreenPick, Screen, PalmCm, PalmTrace, Press, Finger, Result }
+
+    /// <summary>屏幕标定的三种方式。</summary>
+    private enum ScreenMode { Edid, Draw, Diag }
+
+    private readonly List<FlowStep> _flow = new();
+    private int _flowIndex;
+    private ScreenMode _screenMode = ScreenMode.Edid;
+    private bool _edidUnusable;   // 方式 1(EDID) 横竖都不准后置位：退回选择页时不再显示方式 1
+    private FlowStep Current => _flow.Count > 0 ? _flow[Math.Clamp(_flowIndex, 0, _flow.Count - 1)] : FlowStep.Route;
+
+    private static string TitleOf(FlowStep s) => s switch
     {
-        "第 1 步 · 检查横向 10cm",
-        "第 2 步 · 检查纵向 10cm",
-        "第 3 步 · 确定推算方式",
-        "第 4 步 · 手掌尺寸",
-        "第 5 步 · 手掌按一下",
-        "第 6 步 · 手指按一下",
-        "第 7 步 · 结果",
+        FlowStep.Route => "选择路线",
+        FlowStep.ScreenPick => "选择屏幕标定方式",
+        FlowStep.Screen => "屏幕标定",
+        FlowStep.PalmCm => "手掌尺寸（厘米）",
+        FlowStep.PalmTrace => "描摹手掌",
+        FlowStep.Press => "手掌按一下",
+        FlowStep.Finger => "手指按一下",
+        FlowStep.Result => "结果",
+        _ => "",
     };
+
+    private static Visibility Vis(bool on) => on ? Visibility.Visible : Visibility.Collapsed;
 
     private readonly TouchInput _touch = new();
     private CalibrationResult _result = new();
@@ -44,7 +60,6 @@ public partial class MainWindow : Window
     // 手掌擦预览（整套在 Eraser/EraserPreviewPage + EraserEngine 里）
     private readonly List<EdidSize> _edidCandidates = new();
     private bool _suppressEdidCombo;
-    private int _step;
 
     private double _dpiScaleX = 1, _dpiScaleY = 1;
     private double _mmPerDiuX, _mmPerDiuY;
@@ -52,7 +67,6 @@ public partial class MainWindow : Window
     // 描摹包围盒（DIU，相对 TraceCanvas）
     private double _bx0, _by0, _bx1, _by1;
     private bool _hasBox;
-    private double _traceAreaPx2;      // a3 描摹凹面积（沿外轮廓一笔围出的多边形面积，物理像素²）
 
     private double? _palmPeakAreaPx2, _palmPeakPressure;
     private double? _fingerPeakAreaPx2, _fingerPeakPressure;
@@ -84,6 +98,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        FitToWorkArea();
         Loaded += OnLoaded;
         Closed += (_, _) => _touch.Dispose();
 
@@ -92,9 +107,6 @@ public partial class MainWindow : Window
 
         // 预览页的来源下拉改动 → 同步本窗口第 5/6 步的两个下拉
         EraserPage.SourceSelectionChanged += SyncSourceUi;
-
-        // 预览页改了手掌面积公式（三选一）→ 重算手掌像素面积与信息栏
-        EraserPage.SettingsChanged += RecomputePalmSize;
 
         // 默认两项都判"准"（对应界面 RadioButton 的默认选中），首次标尺即按 EDID 原样
         _result.WidthRulerOk = true;
@@ -106,6 +118,25 @@ public partial class MainWindow : Window
             Color = Color.FromRgb(0x22, 0x66, 0xCC),
             FitToCurve = true,
         };
+    }
+
+    /// <summary>把窗口限制在主屏工作区内：高 DPI 下窗口按物理像素会超过屏幕，
+    /// CenterScreen 会把标题栏顶到屏幕上方导致拖不动。这里改为手动定位并夹取。</summary>
+    private void FitToWorkArea()
+    {
+        Rect wa = SystemParameters.WorkArea;   // 逻辑单位(DIP)
+        const double margin = 24;
+        double maxH = Math.Max(320, wa.Height - margin);
+        double maxW = Math.Max(400, wa.Width - margin);
+
+        if (double.IsNaN(Height) || Height > maxH) Height = maxH;
+        if (double.IsNaN(Width) || Width > maxW) Width = maxW;
+
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        double left = wa.Left + Math.Max(0, (wa.Width - Width) / 2);
+        double top = wa.Top + Math.Max(0, (wa.Height - Height) / 2);
+        Left = Math.Clamp(left, wa.Left, Math.Max(wa.Left, wa.Right - Width));
+        Top = Math.Clamp(top, wa.Top, Math.Max(wa.Top, wa.Bottom - Height));
     }
 
     // ================= 原始HID（RawInput）=================
@@ -127,12 +158,25 @@ public partial class MainWindow : Window
         PushHidDevices();
     }
 
-    /// <summary>把扫到的触摸类 HID 设备喂给三处「HID 触摸屏」下拉（索引 0 固定"自动"）。</summary>
+    /// <summary>把扫到的触摸类 HID **按逻辑屏归并后**喂给三处「HID 触摸屏」下拉（索引 0 固定"自动"）。</summary>
     private void PushHidDevices()
     {
         _hidDeviceKeys.Clear();
+
+        // 同一物理屏的多个 HID 集合（希沃：MI_00&Col04 + MI_02&Col02）合成一个逻辑屏，下拉只列逻辑屏
+        var groups = new List<string>();
+        var agg = new Dictionary<string, (bool W, bool H, bool P, int N)>(StringComparer.OrdinalIgnoreCase);
         foreach (HidReader.HidDeviceInfo d in _hidDevices.Where(d => d.IsTouchScreen))
-            _hidDeviceKeys.Add(d.DeviceName);
+        {
+            if (!agg.TryGetValue(d.GroupKey, out (bool W, bool H, bool P, int N) a))
+            {
+                a = (false, false, false, 0);
+                groups.Add(d.GroupKey);
+            }
+            agg[d.GroupKey] = (a.W || d.HasWidth, a.H || d.HasHeight, a.P || d.HasPressure, a.N + 1);
+        }
+        foreach (string k in groups)
+            _hidDeviceKeys.Add(k);
 
         _suppressDeviceUi = true;
         foreach (ComboBox? combo in new[] { PalmHidDeviceCombo, FingerHidDeviceCombo })
@@ -141,17 +185,28 @@ public partial class MainWindow : Window
                 continue;
             combo.Items.Clear();
             combo.Items.Add("自动（第一块出数的触摸屏）");
-            foreach (HidReader.HidDeviceInfo d in _hidDevices.Where(d => d.IsTouchScreen))
-                combo.Items.Add(ShortName(d.DeviceName));
+            foreach (string k in groups)
+                combo.Items.Add(HidGroupLabel(k, agg[k]));
             combo.SelectedIndex = 0;
         }
         _suppressDeviceUi = false;
 
         if (EraserPage is not null)
-            EraserPage.SetHidDevices(_hidDevices.Where(d => d.IsTouchScreen)
-                .Select(d => (Key: d.DeviceName, Label: ShortName(d.DeviceName))).ToList());
+            EraserPage.SetHidDevices(groups.Select(k => (Key: k, Label: HidGroupLabel(k, agg[k]))).ToList());
 
         SyncHidDeviceUi();
+    }
+
+    /// <summary>逻辑屏下拉标签：VID&amp;PID + 能力标记（含尺寸/含压感）+ 是否由多个集合合并而来。</summary>
+    private static string HidGroupLabel(string key, (bool W, bool H, bool P, int N) a)
+    {
+        var caps = new List<string>();
+        if (a.W || a.H) caps.Add("含尺寸");
+        if (a.P) caps.Add("含压感");
+        caps.Add(caps.Count > 0 ? "" : "仅坐标");
+        caps.RemoveAll(s => s.Length == 0);
+        string merged = a.N > 1 ? $"，已合并{a.N}集合" : "";
+        return $"{key}（{string.Join("·", caps)}{merged}）";
     }
 
     private readonly List<string> _hidDeviceKeys = new();
@@ -224,7 +279,9 @@ public partial class MainWindow : Window
     {
         // 多块触摸屏：与预览页共用同一把设备闸门（指定那台 / 自动锁第一台出数的），
         // 保证「标定采样」和「预览」用的是同一块屏，别让第二块屏的样本污染 K。
-        if (EraserPage is not null && !EraserPage.Engine.AcceptHidDevice(s.DeviceName))
+        // 闸门按「逻辑屏键」判：同一物理屏的多个 HID 集合（尺寸/压感分开报的）算同一块屏。
+        string groupKey = HidReader.GroupOfDevice(s.DeviceName);
+        if (EraserPage is not null && !EraserPage.Engine.AcceptHidDevice(groupKey))
             return;
 
         // 尺寸只需要计数 + 该轴逻辑量程（空槽位/占位帧两样都没有才丢帧）。不需要 mm。
@@ -241,7 +298,16 @@ public partial class MainWindow : Window
                  + $" X={s.XLogical}/{s.XLogMax}({Precision.Fmt(s.XNorm, 4)}) Y={s.YLogical}/{s.YLogMax}({Precision.Fmt(s.YNorm, 4)})"
                  + $" 压感={Precision.Fmt(s.Pressure01, 3)} raw=[{s.Hex}]");
             Log.Info($"原始HID 有数据槽位: {s.LinksDetail}");
+            Log.Info($"通道对照: 原始HID 触点数={s.Contacts?.Count ?? 0}"
+                 + $" W={s.WidthLogical}/{s.WidthLogMax} H={s.HeightLogical}/{s.HeightLogMax}"
+                 + $" | WPF {(_touch.LastWpfBounds is Rect wb ? $"{Precision.Fmt(wb.Width, 3)}×{Precision.Fmt(wb.Height, 3)} DIP" : "无")}"
+                 + $" | Stylus {(_touch.LastStylusPressure?.ToString("0.###") ?? "无")}");
         }
+
+        IReadOnlyList<ContactRect>? rawContacts = s.Contacts is { Count: > 0 } rl
+            ? rl.Select(c => new ContactRect(c.ContactId, null, c.Wmm, c.Hmm, c.XNorm, c.YNorm, c.Pressure01,
+                c.WLogical, c.HLogical)).ToList()
+            : null;
 
         OnSample(new TouchSample("RawHID", s.WidthMm, s.HeightMm, s.Pressure01,
             Detail: $"L={s.LinkCollection} W={s.WidthLogical}/{s.WidthLogMax} H={s.HeightLogical}/{s.HeightLogMax} raw=[{s.Hex}]",
@@ -249,18 +315,25 @@ public partial class MainWindow : Window
             XNorm: s.XNorm, YNorm: s.YNorm,
             XLogMax: s.XLogMax, YLogMax: s.YLogMax,
             WidthLogMax: s.WidthLogMax, HeightLogMax: s.HeightLogMax,
+            Contacts: rawContacts,
             XPhysMm: s.XPhysMm, YPhysMm: s.YPhysMm,
-            DeviceKey: s.DeviceName));
+            DeviceKey: groupKey));
     }
 
-    /// <summary>原始HID 设备换算表（映射表）文字，只读展示。</summary>
+    /// <summary>原始HID 设备换算表（映射表）文字，只读展示。同一物理屏的多个集合合到一行。</summary>
     private string HidTableText()
     {
         List<HidReader.HidDeviceInfo> touch = _hidDevices.Where(d => d.IsTouchScreen).ToList();
         if (touch.Count == 0)
             return "原始HID 映射表：（未发现触摸类 HID 设备）";
         return "原始HID 映射表：" + string.Join("",
-            touch.Select(d => $"\n  {ShortName(d.DeviceName)}：宽 [{d.WidthDetail}]；高 [{d.HeightDetail}]；压感 [{d.PressureDetail}]；X/Y [{d.XYDetail}]"));
+            touch.GroupBy(d => d.GroupKey).Select(g =>
+            {
+                string members = string.Join("、", g.Select(d => ShortName(d.DeviceName)));
+                HidReader.HidDeviceInfo p = g.FirstOrDefault(d => d.HasWidth || d.HasHeight) ?? g.First();
+                string press = string.Join(" | ", g.Where(x => x.PressureDetail.Length > 0).Select(x => x.PressureDetail));
+                return $"\n  【{g.Key}】{members}：宽 [{p.WidthDetail}]；高 [{p.HeightDetail}]；压感 [{press}]；X/Y [{p.XYDetail}]";
+            }));
     }
 
     private static string ShortName(string path)
@@ -390,16 +463,17 @@ public partial class MainWindow : Window
 
             _liveAreaPx2 = null;
             _livePressure = null;
-            if (_step == 4)
+            if (Current == FlowStep.Press)
                 PalmLiveText.Text = LiveText();
-            else if (_step == 5)
+            else if (Current == FlowStep.Finger)
                 FingerLiveText.Text = LiveText();
             RefreshInfoBar();
         }, Dispatcher);
         _uiTick.Start();
 
+        InitFlow();
         if (!TryLoadSaved())
-            ShowStep(0);
+            ShowFlow();
     }
 
     /// <summary>启动时若已保存过标定，弹窗询问是否载入；载入成功则跳到结果页并返回 true。</summary>
@@ -430,7 +504,8 @@ public partial class MainWindow : Window
 
         ApplyLoaded(saved);
         Log.Info($"启动载入已保存标定: {path}（{stamp}）");
-        ShowStep(6);
+        _flowIndex = Math.Max(0, _flow.IndexOf(FlowStep.Result));
+        ShowFlow();
         SetStatus("已载入上次保存的标定；要重来请点「上一步」回到前面的步骤，或直接在本页查看预览。");
         return true;
     }
@@ -446,7 +521,6 @@ public partial class MainWindow : Window
 
         if (saved.PalmWidthPx > 0) PalmWidthInput.Text = saved.PalmWidthPx.ToString("0.###");
         if (saved.PalmHeightPx > 0) PalmHeightInput.Text = saved.PalmHeightPx.ToString("0.###");
-        _traceAreaPx2 = saved.PalmTraceAreaPx2;   // a3 已存；描摹线本身不持久化
 
         // 建立标尺用的 ScreenCalibration，然后用保存的 mm/px 覆盖（对角线 / 手画尺子时推不出来）
         RebuildCalibration();
@@ -461,9 +535,15 @@ public partial class MainWindow : Window
         // 恢复预览页的开关/滑块/形状/长宽比/面积公式（老版本 JSON 无这些字段时保持默认）
         EraserPage.ApplySettings(saved);
 
-        // 恢复 HID 触摸屏（老版本 JSON 无则保持默认"自动"）
+        // 恢复 HID 触摸屏（老版本 JSON 无则保持默认"自动"）。
+        // 现在这个键是「逻辑屏键」(VID&PID)；旧版本存的是完整设备路径，认不出 → 退回"自动"，避免锁死到不存在的设备。
         if (!string.IsNullOrEmpty(saved.HidDeviceKey))
-            EraserPage.Engine.SetRawHidDevice(saved.HidDeviceKey);
+        {
+            string key = saved.HidDeviceKey;
+            bool known = _hidDevices.Any(d => d.IsTouchScreen
+                && string.Equals(d.GroupKey, key, StringComparison.OrdinalIgnoreCase));
+            EraserPage.Engine.SetRawHidDevice(known ? key : "");
+        }
         SyncSourceUi();
     }
 
@@ -509,7 +589,6 @@ public partial class MainWindow : Window
 
         DrawRulers();
         RefreshInfoBar();
-        UpdateDiagonalPanelVisibility();
         SyncEraserPage();
         Log.Info($"重建校准: 来源={_sizeSource} 方式={_result.SizeMode} 物理={_calib.ScreenWidthMm:0.0}×{_calib.ScreenHeightMm:0.0}mm "
                  + $"mm/px={Precision.Fmt(_calib.MmPerPxX)}×{Precision.Fmt(_calib.MmPerPxY)} 横10cm准={_result.WidthRulerOk} 竖10cm准={_result.HeightRulerOk}");
@@ -531,16 +610,6 @@ public partial class MainWindow : Window
         SetStatus(Precision.High
             ? "高精度模式：已开启（后端双精度、不取整；显示按有效位自适应）"
             : "高精度模式：已关闭（后端取整、显示固定 1 位小数）");
-    }
-
-    /// <summary>只在「横竖都不准」或「EDID 读失败」时才露出对角线兜底输入。</summary>
-    private void UpdateDiagonalPanelVisibility()
-    {
-        if (DiagonalPanel is null)
-            return;
-
-        bool bothBad = !_result.WidthRulerOk && !_result.HeightRulerOk;
-        DiagonalPanel.Visibility = (_edidFailed || bothBad) ? Visibility.Visible : Visibility.Collapsed;
     }
 
     /// <summary>EDID 不可信（都不准 / 读失败）时：手填对角线英寸反推物理尺寸（方形像素，按分辨率比例）。</summary>
@@ -802,72 +871,147 @@ public partial class MainWindow : Window
         }
     }
 
-    // ================= 步骤导航 =================
+    // ================= 路线与步骤导航 =================
 
-    private void ShowStep(int step)
+    /// <summary>初始（未选路线）：一条含「选路线」的默认序列。</summary>
+    private void InitFlow()
     {
-        _step = step;
-        Step0.Visibility = step == 0 ? Visibility.Visible : Visibility.Collapsed;
-        Step1.Visibility = step == 1 ? Visibility.Visible : Visibility.Collapsed;
-        Step2.Visibility = step == 2 ? Visibility.Visible : Visibility.Collapsed;
-        Step3.Visibility = step == 3 ? Visibility.Visible : Visibility.Collapsed;
-        Step4.Visibility = step == 4 ? Visibility.Visible : Visibility.Collapsed;
-        Step5.Visibility = step == 5 ? Visibility.Visible : Visibility.Collapsed;
-        Step6.Visibility = step == 6 ? Visibility.Visible : Visibility.Collapsed;
+        _flow.Clear();
+        _flow.Add(FlowStep.Route);
+        _flow.Add(FlowStep.ScreenPick);
+        _flow.Add(FlowStep.Screen);
+        _flow.Add(FlowStep.PalmCm);
+        _flow.Add(FlowStep.Press);
+        _flow.Add(FlowStep.Finger);
+        _flow.Add(FlowStep.Result);
+        _flowIndex = 0;
+    }
 
-        StepTitle.Text = StepTitles[step];
-        BackBtn.IsEnabled = step > 0 && step < 6;
-        NextBtn.Content = step == 5 ? "完成" : "下一步";
-        NextBtn.IsEnabled = step < 6;
+    /// <summary>按所选方式构造步骤序列，并直接进入第一步。</summary>
+    private void BuildFlow(bool traceRoute)
+    {
+        _flow.Clear();
+        _edidUnusable = false;
+        _flow.Add(FlowStep.Route);
+        if (traceRoute)
+        {
+            _flow.Add(FlowStep.PalmTrace);
+        }
+        else
+        {
+            _flow.Add(FlowStep.ScreenPick);
+            _flow.Add(FlowStep.Screen);
+            _flow.Add(FlowStep.PalmCm);
+        }
+        _flow.Add(FlowStep.Press);
+        _flow.Add(FlowStep.Finger);
+        _flow.Add(FlowStep.Result);
 
-        if (step == 6)
+        Log.Info(traceRoute ? "选择路线一：直接描摹手掌" : "选择路线二：屏幕标定 → 手掌厘米");
+        _flowIndex = 1;   // 直接进入第一步
+        ShowFlow();
+    }
+
+    private void OnPickTraceRoute(object sender, RoutedEventArgs e) => BuildFlow(traceRoute: true);
+    private void OnPickScreenRoute(object sender, RoutedEventArgs e) => BuildFlow(traceRoute: false);
+
+    private void ShowFlow()
+    {
+        FlowStep s = Current;
+        StepRoute.Visibility = Vis(s == FlowStep.Route);
+        StepScreenPick.Visibility = Vis(s == FlowStep.ScreenPick);
+        StepScreen.Visibility = Vis(s == FlowStep.Screen);
+        StepPalmCm.Visibility = Vis(s == FlowStep.PalmCm);
+        StepPalmTrace.Visibility = Vis(s == FlowStep.PalmTrace);
+        Step4.Visibility = Vis(s == FlowStep.Press);
+        Step5.Visibility = Vis(s == FlowStep.Finger);
+        Step6.Visibility = Vis(s == FlowStep.Result);
+
+        StepTitle.Text = TitleOf(s);
+        BackBtn.IsEnabled = _flowIndex > 0;
+        NextBtn.Visibility = Vis(s != FlowStep.Result);
+        NextBtn.Content = s == FlowStep.Finger ? "完成" : "下一步";
+
+        if (s == FlowStep.ScreenPick)
+            UpdateScreenPick();
+        else if (s == FlowStep.Screen)
+            ApplyScreenMode();
+        else if (s == FlowStep.PalmCm)
+            UpdatePalmCm();
+        else if (s == FlowStep.PalmTrace)
+            RecomputePalmSize();
+        else if (s == FlowStep.Result)
             BuildResult();
-        else if (step == 3)
-            RecomputePalmSize();   // 进入手掌尺寸步时按当前输入框重算
 
-        Log.Info($"进入 {StepTitles[step]}");
+        Log.Info($"进入 {TitleOf(s)}");
     }
 
     private void OnBack(object sender, RoutedEventArgs e)
     {
-        if (_step > 0)
-            ShowStep(_step - 1);
+        if (_flowIndex > 0)
+        {
+            _flowIndex--;
+            ShowFlow();
+        }
+    }
+
+    private void Advance()
+    {
+        if (_flowIndex < _flow.Count - 1)
+        {
+            _flowIndex++;
+            ShowFlow();
+        }
     }
 
     private void OnNext(object sender, RoutedEventArgs e)
     {
-        switch (_step)
+        switch (Current)
         {
-            case 0:
-                _result.WidthRulerOk = HWideOk.IsChecked == true;
-                Log.Info($"第1步 横10cm 判定={(_result.WidthRulerOk ? "准" : "不准")}");
-                RebuildCalibration();
-                ShowStep(1);
-                break;
-
-            case 1:
-                _result.HeightRulerOk = VWideOk.IsChecked == true;
-                Log.Info($"第2步 竖10cm 判定={(_result.HeightRulerOk ? "准" : "不准")}");
-                if (!_result.WidthRulerOk && !_result.HeightRulerOk)
-                    SetStatus("横向、纵向都判为不准 → 只能退回 EDID 原样，标尺可能仍有偏差。");
-                RebuildCalibration();
-                ShowStep(2);
-                break;
-
-            case 2:
-                ShowStep(3);
-                break;
-
-            case 3:
-                if (_result.PalmAreaPx2 <= 0)
+            case FlowStep.Screen:
+                if (_screenMode == ScreenMode.Edid)
                 {
-                    SetStatus("请在右侧填入手掌宽/高（物理像素 px）——不描摹也行；想用描摹凹面积 a3 再描一圈。");
+                    _result.WidthRulerOk = HWideOk.IsChecked == true;
+                    _result.HeightRulerOk = VWideOk.IsChecked == true;
+                    RebuildCalibration();
+                    // 横竖都不准 → 退回「选方式」，让你换「画 10cm」或「对角英寸」
+                    if (!_result.WidthRulerOk && !_result.HeightRulerOk)
+                    {
+                        _edidUnusable = true;
+                        _flowIndex = Math.Max(0, _flow.IndexOf(FlowStep.ScreenPick));
+                        ShowFlow();
+                        SetStatus("方式 1（EDID）横竖都不准 → 已隐藏方式 1，请改选方式 2 或 3。");
+                        return;
+                    }
+                }
+                if (!(_result.MmPerPxX > 0 && _result.MmPerPxY > 0))
+                {
+                    SetStatus("当前标定方式还没算出毫米/像素，请先完成标定。");
                     return;
                 }
-                ShowStep(4);
+                Advance();
                 break;
 
-            case 4:
+            case FlowStep.PalmCm:
+                UpdatePalmCm();
+                if (_result.PalmAreaPx2 <= 0)
+                {
+                    SetStatus("请填入手掌宽/高（厘米），且屏幕标定已完成。");
+                    return;
+                }
+                Advance();
+                break;
+
+            case FlowStep.PalmTrace:
+                if (_result.PalmAreaPx2 <= 0)
+                {
+                    SetStatus("请在左侧描摹手掌，或在右侧填入手掌宽/高（px）。");
+                    return;
+                }
+                Advance();
+                break;
+
+            case FlowStep.Press:
                 if (_palmAreas.Count == 0)
                 {
                     SetStatus("请先把手掌按在黑区上，点「记录手掌」（可多按几次取中值）。");
@@ -875,12 +1019,12 @@ public partial class MainWindow : Window
                 }
                 _result.PalmContactAreaPx2 = Precision.Round(Median(_palmAreas));
                 _result.PalmPressure = _palmPressures.Count > 0 ? Precision.Round(Median(_palmPressures), 3) : null;
-                Log.Info($"第4步 手掌定案: {_palmAreas.Count} 次中值面积={FmtArea(_result.PalmContactAreaPx2)}{FmtPressure(_result.PalmPressure)}");
+                Log.Info($"手掌定案: {_palmAreas.Count} 次中值面积={FmtArea(_result.PalmContactAreaPx2)}{FmtPressure(_result.PalmPressure)}");
                 RefreshInfoBar();
-                ShowStep(5);
+                Advance();
                 break;
 
-            case 5:
+            case FlowStep.Finger:
                 if (_fingerAreas.Count == 0)
                 {
                     SetStatus("请先用一根手指按在黑区上，点「记录手指」（可多按几次取中值）。");
@@ -888,11 +1032,81 @@ public partial class MainWindow : Window
                 }
                 _result.FingerContactAreaPx2 = Precision.Round(Median(_fingerAreas));
                 _result.FingerPressure = _fingerPressures.Count > 0 ? Precision.Round(Median(_fingerPressures), 3) : null;
-                Log.Info($"第5步 手指定案: {_fingerAreas.Count} 次中值面积={FmtArea(_result.FingerContactAreaPx2)}{FmtPressure(_result.FingerPressure)}");
+                Log.Info($"手指定案: {_fingerAreas.Count} 次中值面积={FmtArea(_result.FingerContactAreaPx2)}{FmtPressure(_result.FingerPressure)}");
                 RefreshInfoBar();
-                ShowStep(6);
+                Advance();
                 break;
         }
+    }
+
+    // ================= 屏幕标定方式（三选一，选完进对应界面）=================
+
+    private void OnPickScreenEdid(object sender, RoutedEventArgs e) => PickScreenMode(ScreenMode.Edid);
+    private void OnPickScreenDraw(object sender, RoutedEventArgs e) => PickScreenMode(ScreenMode.Draw);
+    private void OnPickScreenDiag(object sender, RoutedEventArgs e) => PickScreenMode(ScreenMode.Diag);
+
+    private void PickScreenMode(ScreenMode mode)
+    {
+        _screenMode = mode;
+        Advance();   // 从「选方式」进到对应的标定界面
+    }
+
+    /// <summary>选方式页：方式 1（EDID）若已判定横竖都不准，就不再显示它。</summary>
+    private void UpdateScreenPick()
+    {
+        if (ScreenPickEdid is not null)
+            ScreenPickEdid.Visibility = Vis(!_edidUnusable);
+    }
+
+    /// <summary>按当前所选方式显示对应面板（EDID 方式顺带重画标尺）。</summary>
+    private void ApplyScreenMode()
+    {
+        if (ScreenModeTitle is null)
+            return;   // XAML 解析期字段尚未就绪
+
+        bool edid = _screenMode == ScreenMode.Edid;
+        ScreenEdidPanel.Visibility = Vis(edid);
+        ScreenDrawPanel.Visibility = Vis(_screenMode == ScreenMode.Draw);
+        ScreenDiagPanel.Visibility = Vis(_screenMode == ScreenMode.Diag);
+        ScreenModeTitle.Text = _screenMode switch
+        {
+            ScreenMode.Edid => "屏幕标定 · 方式 1：EDID 核对（用尺子量下面两段 10cm）",
+            ScreenMode.Draw => "屏幕标定 · 方式 2：画一条 10cm 线",
+            _ => "屏幕标定 · 方式 3：填屏幕对角线英寸",
+        };
+        if (edid)
+            RebuildCalibration();
+    }
+
+    // ================= 路线一：手掌厘米 → 像素 =================
+
+    private void OnPalmCmChanged(object sender, TextChangedEventArgs e) => UpdatePalmCm();
+
+    /// <summary>手掌宽/高（cm）× 当前 mm/px → 像素尺寸与面积（K 的分子）。</summary>
+    private void UpdatePalmCm()
+    {
+        if (PalmCmWidth is null || PalmCmHeight is null || PalmCmResult is null)
+            return;   // XAML 解析期字段尚未就绪
+
+        double.TryParse(PalmCmWidth.Text.Trim(), out double wcm);
+        double.TryParse(PalmCmHeight.Text.Trim(), out double hcm);
+
+        double mmx = _calib?.MmPerPxX ?? 0;
+        double mmy = _calib?.MmPerPxY ?? 0;
+        double wPx = mmx > 0 && wcm > 0 ? wcm * 10.0 / mmx : 0;
+        double hPx = mmy > 0 && hcm > 0 ? hcm * 10.0 / mmy : 0;
+
+        _result.PalmWidthPx = wPx;
+        _result.PalmHeightPx = hPx;
+        _result.PalmAreaPx2 = wPx > 0 && hPx > 0 ? wPx * hPx : 0;
+
+        PalmCmResult.Text = _result.PalmAreaPx2 > 0
+            ? $"宽 {Precision.Fmt(wcm, 1)}cm → {Precision.Fmt(wPx, 0)}px｜高 {Precision.Fmt(hcm, 1)}cm → {Precision.Fmt(hPx, 0)}px\n"
+              + $"手掌面积 = {Precision.Fmt(_result.PalmAreaPx2, 0)} px²（mm/px {Precision.Fmt(mmx)} × {Precision.Fmt(mmy)}）"
+            : "—（请填入手掌宽/高，且屏幕标定已完成）";
+
+        SyncEraserPage();
+        RefreshInfoBar();
     }
 
     // ================= 步骤 4：手掌尺寸 =================
@@ -917,8 +1131,6 @@ public partial class MainWindow : Window
         }
 
         // 用描摹外接矩形填右侧（DIU → 物理像素 px）
-        ComputeTraceArea();
-
         if (_hasBox)
         {
             double wPx = (_bx1 - _bx0) * _dpiScaleX;
@@ -928,40 +1140,17 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>a3 = 描摹凹面积：对每条描摹线按点序做鞋带公式（隐式闭合）取面积，DIU² → 物理像素²。
-    /// 沿手掌外轮廓一笔描一圈时 = 真实凹面积；多笔各自取面积后相加。</summary>
-    private void ComputeTraceArea()
-    {
-        double sumDiu2 = 0;
-        foreach (Stroke st in TraceCanvas.Strokes)
-        {
-            StylusPointCollection pts = st.StylusPoints;
-            if (pts.Count < 3)
-                continue;
-            double a = 0;
-            for (int i = 0; i < pts.Count; i++)
-            {
-                StylusPoint p1 = pts[i];
-                StylusPoint p2 = pts[(i + 1) % pts.Count];
-                a += p1.X * p2.Y - p2.X * p1.Y;
-            }
-            sumDiu2 += Math.Abs(a) / 2.0;
-        }
-        _traceAreaPx2 = sumDiu2 * _dpiScaleX * _dpiScaleY;
-    }
-
     private void OnClearTrace(object sender, RoutedEventArgs e)
     {
         TraceCanvas.Strokes.Clear();
         _hasBox = false;
-        _traceAreaPx2 = 0;
         RecomputePalmSize();
-        SetStatus("描摹已清除（右侧数值保留；a3 已归零）。");
+        SetStatus("描摹已清除（右侧数值保留）。");
     }
 
     private void OnPalmSizeChanged(object sender, TextChangedEventArgs e) => RecomputePalmSize();
 
-    /// <summary>按右侧输入框重算手掌宽/长/面积（px²，取面积公式三选一）；进入该步或改公式时也会调用。</summary>
+    /// <summary>按右侧输入框重算手掌宽/长/面积（px²，固定按外接矩形 a1×a2）；进入该步或改宽高时也会调用。</summary>
     private void RecomputePalmSize()
     {
         if (PalmWidthInput is null || PalmHeightInput is null || PalmSizeText is null)
@@ -973,18 +1162,11 @@ public partial class MainWindow : Window
         _result.PalmWidthPx = w;
         _result.PalmHeightPx = h;
 
-        AreaFormula f = EraserPage?.Engine.Formula ?? AreaFormula.Rect;
-        _result.PalmAreaFormula = f.ToString();
-        _result.PalmAreaPx2 = EraserEngine.PalmAreaFrom(f, w, h, _traceAreaPx2);
-
-        // 选了 a3 但没描摹 → 自动退回 a1×a2（不描摹也能过，用右侧默认/手填的宽高即可）
-        bool traceFallback = f == AreaFormula.Trace && !(_traceAreaPx2 > 0) && w > 0 && h > 0;
+        _result.PalmAreaPx2 = w > 0 && h > 0 ? w * h : 0;
 
         PalmSizeText.Text = _result.PalmAreaPx2 > 0
             ? $"宽 a2 = {Precision.Fmt(w)} px × 高 a1 = {Precision.Fmt(h)} px\n"
-              + $"描摹凹面积 a3 = {Precision.Fmt(_traceAreaPx2, 0)} px²"
-              + (_traceAreaPx2 > 0 ? "" : "（没描摹；不影响，取面积用下面这条）") + "\n"
-              + $"取面积（{SourceNames.OfFormula(f)}{(traceFallback ? " → 无描摹，退回 a1×a2" : "")}）= {Precision.Fmt(_result.PalmAreaPx2, 0)} px²"
+              + $"手掌面积（a1×a2）= {Precision.Fmt(_result.PalmAreaPx2, 0)} px²（K 的分子）"
             : "面积：—（在右侧填入手掌宽/高 px 即可，描摹可选）";
 
         SyncEraserPage();
@@ -1000,7 +1182,7 @@ public partial class MainWindow : Window
         if (nowTicks - _lastSampleLogTicks >= 250)
         {
             _lastSampleLogTicks = nowTicks;
-            Log.Info($"样本[{StepTitles[_step]}] {Describe(s)}");
+            Log.Info($"样本[{TitleOf(Current)}] {Describe(s)}");
         }
 
         // 信息栏节流刷新（内容都是标定值；节流只为避免每帧刷）
@@ -1010,7 +1192,7 @@ public partial class MainWindow : Window
             RefreshInfoBar();
         }
 
-        if (_step == 6)
+        if (Current == FlowStep.Result)
         {
             // 信息栏的「当前接触 / 当前压感」在最后一页也要更新（原来这一步提前 return，值永远为 —）
             if (SampleAreaPx2(s) is double la6) _liveAreaPx2 = la6;
@@ -1019,7 +1201,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (_step != 4 && _step != 5)
+        if (Current != FlowStep.Press && Current != FlowStep.Finger)
             return;
 
         if (!Accept(s))
@@ -1035,7 +1217,7 @@ public partial class MainWindow : Window
 
         // 峰值 = 自上次「记录」以来的最大接触，抬手不清空：
         // 点「记录」时手指落在按钮上的那一下小接触（远小于手掌）不会顶掉手掌的峰值。
-        if (_step == 4)
+        if (Current == FlowStep.Press)
         {
             _palmActiveSource = s.Source;
             if (area is double a && a > (_palmPeakAreaPx2 ?? 0)) _palmPeakAreaPx2 = a;
@@ -1058,8 +1240,8 @@ public partial class MainWindow : Window
     /// <summary>样本的接触面积（物理像素²）：RawHID = 宽高计数换算后的 px 乘积；WPF = 接触框（DIP × DPI）。
     /// 面积与宽高换算方式无关（面积因子恒等）。</summary>
     private double? SampleAreaPx2(TouchSample s)
-        => SamplePx.AreaPx2(s, _result.ResX, _result.ResY,
-            EraserPage?.Engine.SizeScale ?? HidSizeScale.Stretch, _dpiScaleX, _dpiScaleY);
+        => SamplePx.AreaPx2(s, _result.ResX, _result.ResY, _dpiScaleX, _dpiScaleY,
+            EraserPage?.Engine.MultiTouchAsPalm ?? true);
 
     /// <summary>
     /// 该样本是否参与标定采样。Stylus 只带压感、不参与面积，始终放行；
@@ -1188,11 +1370,11 @@ public partial class MainWindow : Window
         RefreshInfoBar();
     }
 
-    /// <summary>把标定值喂给面积擦预览页（手掌宽高/描摹面积/按压面积/压感，全部物理像素）。</summary>
+    /// <summary>把标定值喂给面积擦预览页（手掌宽高/按压面积/压感，全部物理像素）。</summary>
     private void SyncEraserPage()
     {
         EraserPage.Setup(_dpiScaleX, _dpiScaleY,
-            _result.PalmWidthPx, _result.PalmHeightPx, _result.PalmTraceAreaPx2,
+            _result.PalmWidthPx, _result.PalmHeightPx,
             _result.PalmContactAreaPx2 ?? 0, _result.FingerContactAreaPx2 ?? 0,
             _result.PalmPressure, _result.FingerPressure,
             _result.ResX, _result.ResY);
@@ -1215,14 +1397,14 @@ public partial class MainWindow : Window
             _result.FollowSize = set.FollowSize;
             _result.LockPalmSize = set.LockPalmSize;
             _result.SmoothJitter = set.SmoothJitter;
-            _result.PalmFloorEnabled = set.PalmFloorEnabled;
+            _result.MultiTouchAsPalm = set.MultiTouchAsPalm;
+            _result.PalmLimit = set.SizeLimit.ToString();
             _result.AreaThresholdEnabled = set.AreaThresholdEnabled;
             _result.WritingFollowSize = set.WritingFollowSize;
             _result.EraserShape = set.Shape.ToString();
             _result.AspectSource = set.Aspect.ToString();
             _result.AspectW = set.CustomAspectW;
             _result.AspectH = set.CustomAspectH;
-            _result.PalmAreaFormula = set.Formula.ToString();
             _result.HidSizeScale = set.SizeScale.ToString();
             _result.HidDeviceKey = EraserPage.Engine.RawHidDeviceKey.Length > 0 ? EraserPage.Engine.RawHidDeviceKey : null;
             _result.K = EraserPage.Engine.ComputeK() is double k && k > 0 ? Precision.Round(k) : null;
@@ -1234,13 +1416,13 @@ public partial class MainWindow : Window
             SetStatus("结果已保存。");
             Log.Info($"结果已保存: {path}（K={(_result.K is double kv ? Precision.Fmt(kv) : "无")} 随尺寸={set.FollowSize} "
                      + $"锁定={set.LockPalmSize} 掌擦压感={set.PalmPressureEnabled} 书写压感={set.WritingUsesPressure} "
-                     + $"形状={set.Shape} 长宽比={set.Aspect} 公式={set.Formula}）");
+                     + $"形状={set.Shape} 长宽比={set.Aspect}）");
         }
         catch (Exception ex)
         {
             EraserPage.SavePathNotice = "保存失败：" + ex.Message;
             SetStatus("保存失败。");
-            Log.Error("结果保存失败: " + ex);
+            Log.Error("结果保存失败", ex);
         }
     }
 
@@ -1269,10 +1451,9 @@ public partial class MainWindow : Window
             // ② 推算方式 / 毫米每像素
             + $"推算方式：横{Yes(_result.WidthRulerOk)} 竖{Yes(_result.HeightRulerOk)} {_result.SizeMode}"
             + $"    毫米/像素：{Precision.Fmt(_calib.MmPerPxX)} × {Precision.Fmt(_calib.MmPerPxY)}\n"
-            // ③ 手掌描摹（px / a3 / 取面积公式）/ 按压
+            // ③ 手掌描摹（px）/ 按压
             + $"手掌描摹：宽a2={Precision.Fmt(_result.PalmWidthPx, 0)}px 高a1={Precision.Fmt(_result.PalmHeightPx, 0)}px"
-            + $"    描摹凹面积a3={Precision.Fmt(_result.PalmTraceAreaPx2, 0)}px²"
-            + $"    取面积({SourceNames.OfFormula(EraserPage?.Engine.Formula ?? AreaFormula.Rect)})={Precision.Fmt(_result.PalmAreaPx2, 0)}px²\n"
+            + $"    手掌面积(a1×a2)={Precision.Fmt(_result.PalmAreaPx2, 0)}px²\n"
             + $"手掌按压：面积{FmtArea(_result.PalmContactAreaPx2)} 压感{FmtPressureVal(_result.PalmPressure)}"
             + $"    手指按压：面积{FmtArea(_result.FingerContactAreaPx2)} 压感{FmtPressureVal(_result.FingerPressure)}"
             + $"    切换阈值：{(thLive > 0 ? Precision.Fmt(thLive, 0) + " px²" : "—")}\n"

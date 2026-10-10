@@ -33,7 +33,8 @@ public static class HidReader
         string DeviceName, bool IsTouchScreen,
         bool HasWidth, bool HasHeight, bool HasPressure,
         int InputValueCaps, string UsageSummary,
-        string WidthDetail, string HeightDetail, string PressureDetail, string XYDetail);
+        string WidthDetail, string HeightDetail, string PressureDetail, string XYDetail,
+        string GroupKey, string GroupLabel);
 
     public sealed record RawTouchSample(
         string DeviceName,
@@ -43,7 +44,13 @@ public static class HidReader
         int WidthLogMax, int HeightLogMax,
         double? XPhysMm, double? YPhysMm,
         int LinkCollection, string LinksDetail,
-        string Hex);
+        string Hex, int ContactId, IReadOnlyList<RawLink>? Contacts = null);
+
+    /// <summary>一帧里的单根接触（原始 HID），用于「多触点求和 / 多点判手掌」。</summary>
+    public sealed record RawLink(
+        int Link, int ContactId,
+        int WLogical, int HLogical, double? Wmm, double? Hmm,
+        double? XNorm, double? YNorm, double? Pressure01);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RAWINPUTDEVICELIST { public IntPtr hDevice; public uint dwType; }
@@ -103,7 +110,119 @@ public static class HidReader
 
         /// <summary>（供 UI）设备声明的物理宽高 mm 文字。</summary>
         public string ScreenPhysText = "";
+
+        /// <summary>逻辑触摸屏键：同一块物理屏的多个 HID 顶层集合共用同一个键（ContainerId 归一，回退 VID&PID）。</summary>
+        public string GroupKey = "";
     }
+
+    // ================= 逻辑屏分组（同一物理屏的多个 HID 集合归一） =================
+
+    private static readonly Dictionary<string, string> _deviceToGroup = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, List<string>> _groupMembers = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, string> _vidPidToContainer = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>某个 HID 集合所属的逻辑屏键（未登记则回退成设备名本身）。</summary>
+    public static string GroupOfDevice(string deviceName)
+        => deviceName.Length > 0 && _deviceToGroup.TryGetValue(deviceName, out string? g) ? g : deviceName;
+
+    /// <summary>某个逻辑屏包含的所有 HID 集合名。</summary>
+    public static IReadOnlyList<string> GroupMembers(string groupKey)
+        => _groupMembers.TryGetValue(groupKey, out List<string>? l) ? l : Array.Empty<string>();
+
+    private const int CR_SUCCESS = 0;
+    private const uint CM_LOCATE_DEVNODE_NORMAL = 0;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DEVPROPKEY { public Guid fmtid; public uint pid; }
+
+    private static readonly DEVPROPKEY DEVPKEY_Device_ContainerId =
+        new() { fmtid = new Guid("8c7ed206-3f8a-4827-b6cc-029f3b2e2b5f"), pid = 2 };
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int CM_Get_DevNode_PropertyW(uint dnDevInst, ref DEVPROPKEY propertyKey,
+        out uint propertyType, byte[] propertyBuffer, ref uint propertyBufferSize, uint ulFlags);
+
+    /// <summary>取设备的 ContainerId（同一物理设备的所有接口共享同一 ContainerId）。取不到返回空串。</summary>
+    private static string TryContainerId(string deviceName)
+    {
+        try
+        {
+            string id = deviceName;
+            if (id.StartsWith(@"\\?\")) id = id[4..];
+            int hash = id.IndexOf("#{", StringComparison.Ordinal);
+            if (hash >= 0) id = id[..hash];
+            id = id.Replace('#', '\\');
+
+            if (CM_Locate_DevNodeW(out uint devInst, id, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS)
+                return "";
+
+            DEVPROPKEY key = DEVPKEY_Device_ContainerId;
+            byte[] buf = new byte[16];
+            uint size = 16;
+            if (CM_Get_DevNode_PropertyW(devInst, ref key, out uint _, buf, ref size, 0) != CR_SUCCESS || size < 16)
+                return "";
+            return new Guid(buf[..16]).ToString();
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    /// <summary>从设备路径里抠出 VID_xxxx&amp;PID_yyyy（去掉 &amp;MI_/&amp;Col 等后缀）。</summary>
+    private static string ExtractVidPid(string deviceName)
+    {
+        int i = deviceName.IndexOf("VID_", StringComparison.OrdinalIgnoreCase);
+        if (i < 0)
+            return "";
+        int j = deviceName.IndexOf('#', i);
+        if (j < 0) j = deviceName.Length;
+        string seg = deviceName[i..j];
+        int m = seg.IndexOf("&MI_", StringComparison.OrdinalIgnoreCase);
+        if (m >= 0) seg = seg[..m];
+        return seg;
+    }
+
+    /// <summary>计算逻辑屏键：优先按 ContainerId 归并；同一 VID&amp;PID 但对不上同一物理设备时加序号区分；最后回退 VID&amp;PID。</summary>
+    private static string ResolveGroupKey(string deviceName)
+    {
+        string vidPid = ExtractVidPid(deviceName);
+        if (vidPid.Length == 0)
+            return deviceName;
+
+        string cid = TryContainerId(deviceName);
+        if (cid.Length == 0)
+            return vidPid;
+
+        if (_vidPidToContainer.TryGetValue(vidPid, out string? seen))
+        {
+            if (string.Equals(seen, cid, StringComparison.OrdinalIgnoreCase))
+                return vidPid;
+            int n = 2;
+            string cand;
+            do { cand = vidPid + "#" + n++; } while (_vidPidToContainer.ContainsKey(cand));
+            _vidPidToContainer[cand] = cid;
+            return cand;
+        }
+
+        _vidPidToContainer[vidPid] = cid;
+        return vidPid;
+    }
+
+    // ================= 跨集合压感合并（希沃等：尺寸一个集合、压感另一个集合） =================
+
+    private sealed class GroupPressureState
+    {
+        public readonly Dictionary<int, (double P, long Ticks)> ByContact = new();
+        public double? Latest;
+        public long LatestTicks;
+    }
+
+    private static readonly Dictionary<string, GroupPressureState> _groupPressure = new(StringComparer.OrdinalIgnoreCase);
+    private const int PressureWindowMs = 250;
 
     private static readonly Dictionary<IntPtr, DeviceCtx> Ctx = new();
 
@@ -247,6 +366,21 @@ public static class HidReader
 
             if (Ctx.TryGetValue(hDevice, out DeviceCtx? old) && old.Preparsed != IntPtr.Zero && old.Preparsed != preparsed)
                 Marshal.FreeHGlobal(old.Preparsed);
+
+            // 逻辑屏分组：同一物理屏的多个 HID 集合（如希沃的 MI_00&Col04 + MI_02&Col02）归到一起
+            ctx.GroupKey = ctx.IsTouch ? ResolveGroupKey(name) : name;
+            if (ctx.IsTouch)
+            {
+                _deviceToGroup[name] = ctx.GroupKey;
+                if (!_groupMembers.TryGetValue(ctx.GroupKey, out List<string>? members))
+                {
+                    members = new List<string>();
+                    _groupMembers[ctx.GroupKey] = members;
+                }
+                if (!members.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    members.Add(name);
+            }
+
             Ctx[hDevice] = ctx;
 
             Cap? w0 = ctx.Widths.FirstOrDefault();
@@ -262,7 +396,8 @@ public static class HidReader
                       + $" X 0..{ctx.Xs.FirstOrDefault()?.LogMax ?? 0}{PhysSuffix(ctx.Xs.FirstOrDefault())}"
                       + $"，Y 0..{ctx.Ys.FirstOrDefault()?.LogMax ?? 0}{PhysSuffix(ctx.Ys.FirstOrDefault())}"
                       + $"　屏幕物理 {ctx.ScreenPhysText}"
-                      + $"　TipSwitch 槽位 {ctx.TipSwitchLinks.Count}/{ctx.Links.Length}"));
+                      + $"　TipSwitch 槽位 {ctx.TipSwitchLinks.Count}/{ctx.Links.Length}",
+                ctx.GroupKey, ctx.GroupKey));
         }
 
         return results;
@@ -307,7 +442,7 @@ public static class HidReader
     private readonly record struct LinkValues(
         ushort Link,
         int WLogical, int HLogical, int WLogMax, int HLogMax, double? Wmm, double? Hmm,
-        int XLogical, int YLogical, int XLogMax, int YLogMax, double? Pressure01);
+        int XLogical, int YLogical, int XLogMax, int YLogMax, double? Pressure01, int ContactId);
 
     /// <summary>处理 WM_INPUT：逐份子报文 × 逐触点槽位解码，取「接触尺寸乘积最大」的槽位（手掌就是最大的那个接触）。</summary>
     public static WmInputResult TryHandleWmInput(IntPtr lParam, out RawTouchSample? sample)
@@ -348,6 +483,11 @@ public static class HidReader
                 reports.Add(report);
             }
 
+            // 本集合带压感 → 先把本帧压感按 ContactID 记进「同一逻辑屏」的缓存，
+            // 供不带压感的兄弟集合（如希沃 Col04 只有尺寸）补齐压感。
+            if (ctx.Pressures.Count > 0)
+                CacheFramePressure(ctx, reports);
+
             // 第一遍：按 TipSwitch 过滤（只认真的按下的槽位，排除残留幽灵槽）
             bool requireTip = ctx.TipSwitchLinks.Count > 0;
             sample = PickBest(ctx, reports, requireTip);
@@ -356,6 +496,14 @@ public static class HidReader
             // 一旦见过真按下，抬手帧必须返回 null（= 抬手），不能把驱动残留的 W/H 又复活成接触。
             if (sample is null && requireTip && !ctx.TipEverSeen)
                 sample = PickBest(ctx, reports, requireTip: false);
+
+            // 本集合无压感、但同一逻辑屏的别的集合有 → 用最近的压感补齐（同 ContactID 优先，退化为最新值）
+            if (sample is not null && sample.Pressure01 is null && ctx.Pressures.Count == 0 && ctx.GroupKey.Length > 0)
+            {
+                double? gp = LookupGroupPressure(ctx.GroupKey, sample.ContactId);
+                if (gp is double g)
+                    sample = sample with { Pressure01 = g };
+            }
 
             return WmInputResult.Handled;
         }
@@ -373,31 +521,47 @@ public static class HidReader
     {
         long bestScore = 0;
         RawTouchSample? best = null;
-        var links = new List<string>();
 
         for (int i = 0; i < reports.Count; i++)
         {
             byte[] report = reports[i];
+            long reportBest = 0;
+            LinkValues? pick = null;
+            var frames = new List<string>();
+            var contacts = new List<RawLink>();
+
             foreach (ushort link in ctx.Links)
             {
                 if (!TryReadLink(ctx, report, (uint)report.Length, link, requireTip, out LinkValues v))
                     continue;
 
-                links.Add($"L{v.Link} W={v.WLogical} H={v.HLogical}");
-                long score = (long)v.WLogical * v.HLogical;
-                if (score <= bestScore)
-                    continue;
-
-                bestScore = score;
-                best = new RawTouchSample(ctx.Name, v.Wmm, v.Hmm,
+                frames.Add($"L{v.Link} W={v.WLogical} H={v.HLogical}");
+                contacts.Add(new RawLink(v.Link, v.ContactId, v.WLogical, v.HLogical, v.Wmm, v.Hmm,
                     v.XLogMax > 0 ? (double)v.XLogical / v.XLogMax : null,
-                    v.YLogMax > 0 ? (double)v.YLogical / v.YLogMax : null,
-                    v.Pressure01,
-                    v.WLogical, v.HLogical, v.XLogical, v.YLogical, v.XLogMax, v.YLogMax,
-                    v.WLogMax, v.HLogMax,
-                    ctx.XPhysMm, ctx.YPhysMm,
-                    v.Link, $"子报文{i + 1}/{reports.Count}：" + string.Join("，", links), ToHex(report));
+                    v.YLogMax > 0 ? (double)v.YLogical / v.YLogMax : null, v.Pressure01));
+
+                long score = (long)v.WLogical * v.HLogical;
+                if (score > reportBest)
+                {
+                    reportBest = score;
+                    pick = v;
+                }
             }
+
+            if (pick is null || reportBest <= bestScore)
+                continue;
+
+            bestScore = reportBest;
+            LinkValues bw = pick.Value;
+            best = new RawTouchSample(ctx.Name, bw.Wmm, bw.Hmm,
+                bw.XLogMax > 0 ? (double)bw.XLogical / bw.XLogMax : null,
+                bw.YLogMax > 0 ? (double)bw.YLogical / bw.YLogMax : null,
+                bw.Pressure01,
+                bw.WLogical, bw.HLogical, bw.XLogical, bw.YLogical, bw.XLogMax, bw.YLogMax,
+                bw.WLogMax, bw.HLogMax,
+                ctx.XPhysMm, ctx.YPhysMm,
+                bw.Link, $"子报文{i + 1}/{reports.Count}：" + string.Join("，", frames), ToHex(report), bw.ContactId,
+                contacts);
         }
         return best;
     }
@@ -435,13 +599,15 @@ public static class HidReader
         bool hasX = xc is not null && Get(0x01, link, 0x30, out x);
         bool hasY = yc is not null && Get(0x01, link, 0x31, out y);
         bool hasP = pc is not null && Get(0x0D, link, 0x30, out p);
+        bool hasCid = Get(0x0D, link, 0x51, out uint cid);
 
         v = new LinkValues(link,
             (int)w, (int)h, wc!.LogMax, hc!.LogMax,
             ToMm(w, wc.LogMax, wc.PhysMax, wc.Exp, wc.Units),
             ToMm(h, hc.LogMax, hc.PhysMax, hc.Exp, hc.Units),
             (int)x, (int)y, hasX ? xc!.LogMax : 0, hasY ? yc!.LogMax : 0,
-            hasP && pc!.LogMax > pc.LogMin ? Math.Clamp((double)(p - (uint)pc.LogMin) / (pc.LogMax - pc.LogMin), 0, 1) : null);
+            hasP && pc!.LogMax > pc.LogMin ? Math.Clamp((double)(p - (uint)pc.LogMin) / (pc.LogMax - pc.LogMin), 0, 1) : null,
+            hasCid ? (int)cid : 0);
         return true;
 
         bool Get(ushort page, ushort lc, ushort usage, out uint value)
@@ -459,6 +625,63 @@ public static class HidReader
             if (usages[i] == UsageTipSwitch)
                 return true;
         return false;
+    }
+
+    /// <summary>把本帧各按下触点的压感按 ContactID 记进「同一逻辑屏」缓存（供不带压感的兄弟集合补齐）。</summary>
+    private static void CacheFramePressure(DeviceCtx ctx, List<byte[]> reports)
+    {
+        if (ctx.GroupKey.Length == 0)
+            return;
+        if (!_groupPressure.TryGetValue(ctx.GroupKey, out GroupPressureState? st))
+        {
+            st = new GroupPressureState();
+            _groupPressure[ctx.GroupKey] = st;
+        }
+
+        long now = Environment.TickCount64;
+        foreach (byte[] rep in reports)
+        {
+            uint len = (uint)rep.Length;
+            foreach (ushort link in ctx.Links)
+            {
+                Cap? pc = ctx.Pressures.FirstOrDefault(c => c.Link == link);
+                if (pc is null || pc.LogMax <= pc.LogMin)
+                    continue;
+
+                // 声明了 TipSwitch 就按它判「真的按下」；否则按 pressure 值判
+                if (ctx.TipSwitchLinks.Contains(link) && !TipPressed(ctx, rep, len, link))
+                    continue;
+                if (HidP_GetUsageValue(HidP_Input, 0x0D, link, 0x30, out uint p, ctx.Preparsed, rep, len) != HIDP_STATUS_SUCCESS)
+                    continue;
+                if (ctx.TipSwitchLinks.Count == 0 && p <= (uint)pc.LogMin)
+                    continue;
+
+                int cid = 0;
+                if (HidP_GetUsageValue(HidP_Input, 0x0D, link, 0x51, out uint c, ctx.Preparsed, rep, len) == HIDP_STATUS_SUCCESS)
+                    cid = (int)c;
+
+                double pf = Math.Clamp((double)(p - (uint)pc.LogMin) / (pc.LogMax - pc.LogMin), 0, 1);
+                st.ByContact[cid] = (pf, now);
+                if (pf > 0)
+                {
+                    st.Latest = pf;
+                    st.LatestTicks = now;
+                }
+            }
+        }
+    }
+
+    /// <summary>取同屏最近的压感：先按 ContactID 匹配，再退化到最新值；超出时间窗返回 null。</summary>
+    private static double? LookupGroupPressure(string groupKey, int contactId)
+    {
+        if (!_groupPressure.TryGetValue(groupKey, out GroupPressureState? st))
+            return null;
+        long now = Environment.TickCount64;
+        if (st.ByContact.TryGetValue(contactId, out (double P, long Ticks) v) && now - v.Ticks <= PressureWindowMs)
+            return v.P;
+        if (st.Latest is double l && now - st.LatestTicks <= PressureWindowMs)
+            return l;
+        return null;
     }
 
     /// <summary>设备没声明物理量程时，用标定比例把"逻辑计数"换算成毫米：mm = 计数 × 本比例。</summary>
