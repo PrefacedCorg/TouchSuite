@@ -260,6 +260,8 @@
                             <TextBlock x:Name="PalmLiveText" FontFamily="Consolas" FontSize="12" Margin="0,6,0,0" Text="实时：—" />
                             <TextBlock x:Name="PalmPeakText" FontFamily="Consolas" FontSize="12" Margin="0,6,0,0" Text="本次峰值：—&#x0a;记录后开始测下一次（建议多按几次取中值）" />
                             <Button Content="记录手掌" Margin="0,10,0,0" Padding="10,4" Click="OnRecordPalm" />
+                            <Button Content="跳过（只报坐标→用多点识别）" Margin="0,6,0,0" Padding="10,4"
+                                    Click="OnSkipPalmArea" />
                         </StackPanel>
                     </Border>
                 </Grid>
@@ -300,6 +302,8 @@
                             <TextBlock x:Name="FingerLiveText" FontFamily="Consolas" FontSize="12" Margin="0,6,0,0" Text="实时：—" />
                             <TextBlock x:Name="FingerPeakText" FontFamily="Consolas" FontSize="12" Margin="0,6,0,0" Text="本次峰值：—&#x0a;记录后开始测下一次（建议多按几次取中值）" />
                             <Button Content="记录手指" Margin="0,10,0,0" Padding="10,4" Click="OnRecordFinger" />
+                            <Button Content="跳过（只报坐标→用多点识别）" Margin="0,6,0,0" Padding="10,4"
+                                    Click="OnSkipFingerArea" />
                         </StackPanel>
                     </Border>
                 </Grid>

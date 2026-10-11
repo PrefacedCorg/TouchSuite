@@ -1375,6 +1375,39 @@ public partial class MainWindow : Window
         SetStatus($"已记录第 {_fingerAreas.Count} 次手指面积 {Precision.Fmt(a, 0)} px²（可再按几次取中值）。");
     }
 
+    /// <summary>跳过手掌按压测面积：设备只报坐标、不报接触尺寸时用，退回「多点识别手掌擦」
+    /// （擦除区取标定手掌大小，面积阈值判定不启用）。</summary>
+    private void OnSkipPalmArea(object sender, RoutedEventArgs e)
+    {
+        _palmAreas.Clear();
+        _palmPressures.Clear();
+        _palmPeakAreaPx2 = null;
+        _palmPeakPressure = null;
+        _result.PalmContactAreaPx2 = null;
+        _result.PalmPressure = null;
+        RefreshPalmPeakText();
+        RefreshInfoBar();
+        Log.Info("跳过手掌按压测面积（设备不报接触尺寸）→ 使用多点识别手掌擦");
+        SetStatus("已跳过手掌面积测量：改用多点识别手掌擦（擦除区取标定手掌大小）。");
+        Advance();
+    }
+
+    /// <summary>跳过手指按压测面积：同上，面积阈值判定不启用。</summary>
+    private void OnSkipFingerArea(object sender, RoutedEventArgs e)
+    {
+        _fingerAreas.Clear();
+        _fingerPressures.Clear();
+        _fingerPeakAreaPx2 = null;
+        _fingerPeakPressure = null;
+        _result.FingerContactAreaPx2 = null;
+        _result.FingerPressure = null;
+        RefreshFingerPeakText();
+        RefreshInfoBar();
+        Log.Info("跳过手指按压测面积（设备不报接触尺寸）→ 使用多点识别手掌擦");
+        SetStatus("已跳过手指面积测量：改用多点识别手掌擦（擦除区取标定手掌大小）。");
+        Advance();
+    }
+
     // ================= 步骤 7：结果 =================
 
     private void BuildResult()
