@@ -1,5 +1,8 @@
+using System.Collections.Generic;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Ink;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
@@ -58,6 +61,9 @@ public partial class EraserPreviewPage : UserControl
         Engine.LockPalmSize = LockPalmSizeCheck.IsChecked == true;
         Engine.SmoothJitter = SmoothJitterCheck.IsChecked == true;
         Engine.MultiTouchAsPalm = MultiTouchPalmCheck.IsChecked == true;
+        Engine.MultiTouchPalmMin = Math.Max(2, MultiTouchMinCombo.SelectedIndex + 2);
+        Engine.PalmGroupWindowMs = ParsePalmWindow();
+        Engine.PalmGroupTol = PalmGroupTolSlider.Value;
         Engine.SizeLimit = CurrentPalmLimit();
         Engine.PalmPressureEnabled = PalmPressureCheck.IsChecked == true;
         Engine.AreaThresholdEnabled = AreaThresholdCheck.IsChecked == true;
@@ -158,6 +164,9 @@ public partial class EraserPreviewPage : UserControl
         if (r.LockPalmSize is bool lp) LockPalmSizeCheck.IsChecked = lp;
         if (r.SmoothJitter is bool sj) SmoothJitterCheck.IsChecked = sj;
         if (r.MultiTouchAsPalm is bool mt) MultiTouchPalmCheck.IsChecked = mt;
+        if (r.MultiTouchPalmMin is int mp) MultiTouchMinCombo.SelectedIndex = Math.Clamp(mp - 2, 0, 3);
+        if (r.PalmGroupWindowMs is int gw) PalmGroupWindowBox.Text = gw.ToString();
+        if (r.PalmGroupTol is double gt) PalmGroupTolSlider.Value = Math.Clamp(gt, 1, 2);
         PalmLimit limit;
         if (!string.IsNullOrEmpty(r.PalmLimit) && Enum.TryParse(r.PalmLimit, out PalmLimit pl)) limit = pl;
         else if (r.PalmFloorEnabled is bool pf) limit = pf ? PalmLimit.Floor : PalmLimit.None;
@@ -219,7 +228,8 @@ public partial class EraserPreviewPage : UserControl
                 Engine.KTrim, Engine.AreaThresholdPx2,
                 Engine.PalmPressureThreshold, Engine.PalmNormMax,
                 Engine.WritingPressureThreshold, Engine.WritingNormMax,
-                Engine.Shape, Engine.Aspect, aw, ah, Engine.SizeScale, Engine.MultiTouchAsPalm);
+                Engine.Shape, Engine.Aspect, aw, ah, Engine.SizeScale, Engine.MultiTouchAsPalm, Engine.MultiTouchPalmMin,
+                Engine.PalmGroupWindowMs, Engine.PalmGroupTol);
         }
     }
 
@@ -399,46 +409,66 @@ public partial class EraserPreviewPage : UserControl
         => new(diu.X * Engine.PxPerDiuX, diu.Y * Engine.PxPerDiuY,
                diu.Width * Engine.PxPerDiuX, diu.Height * Engine.PxPerDiuY);
 
-    /// <summary>把 HID 的尺寸（物理像素）+ 归一化坐标合成一个原始HID 矩形喂给引擎（id 固定 0）。
+    /// <summary>把 HID 的尺寸（物理像素）+ 归一化坐标合成矩形喂给引擎。
+    /// **多指 = 逐根接触各喂一次**（多指书写 / 多指擦除都保留，各按各的面积判定）；
+    /// 「多点判手掌」由引擎按时间窗 + 大小范围判定。
     /// Xn/Yn 为数字化器归一化坐标 → 虚拟桌面 DIP → 预览区局部坐标。</summary>
     private void SubmitHidRect(TouchSample s)
     {
-        (double? wPx, double? hPx) = HidScale.ContactPx(s, _resX, _resY, Engine.SizeScale);
-        if (wPx is not double w || hPx is not double h || !(w > 0) || !(h > 0))
-            return;
-
-        // 多触点求和（≥2 接触）且开关打开 → 整帧当一块手掌：面积取各接触之和，判手掌擦
-        bool multi = false;
-        if (Engine.MultiTouchAsPalm && s.Contacts is { Count: >= 2 } rc)
-        {
-            double af = HidScale.AreaFactor(s.WidthLogMax, s.HeightLogMax, _resX, _resY);
-            double sum = 0;
-            bool any = false;
-            foreach (ContactRect c in rc)
-                if (c.WLogical > 0 && c.HLogical > 0)
-                {
-                    sum += c.WLogical * (double)c.HLogical * af;
-                    any = true;
-                }
-            if (any && sum > 0)
-            {
-                double side = Math.Sqrt(sum);
-                w = side;
-                h = side;
-                multi = true;
-            }
-        }
-
         double sx = Engine.PxPerDiuX > 0 ? Engine.PxPerDiuX : 1;
         double sy = Engine.PxPerDiuY > 0 ? Engine.PxPerDiuY : 1;
+        DpiScale dpi = VisualTreeHelper.GetDpi(this);
+        Point hostOrigin = Host.PointToScreen(new Point(0, 0));
 
-        double cx, cy;
-        if (s.XNorm is double xn && s.YNorm is double yn)
+        // 多指：逐根接触各算各的面积 / 位置 / 判定
+        if (s.Contacts is { Count: > 1 } contacts)
         {
-            DpiScale dpi = VisualTreeHelper.GetDpi(this);
-            Point hostOrigin = Host.PointToScreen(new Point(0, 0));   // 设备像素
-            double screenDipX = SystemParameters.VirtualScreenLeft + Math.Clamp(xn, 0, 1) * SystemParameters.VirtualScreenWidth;
-            double screenDipY = SystemParameters.VirtualScreenTop + Math.Clamp(yn, 0, 1) * SystemParameters.VirtualScreenHeight;
+            (double fw, double fh) = HidScale.Factors(s.WidthLogMax, s.HeightLogMax, _resX, _resY, Engine.SizeScale);
+
+            foreach (ContactRect c in contacts)
+            {
+                if (c.WLogical <= 0 || c.HLogical <= 0)
+                    continue;
+                double w = c.WLogical * fw;
+                double h = c.HLogical * fh;
+                if (w <= 0 || h <= 0)
+                    continue;
+
+                (double cx, double cy) = HidCenterToLocal(c.XNorm, c.YNorm, sx, sy, dpi, hostOrigin);
+                Engine.Submit(ContactSource.RawHid, c.Id,
+                    new Rect(cx - w / 2, cy - h / 2, w, h),
+                    applyThreshold: false,
+                    detail: $"#{c.Id} 计数 {c.WLogical}×{c.HLogical} → {Precision.Fmt(w)}×{Precision.Fmt(h)} px = {Precision.Fmt(w * h, 0)} px²",
+                    deviceKey: s.DeviceKey);
+            }
+            return;
+        }
+
+        // 单指：沿用原路径
+        (double? wPx, double? hPx) = HidScale.ContactPx(s, _resX, _resY, Engine.SizeScale);
+        if (wPx is not double w1 || hPx is not double h1 || !(w1 > 0) || !(h1 > 0))
+            return;
+
+        (double cx0, double cy0) = HidCenterToLocal(s.XNorm, s.YNorm, sx, sy, dpi, hostOrigin);
+        Engine.Submit(ContactSource.RawHid, 0,
+            new Rect(cx0 - w1 / 2, cy0 - h1 / 2, w1, h1),
+            applyThreshold: false,
+            detail: $"HID 计数 {s.WidthLogical}/{s.WidthLogMax}、{s.HeightLogical}/{s.HeightLogMax}"
+                  + $" ÷ 量程 × 分辨率({_resX}×{_resY}) = {Precision.Fmt(w1)}×{Precision.Fmt(h1)} px = {Precision.Fmt(w1 * h1, 0)} px²",
+            deviceKey: s.DeviceKey);
+    }
+
+    /// <summary>HID 归一化坐标 → 预览区局部**物理像素**。**不夹取**：夹到预览区会把多点组的
+    /// 跨度压到预览区大小以内（预览区通常比手掌还窄），导致"跨度永远 ≤ 手掌"而误判手掌。
+    /// 画到区外没关系，Overlay/Ink 都有 ClipToBounds。</summary>
+    private (double cx, double cy) HidCenterToLocal(double? xn, double? yn,
+        double sx, double sy, DpiScale dpi, Point hostOrigin)
+    {
+        double cx, cy;
+        if (xn is double x && yn is double y)
+        {
+            double screenDipX = SystemParameters.VirtualScreenLeft + Math.Clamp(x, 0, 1) * SystemParameters.VirtualScreenWidth;
+            double screenDipY = SystemParameters.VirtualScreenTop + Math.Clamp(y, 0, 1) * SystemParameters.VirtualScreenHeight;
             cx = (screenDipX - hostOrigin.X / dpi.DpiScaleX) * sx;
             cy = (screenDipY - hostOrigin.Y / dpi.DpiScaleY) * sy;
         }
@@ -448,20 +478,13 @@ public partial class EraserPreviewPage : UserControl
             cy = Host.ActualHeight / 2 * sy;
         }
 
-        // 夹取到预览区内，避免坐标异常时把擦除区画到看不见的地方
-        if (Host.ActualWidth > 0)
-            cx = Math.Clamp(cx, 0, Host.ActualWidth * sx);
-        if (Host.ActualHeight > 0)
-            cy = Math.Clamp(cy, 0, Host.ActualHeight * sy);
-
-        Engine.Submit(ContactSource.RawHid, 0,
-            new Rect(cx - w / 2, cy - h / 2, w, h),
-            applyThreshold: false,
-            detail: multi
-                ? $"多触点求和 {s.Contacts!.Count} 指 → {Precision.Fmt(w * h, 0)} px²（判手掌擦）"
-                : $"HID 计数 {s.WidthLogical}/{s.WidthLogMax}、{s.HeightLogical}/{s.HeightLogMax}"
-                  + $" ÷ 量程 × 分辨率({_resX}×{_resY}) = {Precision.Fmt(w)}×{Precision.Fmt(h)} px = {Precision.Fmt(w * h, 0)} px²",
-            deviceKey: s.DeviceKey, multiPalm: multi);
+        if (Environment.TickCount64 - _lastHidDiagTicks > 400)
+        {
+            _lastHidDiagTicks = Environment.TickCount64;
+            Log.Info($"[HID坐标] xn={xn?.ToString("0.####") ?? "null"} yn={yn?.ToString("0.####") ?? "null"}"
+                   + $" → ({cx:0},{cy:0}) sx={sx:0.####} host=({hostOrigin.X:0},{hostOrigin.Y:0}) hostSize={Host.ActualWidth:0}×{Host.ActualHeight:0}");
+        }
+        return (cx, cy);
     }
 
     // ================= 参数控件 =================
@@ -488,6 +511,7 @@ public partial class EraserPreviewPage : UserControl
         bool palmOn = PalmPressureCheck?.IsChecked == true;
         bool writeOn = WritingPressureCheck?.IsChecked == true;
         bool areaThrOn = AreaThresholdCheck?.IsChecked == true;
+        bool multiOn = MultiTouchPalmCheck?.IsChecked == true;
         bool followSize = FollowSizeCheck?.IsChecked == true;
         bool aspectCustom = AspectCustom?.IsChecked == true;
         bool aspectContact = AspectContact?.IsChecked == true;
@@ -501,7 +525,8 @@ public partial class EraserPreviewPage : UserControl
         if (WritingPressureDetailPanel is not null) WritingPressureDetailPanel.Visibility = Vis(writeOn);
 
         if (AreaThresholdDetailPanel is not null) AreaThresholdDetailPanel.Visibility = Vis(areaThrOn);
-        if (WritingSection is not null) WritingSection.Visibility = Vis(areaThrOn);
+        if (MultiTouchDetailPanel is not null) MultiTouchDetailPanel.Visibility = Vis(multiOn);
+        if (WritingSection is not null) WritingSection.Visibility = Vis(areaThrOn || multiOn);
 
         if (PalmLimitPanel is not null) PalmLimitPanel.Visibility = Vis(followSize);
 
@@ -749,6 +774,51 @@ public partial class EraserPreviewPage : UserControl
         Engine.NotifyChanged();
     }
 
+    private void OnMultiTouchMinChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (MultiTouchMinCombo is null)
+            return;
+        Engine.MultiTouchPalmMin = Math.Max(2, MultiTouchMinCombo.SelectedIndex + 2);
+        Engine.NotifyChanged();
+    }
+
+    private int ParsePalmWindow()
+        => PalmGroupWindowBox is not null && int.TryParse(PalmGroupWindowBox.Text?.Trim(), out int v)
+            ? Math.Clamp(v, 0, 2000) : 200;
+
+    private void OnPalmGroupWindowChanged(object sender, RoutedEventArgs e)
+    {
+        if (PalmGroupWindowBox is null)
+            return;
+        Engine.PalmGroupWindowMs = ParsePalmWindow();
+        PalmGroupWindowBox.Text = Engine.PalmGroupWindowMs.ToString();
+        Engine.NotifyChanged();
+    }
+
+    private void OnPalmGroupWindowKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter)
+            return;
+        OnPalmGroupWindowChanged(sender, e);
+        e.Handled = true;
+    }
+
+    private void OnPalmGroupTolChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (Engine is null || PalmGroupTolSlider is null)
+            return;
+        Engine.PalmGroupTol = PalmGroupTolSlider.Value;
+        if (PalmGroupTolValueText is not null)
+            PalmGroupTolValueText.Text = $"×{PalmGroupTolSlider.Value:0.00}（手掌宽高的倍数上限）";
+        Engine.NotifyChanged();
+    }
+
+    private void OnResetPalmGroupTol(object sender, RoutedEventArgs e)
+    {
+        if (PalmGroupTolSlider is not null)
+            PalmGroupTolSlider.Value = 1.0;
+    }
+
     /// <summary>「限制」三选一：不限 / 下限 / 上限。</summary>
     private void OnPalmLimitChanged(object sender, RoutedEventArgs e)
     {
@@ -824,7 +894,7 @@ public partial class EraserPreviewPage : UserControl
         else
             sb.Append("压感: 无\n");
 
-        double? areaPx2 = SamplePx.AreaPx2(s, _resX, _resY, Engine.PxPerDiuX, Engine.PxPerDiuY, Engine.MultiTouchAsPalm);
+        double? areaPx2 = SamplePx.AreaPx2(s, _resX, _resY, Engine.PxPerDiuX, Engine.PxPerDiuY);
         (double W, double H)? size = SamplePx.SizePx(s, _resX, _resY, Engine.SizeScale, Engine.PxPerDiuX, Engine.PxPerDiuY);
         if (size is not null)
             sb.Append($"尺寸（px）= {size.Value.W:0.#}×{size.Value.H:0.#}"
@@ -876,6 +946,97 @@ public partial class EraserPreviewPage : UserControl
             tb.Text = text;
     }
 
+    // ================= 简易画布（InkCanvas） =================
+
+    private readonly Dictionary<int, List<Stroke>> _inkById = new();
+    private readonly Dictionary<int, (double X, double Y)> _lastInkPos = new();
+    private long _lastDiagTicks;
+    private long _lastHidDiagTicks;
+
+    /// <summary>诊断：每 ~0.5s 打一次各接触的判定（写/擦、是否多点判手掌、尺寸、位置）。</summary>
+    private void DiagLogClassification()
+    {
+        long now = Environment.TickCount64;
+        if (now - _lastDiagTicks < 500)
+            return;
+        _lastDiagTicks = now;
+
+        var sb = new System.Text.StringBuilder();
+        foreach ((int id, Rect c) in Engine.LastContacts)
+            sb.Append($" #{id}→{(Engine.IsWriting(id) ? "写" : "擦")}[多点={Engine.IsPalmMulti(id)},定夺={Engine.IsPalmDecided(id)}]"
+                    + $" {c.Width:0}×{c.Height:0}px@({c.X + c.Width / 2:0},{c.Y + c.Height / 2:0})");
+        Log.Info($"[画布判定] 墨 {Ink?.Strokes.Count ?? 0} 笔（手掌 {Engine.PalmWidthPx:0}×{Engine.PalmHeightPx:0}px）|{sb}");
+    }
+
+    private void OnClearInk(object sender, RoutedEventArgs e)
+    {
+        Ink?.Strokes.Clear();
+        _inkById.Clear();
+        _lastInkPos.Clear();
+    }
+
+    /// <summary>书写：在画布上落一个墨点，并记在「这根的」名下（以便日后被判手掌时撤销）。</summary>
+    private void AddInkDot(int id, double cx, double cy, double radiusDip)
+    {
+        if (Ink is null || radiusDip <= 0.5)
+            return;
+        if (_lastInkPos.TryGetValue(id, out var p) && Math.Abs(cx - p.X) < 3 && Math.Abs(cy - p.Y) < 3)
+            return;
+        _lastInkPos[id] = (cx, cy);
+
+        var points = new StylusPointCollection { new StylusPoint(cx, cy) };
+        var attrs = new DrawingAttributes
+        {
+            Color = Colors.White,
+            Width = radiusDip * 2,
+            Height = radiusDip * 2,
+            FitToCurve = false,
+            StylusTip = StylusTip.Ellipse,
+        };
+        var stroke = new Stroke(points, attrs);
+        Ink.Strokes.Add(stroke);
+        if (!_inkById.TryGetValue(id, out var list))
+        {
+            list = new List<Stroke>();
+            _inkById[id] = list;
+        }
+        list.Add(stroke);
+    }
+
+    /// <summary>某根接触被改判为手掌擦 → 撤销它当初写下的墨迹。</summary>
+    private void CancelInk(int id)
+    {
+        if (Ink is null)
+            return;
+        if (_inkById.TryGetValue(id, out var list))
+        {
+            foreach (Stroke st in list)
+                Ink.Strokes.Remove(st);
+            _inkById.Remove(id);
+            Log.Info($"[画布] 撤销 #{id} 的 {list.Count} 笔墨（改判手掌）");
+        }
+        _lastInkPos.Remove(id);
+    }
+
+    /// <summary>手掌擦：抹掉与擦除区相交的墨迹。</summary>
+    private void EraseInk(Rect r)
+    {
+        if (Ink is null || Ink.Strokes.Count == 0)
+            return;
+        var hit = new List<Stroke>();
+        foreach (Stroke st in Ink.Strokes)
+            if (st.GetBounds().IntersectsWith(r))
+                hit.Add(st);
+        foreach (Stroke st in hit)
+        {
+            Ink.Strokes.Remove(st);
+            foreach (var kv in _inkById)
+                kv.Value.Remove(st);
+        }
+        if (hit.Count > 0)
+            Log.Info($"[画布] 手掌扫掉 {hit.Count} 笔墨");
+    }
+
     private void Redraw()
     {
         if (Overlay is null)
@@ -888,6 +1049,7 @@ public partial class EraserPreviewPage : UserControl
         SetText(PressureInfoText, Engine.PressureInfo());
         SetText(JudgeText, Engine.JudgeInfo());
         SetText(EraserInfoText, string.IsNullOrEmpty(Engine.SizeHint) ? Engine.EraserInfo() : Engine.SizeHint);
+        DiagLogClassification();
         SetText(HidInfoText, BuildTouchInfo());
         AreaThresholdValueText.Text = Engine.HasThresholdRange
             ? $"当前 {Precision.Fmt(Engine.AreaThresholdPx2, 0)} px²"
@@ -895,12 +1057,17 @@ public partial class EraserPreviewPage : UserControl
 
         // 抬手（来源过期）后不再画：形状应消失，只保留文字留档
         if (!Engine.HasLiveContact)
+        {
+            _lastInkPos.Clear();
             return;
+        }
 
         double px2DiuX = Engine.PxPerDiuX > 0 ? Engine.PxPerDiuX : 1;
         double px2DiuY = Engine.PxPerDiuY > 0 ? Engine.PxPerDiuY : 1;
 
-        // 多指：每根接触各画各的框（各按各的面积/判定）
+        // 多指：书写各画各的；手掌擦里，多点组**合成一个**（重心处、手掌同大），面积判定的各自画
+        var multiPalm = new List<(double cx, double cy)>();
+
         foreach ((int id, Rect c) in Engine.LastContacts)
         {
             double cx = (c.X + c.Width / 2) / px2DiuX;
@@ -921,6 +1088,13 @@ public partial class EraserPreviewPage : UserControl
                 Overlay.Children.Add(pen);
                 Canvas.SetLeft(pen, cx - d / 2);
                 Canvas.SetTop(pen, cy - d / 2);
+                AddInkDot(id, cx, cy, d / 2);
+            }
+            else if (Engine.IsPalmMulti(id))
+            {
+                // 多点判手掌：这根不单独画擦除区，收集起来到重心处合画一个
+                CancelInk(id);
+                multiPalm.Add((cx, cy));
             }
             else
             {
@@ -936,12 +1110,42 @@ public partial class EraserPreviewPage : UserControl
                 Overlay.Children.Add(shape);
                 Canvas.SetLeft(shape, cx - w / 2);
                 Canvas.SetTop(shape, cy - h / 2);
+                CancelInk(id);
+                EraseInk(new Rect(cx - w / 2, cy - h / 2, w, h));
             }
 
             var dot = new Ellipse { Width = 6, Height = 6, Fill = Brushes.Yellow };
             Overlay.Children.Add(dot);
             Canvas.SetLeft(dot, cx - 3);
             Canvas.SetTop(dot, cy - 3);
+        }
+
+        // 多点组：在这些点的**重心**处画「一个」与手掌同大的擦除区
+        if (multiPalm.Count > 0)
+        {
+            double mx = 0, my = 0;
+            foreach ((double cx, double cy) in multiPalm)
+            {
+                mx += cx;
+                my += cy;
+            }
+            mx /= multiPalm.Count;
+            my /= multiPalm.Count;
+
+            (double w, double h) = Engine.PalmSizeDiu();
+            if (w > 0 && h > 0)
+            {
+                Shape shape = Engine.Shape == EraserShape.Circle
+                    ? new Ellipse { Width = w, Height = h }
+                    : new Rectangle { Width = w, Height = h };
+                shape.Stroke = Brushes.Lime;
+                shape.StrokeThickness = 2;
+                shape.Fill = new SolidColorBrush(Color.FromArgb(0x33, 0x00, 0xFF, 0x00));
+                Overlay.Children.Add(shape);
+                Canvas.SetLeft(shape, mx - w / 2);
+                Canvas.SetTop(shape, my - h / 2);
+                EraseInk(new Rect(mx - w / 2, my - h / 2, w, h));
+            }
         }
     }
 }

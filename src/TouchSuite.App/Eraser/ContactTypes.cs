@@ -122,32 +122,16 @@ public static class HidScale
 public static class SamplePx
 {
     /// <summary>样本的接触面积（px²）：RawHID = 宽计数 × 高计数 × 面积因子（各向同性，与形状比例无关）；
-    /// WPF = 分指接触框面积之和。<paramref name="sumRawContacts"/> 为真且样本带分指列表时，RawHID 也按各接触求和。</summary>
+    /// WPF = 分指接触框面积之和。</summary>
     public static double? AreaPx2(TouchSample s, int resX, int resY,
-        double pxPerDiuX, double pxPerDiuY, bool sumRawContacts = true)
+        double pxPerDiuX, double pxPerDiuY)
     {
         if (s.Source == "RawHID")
         {
-            double af = HidScale.AreaFactor(s.WidthLogMax, s.HeightLogMax, resX, resY);
-            if (af <= 0)
-                return null;
-
-            if (sumRawContacts && s.Contacts is { Count: > 0 } rawList)
-            {
-                double sumRaw = 0;
-                bool anyRaw = false;
-                foreach (ContactRect c in rawList)
-                    if (c.WLogical > 0 && c.HLogical > 0)
-                    {
-                        sumRaw += (double)c.WLogical * c.HLogical * af;
-                        anyRaw = true;
-                    }
-                return anyRaw ? sumRaw : null;
-            }
-
             if (s.WidthLogical <= 0 || s.HeightLogical <= 0)
                 return null;
-            return s.WidthLogical * s.HeightLogical * af;
+            double af = HidScale.AreaFactor(s.WidthLogMax, s.HeightLogMax, resX, resY);
+            return af > 0 ? s.WidthLogical * s.HeightLogical * af : null;
         }
 
         if (s.Contacts is { Count: > 0 } list)
@@ -206,7 +190,7 @@ public sealed record EraserSettings(
     double PalmPressureThreshold, double PalmNormMax,
     double WritingPressureThreshold, double WritingNormMax,
     EraserShape Shape, AspectSource Aspect, double CustomAspectW, double CustomAspectH,
-    HidSizeScale SizeScale, bool MultiTouchAsPalm)
+    HidSizeScale SizeScale, bool MultiTouchAsPalm, int MultiTouchPalmMin, int PalmGroupWindowMs, double PalmGroupTol)
 {
     /// <summary>设置齐全的默认值（引擎未标定/未载入时用）。</summary>
     public static EraserSettings Default { get; } = new(
@@ -217,5 +201,5 @@ public sealed record EraserSettings(
         PalmPressureThreshold: 0.5, PalmNormMax: 2,
         WritingPressureThreshold: 0.5, WritingNormMax: 2,
         Shape: EraserShape.Rectangle, Aspect: AspectSource.Contact, CustomAspectW: 1, CustomAspectH: 1,
-        SizeScale: HidSizeScale.Stretch, MultiTouchAsPalm: true);
+        SizeScale: HidSizeScale.Stretch, MultiTouchAsPalm: true, MultiTouchPalmMin: 3, PalmGroupWindowMs: 200, PalmGroupTol: 1.0);
 }

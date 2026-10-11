@@ -92,8 +92,18 @@ public sealed class EraserEngine
     /// <summary>平滑抖动：对压感做指数平滑、对擦除区尺寸加死区，避免轻微抖动导致擦除区一直闪。默认开。</summary>
     public bool SmoothJitter { get; set; } = true;
 
-    /// <summary>多触点求和（多点识别为手掌擦）：一帧里出现 ≥2 个接触时，整帧当一块手掌 → 判擦，并按其面积和。默认开。</summary>
+    /// <summary>多触点求和（多点识别为手掌擦）：一帧里出现 ≥<see cref="MultiTouchPalmMin"/> 个接触时，整帧当一块手掌 → 判擦，并按其面积和。默认开。</summary>
     public bool MultiTouchAsPalm { get; set; } = true;
+
+    /// <summary>判手掌的最少触点数（2~5）。调大即可放过多指书写（如 3 → ≤2 指仍走书写）。</summary>
+    public int MultiTouchPalmMin { get; set; } = 3;
+
+    /// <summary>多点判手掌的「时间窗」(ms)：先后按下相差不超过它的接触，算同一次按压（触摸屏上报有延迟）。默认 200。</summary>
+    public int PalmGroupWindowMs { get; set; } = 200;
+
+    /// <summary>多点判手掌的「大小范围」系数：把时间窗内这一组接触的所有点叠在一个坐标系里，
+    /// X 方向最远两点的差 = 宽、Y 同理 = 高；宽高 ≤ 手掌标定宽高 × 该系数才算手掌。默认 1.0。</summary>
+    public double PalmGroupTol { get; set; } = 1.0;
 
     /// <summary>随触摸尺寸时，擦除区大小相对「手掌标定面积」的限制：不限 / 下限 / 上限（默认下限）。
     /// 不限 = 接触面积×K（可小可大）；下限 = 不小于手掌（只增不减）；上限 = 不超过手掌（只减不增）。</summary>
@@ -195,13 +205,15 @@ public sealed class EraserEngine
     private sealed class Track
     {
         public long LastTicks;
+        public long DownTicks;           // 本次按下的时刻（首次出现）：用于「时间窗」把先后到来的接触归成一组
         public readonly List<Rect> History = new();
         public Rect? Median;             // 中值滤波后的最新接触矩形（px）
         public double LastPxW, LastPxH;
         public double PeakPxW, PeakPxH;
         public double LockedAreaPx2;     // 锁定模式：本指本次按压内见过的最大擦除区面积
         public bool PalmLatched;         // 锁定模式：本指已判定为手掌擦（保持到抬手，不再退回书写）
-        public bool MultiPalm;           // 本指来自「多点」帧（≥2 接触）→ 判手掌擦
+        public bool MultiPalm;           // 多点判手掌：本指所属组被判定为手掌擦
+        public bool MultiDecided;        // 多点判手掌：本指所属组已「定夺」（定完不再改，直到抬手）
         public double ShownW, ShownH;    // 平滑抖动：上次画出来的擦除区尺寸（px），微动沿用
     }
 
@@ -327,9 +339,9 @@ public sealed class EraserEngine
     /// <summary>提交一根接触的矩形（**物理像素**）。contactId 标识是哪根手指，
     /// 多根手指各调各的、各画各的框。applyThreshold=false 时不套尺寸阈值（原始 HID 的真值）。
     /// deviceKey = 该样本来自哪台 HID 触摸屏（见 <see cref="RawHidDeviceKey"/>）。
-    /// multiPalm = 该接触来自一帧多点（≥2 指）→ 开启「多点识别为手掌」时判为手掌擦。</summary>
+    /// 「多点判手掌」由引擎按「时间窗 + 大小范围」自行判定，不由此处传入。</summary>
     public void Submit(ContactSource src, int contactId, Rect rectPx, bool applyThreshold, string detail,
-        string deviceKey = "", bool multiPalm = false)
+        string deviceKey = "")
     {
         long now = Environment.TickCount64;
 
@@ -395,7 +407,8 @@ public sealed class EraserEngine
             _tracks.Clear(); // 换来源就重置滤波，避免不同量纲互相污染
         }
 
-        UpdateFromContact(contactId, rectPx, applyThreshold, multiPalm);
+        UpdateFromContact(contactId, rectPx, applyThreshold);
+        RecomputeMultiPalm();
         Raise();
     }
 
@@ -461,7 +474,7 @@ public sealed class EraserEngine
 
     // ================= 滤波 + 计算（按指独立）=================
 
-    private void UpdateFromContact(int id, Rect b, bool applyThreshold, bool multiPalm)
+    private void UpdateFromContact(int id, Rect b, bool applyThreshold)
     {
         bool tooSmall = b.Width <= 0 || b.Height <= 0;
         if (!tooSmall && applyThreshold)
@@ -480,7 +493,7 @@ public sealed class EraserEngine
 
         if (!_tracks.TryGetValue(id, out Track? track))
         {
-            track = new Track();
+            track = new Track { DownTicks = Environment.TickCount64 };
             _tracks[id] = track;
         }
 
@@ -492,8 +505,6 @@ public sealed class EraserEngine
                 Math.Abs(last.Width - b.Width) < 0.01 && Math.Abs(last.Height - b.Height) < 0.01)
                 return;
         }
-
-        track.MultiPalm = multiPalm;
 
         track.History.Add(b);
         if (track.History.Count > ContactHistoryMax)
@@ -526,6 +537,95 @@ public sealed class EraserEngine
         }
 
         SizeHint = "";
+    }
+
+    /// <summary>多点判手掌（时间窗 + 大小范围）。关键在「定夺一次」：把「按下时刻相差 ≤
+    /// PalmGroupWindowMs」的接触归成一组，等整组都按满一个窗口后，用这组**所有点**的宽高跨度
+    /// 一次性判定是手掌还是书写，并**锁死到抬手**——避免落笔瞬间被误判成手掌（把墨撤销）之后
+    /// 又翻来翻去，导致手指书写只剩一个点。</summary>
+    private void RecomputeMultiPalm()
+    {
+        long now = Environment.TickCount64;
+        var live = new List<Track>();
+        foreach (Track t in _tracks.Values)
+            if (t.Median is not null && now - t.LastTicks <= SourceFreshMs)
+                live.Add(t);
+
+        if (!MultiTouchAsPalm)
+        {
+            foreach (Track t in live)
+            {
+                t.MultiPalm = false;
+                t.MultiDecided = false;
+            }
+            return;
+        }
+
+        int min = Math.Max(2, MultiTouchPalmMin);
+        int win = Math.Max(0, PalmGroupWindowMs);
+
+        foreach (Track a in live)
+        {
+            if (a.MultiDecided)
+                continue;                       // 本组已定夺 → 保持
+
+            var group = new List<Track>();
+            foreach (Track t in live)
+                if (Math.Abs(t.DownTicks - a.DownTicks) <= win)
+                    group.Add(t);
+
+            if (group.Count < min)
+                continue;                       // 不够 N 根 → 暂不定夺（按书写）
+
+            // 锚点按下满一个窗口再定夺（躲开落笔瞬间的抖动）。用**锚点自身**的年龄判定，
+            // 不会被"不断新来的接触"无限推迟——触摸屏会频繁增删接触，用组内最晚时刻会永远定不了。
+            if (now - a.DownTicks < win)
+                continue;
+
+            bool palm = GroupWithinPalm(group);
+            GroupSpan(group, out double spanW, out double spanH);
+            Log.Info($"[多点判手掌] 组 {group.Count} 根，跨度 {spanW:0.0}×{spanH:0.0}px ／ 手掌 {PalmWidthPx:0.0}×{PalmHeightPx:0.0}px ×{PalmGroupTol:0.00} → {(palm ? "手掌擦" : "书写")}");
+            foreach (Track t in group)
+            {
+                t.MultiDecided = true;
+                t.MultiPalm = palm;
+            }
+        }
+    }
+
+    /// <summary>本指是否被「多点判手掌」判为手掌擦。</summary>
+    public bool IsPalmMulti(int id) => _tracks.TryGetValue(id, out Track? t) && t.MultiPalm;
+
+    /// <summary>本指所属多点组是否已定夺。</summary>
+    public bool IsPalmDecided(int id) => _tracks.TryGetValue(id, out Track? t) && t.MultiDecided;
+
+    /// <summary>这组接触是否落在手掌标定宽高范围内：把组内**所有点**叠在一个坐标系里，
+    /// 宽 = X 最远两点的差、高 = Y 最远两点的差，与手掌标定宽高 × 容差比较。没标定手掌尺寸则不约束。</summary>
+    private bool GroupWithinPalm(List<Track> group)
+    {
+        GroupSpan(group, out double spanW, out double spanH);
+        if (PalmWidthPx <= 0 || PalmHeightPx <= 0)
+            return true;
+        double tol = PalmGroupTol > 0 ? PalmGroupTol : 1.0;
+        return spanW <= PalmWidthPx * tol && spanH <= PalmHeightPx * tol;
+    }
+
+    /// <summary>组内所有点（各接触的历史采样中心）叠起来的外接宽 / 高（px）。</summary>
+    private static void GroupSpan(List<Track> group, out double spanW, out double spanH)
+    {
+        double minX = double.MaxValue, maxX = double.MinValue, minY = double.MaxValue, maxY = double.MinValue;
+        foreach (Track t in group)
+            foreach (Rect p in t.History)
+            {
+                double cx = p.X + p.Width / 2;
+                double cy = p.Y + p.Height / 2;
+                if (cx < minX) minX = cx;
+                if (cx > maxX) maxX = cx;
+                if (cy < minY) minY = cy;
+                if (cy > maxY) maxY = cy;
+            }
+        spanW = maxX >= minX ? maxX - minX : 0;
+        spanH = maxY >= minY ? maxY - minY : 0;
     }
 
     private static Rect MedianRect(List<Rect> items) => new(
@@ -637,6 +737,32 @@ public sealed class EraserEngine
         return double.IsFinite(w) && double.IsFinite(h) && w > 0 && h > 0 ? (w, h) : (0, 0);
     }
 
+    /// <summary>多点判手掌：在组**重心**处画的那「一个」与标定手掌同大的擦除区尺寸（DIU）。
+    /// = 标定手掌面积 × K 倍率 × 压感倍数²，再按当前形状 / 长宽比换算。手掌未标定时返回 (0,0)。</summary>
+    public (double w, double h) PalmSizeDiu()
+    {
+        if (PxPerDiuX <= 0 || PxPerDiuY <= 0)
+            return (0, 0);
+
+        double trim = Math.Clamp(KTrim, 0.5, 2.0);
+        double g = PalmGain;
+        double areaPx2 = PalmAreaPx2 * trim * g * g;
+        if (!(areaPx2 > 0))
+            return (0, 0);
+
+        double aspect = AspectFor(null);
+        double hPx = Shape == EraserShape.Circle
+            ? Math.Sqrt(4 * areaPx2 / (Math.PI * aspect))
+            : Math.Sqrt(areaPx2 / aspect);
+        double wPx = aspect * hPx;
+        if (!double.IsFinite(wPx) || !double.IsFinite(hPx) || wPx <= 0 || hPx <= 0)
+            return (0, 0);
+
+        double w = wPx / PxPerDiuX;
+        double h = hPx / PxPerDiuY;
+        return double.IsFinite(w) && double.IsFinite(h) && w > 0 && h > 0 ? (w, h) : (0, 0);
+    }
+
     /// <summary>擦除区尺寸（物理像素）。开启「平滑抖动」时加尺寸死区：
     /// 新尺寸和上一次画出来的差不到 <see cref="SizeHysteresisTol"/> 就保持不变，避免一直闪。</summary>
     public (double w, double h) SizePx(int id, Rect c)
@@ -714,25 +840,26 @@ public sealed class EraserEngine
     /// <summary>是否还有"新鲜"的接触（抬手/静默过期后为 false）。</summary>
     public bool HasLiveContact => _active != ContactSource.None && _tracks.Count > 0;
 
-    /// <summary>某根接触是否判为「书写」：启用面积阈值，且该指接触面积（px²）&lt; 阈值（按指独立判定）。
-    /// 例外：开启「锁定手掌大小」时，本指一旦判为手掌擦就保持到抬手，不再退回书写。</summary>
+    /// <summary>按指判定「书写 / 手掌擦」。手掌判定有两类（可同时启用）：①靠多点（本指落在多点组里）
+    /// ②靠面积（接触面积 ≥ 阈值）。两类都没命中才算书写；两类都关 → 没有手掌判定（全按书写）。</summary>
     public bool IsWriting(int id)
     {
-        if (!AreaThresholdEnabled)
-            return false;
         if (!_tracks.TryGetValue(id, out Track? t) || t.Median is not Rect c)
             return false;
 
-        if (LockPalmSize && t.PalmLatched)
-            return false;
-
-        // 多触点求和：本指来自多点帧（≥2 接触）→ 判手掌擦（不依赖面积，规避"手掌被拆成多根小接触"）
+        // ① 靠多点
         if (MultiTouchAsPalm && t.MultiPalm)
             return false;
 
-        if (AreaThresholdPx2 <= 0)
+        // ② 靠面积
+        if (AreaThresholdEnabled && AreaThresholdPx2 > 0 && c.Width * c.Height >= AreaThresholdPx2)
             return false;
-        return c.Width * c.Height < AreaThresholdPx2;
+
+        // 锁定模式：本指已判手掌擦则保持到抬手
+        if (LockPalmSize && t.PalmLatched)
+            return false;
+
+        return true;
     }
 
     // ================= 文字（界面直接显示） =================

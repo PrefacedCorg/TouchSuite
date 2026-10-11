@@ -52,6 +52,9 @@ public sealed class CalibrationResult
     public bool? LockPalmSize { get; set; }               // 禁止手掌擦缩小（擦时只增不减）
     public bool? SmoothJitter { get; set; }               // 平滑抖动（压感/尺寸微动不改擦除区）
     public bool? MultiTouchAsPalm { get; set; }           // 多触点求和（多点识别为手掌擦）
+    public int? MultiTouchPalmMin { get; set; }           // 判手掌最少触点数（2~5）
+    public int? PalmGroupWindowMs { get; set; }           // 多点判手掌时间窗（ms）
+    public double? PalmGroupTol { get; set; }             // 多点判手掌大小范围（手掌宽高的倍数上限）
     public string? PalmLimit { get; set; }                 // 随尺寸时的限制：None / Floor / Cap
     public bool? PalmFloorEnabled { get; set; }            // 旧字段（仅兼容读取）：true=下限、false=不限
     public bool? AreaThresholdEnabled { get; set; }       // 启用面积阈值判 擦/写

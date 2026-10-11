@@ -1240,8 +1240,7 @@ public partial class MainWindow : Window
     /// <summary>样本的接触面积（物理像素²）：RawHID = 宽高计数换算后的 px 乘积；WPF = 接触框（DIP × DPI）。
     /// 面积与宽高换算方式无关（面积因子恒等）。</summary>
     private double? SampleAreaPx2(TouchSample s)
-        => SamplePx.AreaPx2(s, _result.ResX, _result.ResY, _dpiScaleX, _dpiScaleY,
-            EraserPage?.Engine.MultiTouchAsPalm ?? true);
+        => SamplePx.AreaPx2(s, _result.ResX, _result.ResY, _dpiScaleX, _dpiScaleY);
 
     /// <summary>
     /// 该样本是否参与标定采样。Stylus 只带压感、不参与面积，始终放行；
@@ -1398,6 +1397,9 @@ public partial class MainWindow : Window
             _result.LockPalmSize = set.LockPalmSize;
             _result.SmoothJitter = set.SmoothJitter;
             _result.MultiTouchAsPalm = set.MultiTouchAsPalm;
+            _result.MultiTouchPalmMin = set.MultiTouchPalmMin;
+            _result.PalmGroupWindowMs = set.PalmGroupWindowMs;
+            _result.PalmGroupTol = set.PalmGroupTol;
             _result.PalmLimit = set.SizeLimit.ToString();
             _result.AreaThresholdEnabled = set.AreaThresholdEnabled;
             _result.WritingFollowSize = set.WritingFollowSize;

@@ -14,7 +14,10 @@
                            Foreground="#FF808080" HorizontalAlignment="Center" VerticalAlignment="Center"
                            TextWrapping="Wrap" TextAlignment="Center" FontSize="15" IsHitTestVisible="False" />
             </Border>
+            <InkCanvas x:Name="Ink" Background="Transparent" IsHitTestVisible="False" ClipToBounds="True" />
             <Canvas x:Name="Overlay" IsHitTestVisible="False" ClipToBounds="True" />
+            <Button Content="清空画布" Padding="10,3" HorizontalAlignment="Right" VerticalAlignment="Top"
+                    Margin="0,8,8,0" Click="OnClearInk" />
         </Grid>
 
         <!-- 右：来源 / 保存 / 触摸信息（原中栏）在最上面，下面是全部参数 -->
@@ -77,13 +80,47 @@
                         </StackPanel>
                     </GroupBox>
 
-                    <!-- 擦 / 写 切换阈值 -->
-                    <GroupBox Header="擦 / 写 切换阈值">
+                    <!-- 手掌擦：两类判定 + 擦除区 -->
+                    <GroupBox Header="手掌擦">
                         <StackPanel Margin="6">
-                            <CheckBox x:Name="AreaThresholdCheck" Content="启用面积阈值（关闭 → 一律手掌擦）"
-                                      IsChecked="True" Checked="OnAreaThresholdCheckChanged"
+                            <TextBlock Text="判定方式（两类可同时启用）" Foreground="#FF444444" />
+
+                            <!-- 类一：靠多点（时间窗内 ≥N 个、且聚在手掌握大小的范围内 → 判手掌擦） -->
+                            <CheckBox x:Name="MultiTouchPalmCheck" Content="靠多点（多点判手掌）" IsChecked="True"
+                                      Margin="0,4,0,0" Checked="OnMultiTouchPalmChanged" Unchecked="OnMultiTouchPalmChanged" />
+                            <StackPanel x:Name="MultiTouchDetailPanel" Margin="16,2,0,0">
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="最少触点数" VerticalAlignment="Center" Foreground="#FF444444" />
+                                    <ComboBox x:Name="MultiTouchMinCombo" Width="78" Margin="8,0,0,0" SelectedIndex="1"
+                                              VerticalAlignment="Center" SelectionChanged="OnMultiTouchMinChanged">
+                                        <ComboBoxItem Content="≥2 指" />
+                                        <ComboBoxItem Content="≥3 指" />
+                                        <ComboBoxItem Content="≥4 指" />
+                                        <ComboBoxItem Content="≥5 指" />
+                                    </ComboBox>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                    <TextBlock Text="时间窗(ms)" VerticalAlignment="Center" Foreground="#FF444444" />
+                                    <TextBox x:Name="PalmGroupWindowBox" Width="60" Margin="8,0,0,0" Text="200"
+                                             VerticalAlignment="Center" LostFocus="OnPalmGroupWindowChanged"
+                                             KeyDown="OnPalmGroupWindowKeyDown" />
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                    <TextBlock Text="大小上限" VerticalAlignment="Center" Foreground="#FF444444" />
+                                    <Slider x:Name="PalmGroupTolSlider" Width="120" Minimum="1" Maximum="2" Value="1"
+                                            TickFrequency="0.05" Margin="8,0,0,0" ValueChanged="OnPalmGroupTolChanged" />
+                                    <Button Content="恢复" Padding="6,1" FontSize="11" Margin="8,0,0,0"
+                                            Click="OnResetPalmGroupTol" />
+                                </StackPanel>
+                                <TextBlock x:Name="PalmGroupTolValueText" FontSize="11" Foreground="#FF666666"
+                                           Text="×1.00（手掌宽高的倍数上限）" Margin="64,0,0,0" />
+                            </StackPanel>
+
+                            <!-- 类二：靠面积（单根接触面积 ≥ 阈值 → 判手掌擦） -->
+                            <CheckBox x:Name="AreaThresholdCheck" Content="靠面积（面积阈值）" IsChecked="True"
+                                      Margin="0,6,0,0" Checked="OnAreaThresholdCheckChanged"
                                       Unchecked="OnAreaThresholdCheckChanged" />
-                            <StackPanel x:Name="AreaThresholdDetailPanel" Margin="0,6,0,0">
+                            <StackPanel x:Name="AreaThresholdDetailPanel" Margin="16,2,0,0">
                                 <TextBlock x:Name="AreaThresholdText" FontFamily="Consolas" FontSize="12"
                                            Foreground="#FF0A5A9A" TextWrapping="Wrap" Text="—" />
                                 <Grid Margin="0,4,0,0">
@@ -98,14 +135,11 @@
                                 </Grid>
                                 <TextBlock x:Name="AreaThresholdValueText" FontSize="11" Foreground="#FF666666" Text="—" />
                             </StackPanel>
-                        </StackPanel>
-                    </GroupBox>
 
-                    <!-- 手掌擦（尺寸跟随 + 限制 + 锁定 + 压感） -->
-                    <GroupBox Header="手掌擦">
-                        <StackPanel Margin="6">
+                            <Border Height="1" Background="#FFDDDDDD" Margin="0,8,0,8" />
+                            <TextBlock Text="擦除区" Foreground="#FF444444" />
                             <CheckBox x:Name="FollowSizeCheck" Content="随触摸尺寸（按多大擦多大）" IsChecked="True"
-                                      Checked="OnFollowSizeChanged" Unchecked="OnFollowSizeChanged" />
+                                      Margin="0,4,0,0" Checked="OnFollowSizeChanged" Unchecked="OnFollowSizeChanged" />
                             <StackPanel x:Name="PalmLimitPanel" Orientation="Horizontal" Margin="16,4,0,0">
                                 <TextBlock Text="限制" VerticalAlignment="Center" Foreground="#FF444444" />
                                 <RadioButton x:Name="PalmLimitNone" Content="不限" GroupName="PalmLimit"
@@ -117,8 +151,6 @@
                             </StackPanel>
                             <CheckBox x:Name="LockPalmSizeCheck" Content="擦时只增不减" IsChecked="False"
                                       Margin="0,4,0,0" Checked="OnLockPalmSizeChanged" Unchecked="OnLockPalmSizeChanged" />
-                            <CheckBox x:Name="MultiTouchPalmCheck" Content="多触点求和（多点 = 手掌擦）" IsChecked="True"
-                                      Margin="0,4,0,0" Checked="OnMultiTouchPalmChanged" Unchecked="OnMultiTouchPalmChanged" />
                             <CheckBox x:Name="PalmPressureCheck" Content="启用压感" IsChecked="True"
                                       Margin="0,4,0,0" Checked="OnPalmPressureChanged" Unchecked="OnPalmPressureChanged" />
                             <StackPanel x:Name="PalmPressureDetailPanel" Margin="16,4,0,0">
