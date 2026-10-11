@@ -519,8 +519,19 @@ public partial class MainWindow : Window
         if (!_edidCandidates.Contains(_edid))
             _edidCandidates.Add(_edid);
 
+        // 手掌尺寸：一次性写入两个输入框（抑制逐个赋值触发的重算，避免用半旧值/默认 180 覆盖），
+        // 再以文件值为准写回 _result。缺高/宽时不做覆盖，也不让输入框默认值污染。
+        _suppressPalmRecompute = true;
         if (saved.PalmWidthPx > 0) PalmWidthInput.Text = saved.PalmWidthPx.ToString("0.###");
         if (saved.PalmHeightPx > 0) PalmHeightInput.Text = saved.PalmHeightPx.ToString("0.###");
+        _suppressPalmRecompute = false;
+        if (saved.PalmWidthPx > 0) _result.PalmWidthPx = saved.PalmWidthPx;
+        if (saved.PalmHeightPx > 0) _result.PalmHeightPx = saved.PalmHeightPx;
+        _result.PalmAreaPx2 = saved.PalmWidthPx > 0 && saved.PalmHeightPx > 0
+            ? saved.PalmWidthPx * saved.PalmHeightPx
+            : saved.PalmAreaPx2;
+        Log.Info($"载入手掌尺寸: 宽a2={Precision.Fmt(_result.PalmWidthPx)}px 高a1={Precision.Fmt(_result.PalmHeightPx)}px "
+                 + $"面积={Precision.Fmt(_result.PalmAreaPx2, 0)}px²");
 
         // 建立标尺用的 ScreenCalibration，然后用保存的 mm/px 覆盖（对角线 / 手画尺子时推不出来）
         RebuildCalibration();
@@ -1148,24 +1159,37 @@ public partial class MainWindow : Window
         SetStatus("描摹已清除（右侧数值保留）。");
     }
 
-    private void OnPalmSizeChanged(object sender, TextChangedEventArgs e) => RecomputePalmSize();
+    /// <summary>载入标定时抑制手掌尺寸重算：两个输入框要一次性写入，避免逐个赋值时用半旧值（含 XAML 默认 180）重算并覆盖。</summary>
+    private bool _suppressPalmRecompute;
+
+    private void OnPalmSizeChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_suppressPalmRecompute)
+            return;
+        RecomputePalmSize();
+    }
 
     /// <summary>按右侧输入框重算手掌宽/长/面积（px²，固定按外接矩形 a1×a2）；进入该步或改宽高时也会调用。</summary>
     private void RecomputePalmSize()
     {
         if (PalmWidthInput is null || PalmHeightInput is null || PalmSizeText is null)
             return;   // XAML 解析期字段尚未全部赋值，忽略
+        if (_suppressPalmRecompute)
+            return;   // 载入标定时由 ApplyLoaded 统一写回，别在这里按半旧值覆盖
 
         double.TryParse(PalmWidthInput.Text.Trim(), out double w);
         double.TryParse(PalmHeightInput.Text.Trim(), out double h);
 
-        _result.PalmWidthPx = w;
-        _result.PalmHeightPx = h;
-
-        _result.PalmAreaPx2 = w > 0 && h > 0 ? w * h : 0;
+        // 只有宽高都有效才更新（避免输入框暂时为空/半旧时把已标定的手掌尺寸冲成默认值）
+        if (w > 0 && h > 0)
+        {
+            _result.PalmWidthPx = w;
+            _result.PalmHeightPx = h;
+            _result.PalmAreaPx2 = w * h;
+        }
 
         PalmSizeText.Text = _result.PalmAreaPx2 > 0
-            ? $"宽 a2 = {Precision.Fmt(w)} px × 高 a1 = {Precision.Fmt(h)} px\n"
+            ? $"宽 a2 = {Precision.Fmt(_result.PalmWidthPx)} px × 高 a1 = {Precision.Fmt(_result.PalmHeightPx)} px\n"
               + $"手掌面积（a1×a2）= {Precision.Fmt(_result.PalmAreaPx2, 0)} px²（K 的分子）"
             : "面积：—（在右侧填入手掌宽/高 px 即可，描摹可选）";
 
@@ -1410,13 +1434,18 @@ public partial class MainWindow : Window
             _result.HidSizeScale = set.SizeScale.ToString();
             _result.HidDeviceKey = EraserPage.Engine.RawHidDeviceKey.Length > 0 ? EraserPage.Engine.RawHidDeviceKey : null;
             _result.K = EraserPage.Engine.ComputeK() is double k && k > 0 ? Precision.Round(k) : null;
+            // 手掌尺寸以引擎当前值为准（预览实际用的就是它）：避免界面输入框/默认值(120×180)与引擎不一致时存下错的 K 分子
+            if (EraserPage.Engine.PalmWidthPx > 0) _result.PalmWidthPx = EraserPage.Engine.PalmWidthPx;
+            if (EraserPage.Engine.PalmHeightPx > 0) _result.PalmHeightPx = EraserPage.Engine.PalmHeightPx;
             _result.PalmAreaPx2 = EraserPage.Engine.PalmAreaPx2;
 
             string path = CalibrationResult.DefaultPath();
             _result.Save(path);
             EraserPage.SavePathNotice = "已保存到：" + path;
             SetStatus("结果已保存。");
-            Log.Info($"结果已保存: {path}（K={(_result.K is double kv ? Precision.Fmt(kv) : "无")} 随尺寸={set.FollowSize} "
+            Log.Info($"结果已保存: {path}（手掌 {Precision.Fmt(_result.PalmWidthPx)}×{Precision.Fmt(_result.PalmHeightPx)}px "
+                     + $"面积={Precision.Fmt(_result.PalmAreaPx2, 0)}px² K={(_result.K is double kv ? Precision.Fmt(kv) : "无")} "
+                     + $"随尺寸={set.FollowSize} "
                      + $"锁定={set.LockPalmSize} 掌擦压感={set.PalmPressureEnabled} 书写压感={set.WritingUsesPressure} "
                      + $"形状={set.Shape} 长宽比={set.Aspect}）");
         }
