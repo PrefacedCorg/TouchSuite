@@ -1,3 +1,30 @@
+## 致谢
+
+感谢以下几位提供触摸屏测试数据：
+
+<table>
+  <tr>
+    <td align="center">
+      <a href="https://github.com/AstrZero">
+        <img src="https://avatars.githubusercontent.com/u/135413163?v=4" width="80" height="80" alt="AstrZero" /><br />
+        <sub><b>AstrZero</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/hhh2309">
+        <img src="https://avatars.githubusercontent.com/u/179317266?v=4" width="80" height="80" alt="HHH2309" /><br />
+        <sub><b>HHH2309</b></sub>
+      </a>
+    </td>
+    <td align="center">
+      <a href="https://github.com/DeepslateQAQ">
+        <img src="https://avatars.githubusercontent.com/u/46892455?v=4" width="80" height="80" alt="岩酱w" /><br />
+        <sub><b>岩酱w</b></sub>
+      </a>
+    </td>
+  </tr>
+</table>
+
 # TouchSuite
 
 把一台**安卓平板**变成 Windows 的触摸屏，并测量/校准触摸所需的物理量（屏幕 mm、手掌面积、驱动上报的接触面积与压感）。
