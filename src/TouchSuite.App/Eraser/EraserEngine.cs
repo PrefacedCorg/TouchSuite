@@ -89,6 +89,10 @@ public sealed class EraserEngine
     /// <summary>锁定手掌大小：手掌擦的擦除区「只增不减」——同一次按压内取最大值，抬手后再重来。按指独立。</summary>
     public bool LockPalmSize { get; set; } = false;
 
+    /// <summary>「擦时只增不减」实际是否生效：「随尺寸」或手掌擦压感至少开一个，同一次按压内面积才会有变化；
+    /// 两个都关时面积恒定，没有可锁的量（界面同步隐藏该开关）。</summary>
+    private bool LockPalmSizeActive => LockPalmSize && (FollowSize || PalmPressureEnabled);
+
     /// <summary>平滑抖动：对压感做指数平滑、对擦除区尺寸加死区，避免轻微抖动导致擦除区一直闪。默认开。</summary>
     public bool SmoothJitter { get; set; } = true;
 
@@ -515,7 +519,7 @@ public sealed class EraserEngine
         Rect cur = track.Median.Value;
 
         // 锁定手掌大小（按指独立）：①本指擦除面积只增不减 ②本指一旦判为手掌擦就保持到抬手
-        if (LockPalmSize)
+        if (LockPalmSizeActive)
         {
             double raw = EraserAreaRawPx2(cur);
             if (raw > track.LockedAreaPx2)
@@ -698,7 +702,7 @@ public sealed class EraserEngine
 
     /// <summary>某根接触的擦除区面积（px²）：开启「锁定手掌大小」时返回本指本次按压内见过的最大值（只增不减）。</summary>
     public double EraserAreaPx2(int id, Rect c)
-        => LockPalmSize && _tracks.TryGetValue(id, out Track? t) && t.LockedAreaPx2 > 0
+        => LockPalmSizeActive && _tracks.TryGetValue(id, out Track? t) && t.LockedAreaPx2 > 0
             ? t.LockedAreaPx2
             : EraserAreaRawPx2(c);
 
@@ -856,7 +860,7 @@ public sealed class EraserEngine
             return false;
 
         // 锁定模式：本指已判手掌擦则保持到抬手
-        if (LockPalmSize && t.PalmLatched)
+        if (LockPalmSizeActive && t.PalmLatched)
             return false;
 
         return true;
@@ -988,7 +992,7 @@ public sealed class EraserEngine
             _ => " 比例触摸",
         };
         string mode = (FollowSize ? "随尺寸" : "固定手掌")
-            + (LockPalmSize ? " 只增不减" : "")
+            + (LockPalmSizeActive ? " 只增不减" : "")
             + aspectText
             + (SmoothJitter ? " 平滑" : "");
         string shape = Shape == EraserShape.Circle ? "椭圆" : "矩形";

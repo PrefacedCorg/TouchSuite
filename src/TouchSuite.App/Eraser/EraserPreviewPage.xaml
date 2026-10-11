@@ -149,8 +149,6 @@
                                 <RadioButton x:Name="PalmLimitCap" Content="上限" GroupName="PalmLimit"
                                              Margin="8,0,0,0" Checked="OnPalmLimitChanged" />
                             </StackPanel>
-                            <CheckBox x:Name="LockPalmSizeCheck" Content="擦时只增不减" IsChecked="False"
-                                      Margin="0,4,0,0" Checked="OnLockPalmSizeChanged" Unchecked="OnLockPalmSizeChanged" />
                             <CheckBox x:Name="PalmPressureCheck" Content="启用压感" IsChecked="True"
                                       Margin="0,4,0,0" Checked="OnPalmPressureChanged" Unchecked="OnPalmPressureChanged" />
                             <StackPanel x:Name="PalmPressureDetailPanel" Margin="16,4,0,0">
@@ -181,6 +179,9 @@
                                 </Grid>
                                 <TextBlock x:Name="PalmMaxValueText" FontSize="11" Foreground="#FF666666" Text="×2.00" Margin="40,0,0,0" />
                             </StackPanel>
+                            <!-- 锁定：擦除区只增不减（随尺寸/压感至少开一个才显示，见 SyncEnableStates） -->
+                            <CheckBox x:Name="LockPalmSizeCheck" Content="擦时只增不减" IsChecked="False"
+                                      Margin="0,8,0,0" Checked="OnLockPalmSizeChanged" Unchecked="OnLockPalmSizeChanged" />
                         </StackPanel>
                     </GroupBox>
 

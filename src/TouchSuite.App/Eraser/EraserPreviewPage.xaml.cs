@@ -505,6 +505,7 @@ public partial class EraserPreviewPage : UserControl
     /// - 未勾「压感」→ 隐藏其阈值/max 滑块；未勾「书写压感」→ 隐藏书写压感滑块；
     /// - 未启用「面积阈值」→ 隐藏阈值滑块 + 整个「书写」区块（永不书写）；
     /// - 未「随触摸尺寸」→ 隐藏「手掌下限」；
+    /// - 「随触摸尺寸」与「手掌擦压感」都未开 → 隐藏「擦时只增不减」（面积恒定，没有可锁的量）；
     /// - 长宽比未选「自定义」→ 收起 W:H 输入；选了「自定义」→ 「触摸比例」失效，收起它。</summary>
     private void SyncEnableStates()
     {
@@ -527,6 +528,9 @@ public partial class EraserPreviewPage : UserControl
         if (AreaThresholdDetailPanel is not null) AreaThresholdDetailPanel.Visibility = Vis(areaThrOn);
         if (MultiTouchDetailPanel is not null) MultiTouchDetailPanel.Visibility = Vis(multiOn);
         if (WritingSection is not null) WritingSection.Visibility = Vis(areaThrOn || multiOn);
+
+        // 「擦时只增不减」要靠“面积在本次按压内会变”才有意义：随尺寸（接触）或手掌擦压感至少开一个
+        if (LockPalmSizeCheck is not null) LockPalmSizeCheck.Visibility = Vis(followSize || palmOn);
 
         if (PalmLimitPanel is not null) PalmLimitPanel.Visibility = Vis(followSize);
 
@@ -771,6 +775,7 @@ public partial class EraserPreviewPage : UserControl
         if (MultiTouchPalmCheck is null)
             return;
         Engine.MultiTouchAsPalm = MultiTouchPalmCheck.IsChecked == true;
+        SyncEnableStates();
         Engine.NotifyChanged();
     }
 
