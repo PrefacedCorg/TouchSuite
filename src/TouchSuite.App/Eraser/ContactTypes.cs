@@ -139,7 +139,7 @@ public static class SamplePx
             double sum = 0;
             bool any = false;
             foreach (ContactRect c in list)
-                if (c.DiuRect is Rect r)
+                if (c.DiuRect is Rect r && r.Width > 0 && r.Height > 0)   // 零尺寸=只报了坐标，无尺寸信息
                 {
                     sum += r.Width * pxPerDiuX * r.Height * pxPerDiuY;
                     any = true;
@@ -147,7 +147,7 @@ public static class SamplePx
             return any ? sum : null;
         }
 
-        if (s.DiuRect is Rect r0)
+        if (s.DiuRect is Rect r0 && r0.Width > 0 && r0.Height > 0)
             return r0.Width * pxPerDiuX * r0.Height * pxPerDiuY;
         return null;
     }

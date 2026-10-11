@@ -128,9 +128,16 @@ public sealed class TouchInput : IDisposable
     {
         Rect b = e.GetTouchPoint(pad).Bounds;
         if (b.Width > 0 && b.Height > 0)
+        {
             touches[e.TouchDevice.Id] = b;
+        }
         else
-            touches.Remove(e.TouchDevice.Id);
+        {
+            // 只报坐标、不报接触尺寸的数字化器：Bounds 为空，但位置有效。
+            // 用「零尺寸矩形 + 该点位置」保留这根触点，供下游做多点识别（多点判手掌只需位置）。
+            Point p = e.GetTouchPoint(pad).Position;
+            touches[e.TouchDevice.Id] = new Rect(p.X, p.Y, 0, 0);
+        }
 
         EmitWpfList(touches);
     }
@@ -146,15 +153,18 @@ public sealed class TouchInput : IDisposable
         Rect onlyRect = default;
         foreach ((int id, Rect r) in touches)
         {
-            double? wMm = MmPerDiuX > 0 ? r.Width * MmPerDiuX : null;
-            double? hMm = MmPerDiuY > 0 ? r.Height * MmPerDiuY : null;
+            bool sized = r.Width > 0 && r.Height > 0;
+            double? wMm = sized && MmPerDiuX > 0 ? r.Width * MmPerDiuX : null;
+            double? hMm = sized && MmPerDiuY > 0 ? r.Height * MmPerDiuY : null;
             list.Add(new ContactRect(id, r, wMm, hMm, null, null, null, 0, 0));
             onlyW = wMm; onlyH = hMm; onlyRect = r;   // 单指时填顶层（多指时顶层无意义，AreaMm2 走 Contacts）
         }
 
         string detail = touches.Count > 1
             ? $"{touches.Count} 指: {string.Join("，", list.Select(c => $"#{c.Id} {Precision.Fmt(c.WMm)}×{Precision.Fmt(c.HMm)} mm"))}"
-            : $"Bounds {Precision.Fmt(onlyRect.Width, 3)}×{Precision.Fmt(onlyRect.Height, 3)} DIP → {Precision.Fmt(onlyW)}×{Precision.Fmt(onlyH)} mm";
+            : onlyW is null
+                ? $"仅坐标（无接触尺寸）@({onlyRect.X:0.#},{onlyRect.Y:0.#}) DIP"
+                : $"Bounds {Precision.Fmt(onlyRect.Width, 3)}×{Precision.Fmt(onlyRect.Height, 3)} DIP → {Precision.Fmt(onlyW)}×{Precision.Fmt(onlyH)} mm";
 
         // 记最大那根，供「通道对照」探针
         LastWpfBounds = list.Where(c => c.DiuRect is not null)

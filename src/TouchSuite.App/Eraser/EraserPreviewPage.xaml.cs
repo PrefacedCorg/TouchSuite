@@ -388,19 +388,30 @@ public partial class EraserPreviewPage : UserControl
                 {
                     foreach (ContactRect c in list)
                     {
-                        if (c.DiuRect is not Rect r || r.Width <= 0 || r.Height <= 0)
+                        if (c.DiuRect is not Rect r)
                             continue;
-                        Engine.Submit(ContactSource.Wpf, c.Id, ToPx(r), applyThreshold: true,
-                            detail: $"#{c.Id} Bounds {Precision.Fmt(r.Width, 3)}×{Precision.Fmt(r.Height, 3)} DIP "
-                                  + $"= {Precision.Fmt(r.Width * Engine.PxPerDiuX)}×{Precision.Fmt(r.Height * Engine.PxPerDiuY)} px");
+                        bool sized = r.Width > 0 && r.Height > 0;
+                        // 只报坐标的设备：Bounds 为空 → 用最小占位尺寸让引擎建轨迹，供多点识别（不按尺寸判面积）
+                        Rect px = sized ? ToPx(r) : PositionOnlyPx(r);
+                        Engine.Submit(ContactSource.Wpf, c.Id, px, applyThreshold: sized,
+                            detail: sized
+                                ? $"#{c.Id} Bounds {Precision.Fmt(r.Width, 3)}×{Precision.Fmt(r.Height, 3)} DIP "
+                                      + $"= {Precision.Fmt(r.Width * Engine.PxPerDiuX)}×{Precision.Fmt(r.Height * Engine.PxPerDiuY)} px"
+                                : $"#{c.Id} 仅坐标（无接触尺寸）@({r.X:0.#},{r.Y:0.#}) DIP");
                     }
                     break;
                 }
-                if (s.DiuRect is not Rect r0 || r0.Width <= 0 || r0.Height <= 0)
+                if (s.DiuRect is not Rect r0)
                     return;
-                Engine.Submit(ContactSource.Wpf, 0, ToPx(r0), applyThreshold: true,
-                    detail: $"Bounds {Precision.Fmt(r0.Width, 3)}×{Precision.Fmt(r0.Height, 3)} DIP "
-                          + $"= {Precision.Fmt(r0.Width * Engine.PxPerDiuX)}×{Precision.Fmt(r0.Height * Engine.PxPerDiuY)} px");
+                {
+                    bool sized0 = r0.Width > 0 && r0.Height > 0;
+                    Rect px0 = sized0 ? ToPx(r0) : PositionOnlyPx(r0);
+                    Engine.Submit(ContactSource.Wpf, 0, px0, applyThreshold: sized0,
+                        detail: sized0
+                            ? $"Bounds {Precision.Fmt(r0.Width, 3)}×{Precision.Fmt(r0.Height, 3)} DIP "
+                                  + $"= {Precision.Fmt(r0.Width * Engine.PxPerDiuX)}×{Precision.Fmt(r0.Height * Engine.PxPerDiuY)} px"
+                            : $"仅坐标（无接触尺寸）@({r0.X:0.#},{r0.Y:0.#}) DIP");
+                }
                 break;
         }
     }
@@ -408,6 +419,16 @@ public partial class EraserPreviewPage : UserControl
     private Rect ToPx(Rect diu)
         => new(diu.X * Engine.PxPerDiuX, diu.Y * Engine.PxPerDiuY,
                diu.Width * Engine.PxPerDiuX, diu.Height * Engine.PxPerDiuY);
+
+    /// <summary>只报坐标的接触（Bounds 为空）：在接触点处给一个最小正尺寸占位框，让引擎建轨迹做多点判定；
+    /// 该框只用于定位/分组，不参与面积判定（下发给引擎时 applyThreshold=false）。</summary>
+    private Rect PositionOnlyPx(Rect diu)
+    {
+        double cx = (diu.X + diu.Width / 2) * (Engine.PxPerDiuX > 0 ? Engine.PxPerDiuX : 1);
+        double cy = (diu.Y + diu.Height / 2) * (Engine.PxPerDiuY > 0 ? Engine.PxPerDiuY : 1);
+        const double s = 1.0;   // px，仅占位
+        return new Rect(cx - s / 2, cy - s / 2, s, s);
+    }
 
     /// <summary>把 HID 的尺寸（物理像素）+ 归一化坐标合成矩形喂给引擎。
     /// **多指 = 逐根接触各喂一次**（多指书写 / 多指擦除都保留，各按各的面积判定）；
