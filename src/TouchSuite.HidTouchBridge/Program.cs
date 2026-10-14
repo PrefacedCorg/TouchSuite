@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace TouchSuite.HidTouchBridge;
@@ -6,18 +7,32 @@ namespace TouchSuite.HidTouchBridge;
 /// HID 触摸桥：把本机那块「Win7 正常、Win8+ UWP 异常」的触摸屏读出来，
 /// 重新用 user32 合成指针（符合规范的触摸）注入回系统，从而让 UWP 也正常。
 ///
-/// 步骤：
-///   1) 写 HKCU\Software\Microsoft\Wisp\Touch\TouchGate = 0，关掉那块屏原有的（非规范）触摸；
-///   2) 用 RawInput 直接读它的 HID 报告，逐触点解码（Link/X/Y/接触ID/TipSwitch）；
-///   3) 用 CreateSyntheticPointerDevice + InjectSyntheticPointerInput 注入（Win8 回退旧版 API）。
+/// 步骤（TouchGate 只在托盘菜单里手动开关，启动/退出都不自动改）：
+///   1) 用 RawInput 直接读触摸屏的 HID 报告，逐触点解码（Link/X/Y/接触ID/TipSwitch）；
+///   2) 用 CreateSyntheticPointerDevice + InjectSyntheticPointerInput 注入（Win8 回退旧版 API）；
+///   3) 托盘菜单可手动「关闭原有触摸」（写 HKCU\...\Wisp\Touch\TouchGate = 0），避免与原触摸叠加。
+///
+/// 以管理员运行（manifest requireAdministrator，必要时进程内再 runas 兜底），常驻托盘；
+/// 托盘可开关「开机自启」（计划任务，免 UAC 提示）。
 /// </summary>
 internal static class Program
 {
     [STAThread]
     private static int Main(string[] args)
     {
-        Console.OutputEncoding = Encoding.UTF8;
-        Console.Title = "TouchSuite.HidTouchBridge";
+        Cli.Attach();
+        if (Cli.HasConsole)
+        {
+            try
+            {
+                Console.OutputEncoding = Encoding.UTF8;
+                Console.Title = "TouchSuite.HidTouchBridge";
+            }
+            catch
+            {
+                // 附着控制台失败不影响运行
+            }
+        }
 
         Options opt;
         try
@@ -26,174 +41,120 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"参数错误：{ex.Message}");
-            Options.PrintUsage();
+            Cli.Error($"参数错误：{ex.Message}{Environment.NewLine}{Environment.NewLine}{Options.UsageText()}");
             return 1;
         }
 
         if (opt.Help)
         {
-            Options.PrintUsage();
+            Cli.Output(Options.UsageText());
             return 0;
         }
 
-        Log.Write($"===== 启动 ===== args=[{string.Join(' ', args)}]");
+        // ---- 提权兜底：manifest 已 requireAdministrator；这里处理清单未生效的宿主 ----
+        if (opt.Elevate && !opt.AlreadyElevated && !Elevation.IsElevated())
+        {
+            Log.Write("当前非管理员，尝试自动提权（runas）…");
+            if (Elevation.RelaunchElevated(args))
+                return 0;
+            Cli.Error("自动提权被取消或失败，将以当前权限继续运行（部分注入场景可能失败）。");
+        }
+
+        Log.Write($"===== 启动 ===== args=[{string.Join(" ", args)}] 管理员={Elevation.IsElevated()}");
 
         List<MonitorInfo> monitors = MonitorMap.Enumerate();
         List<RawHidTouch.TouchDevice> devices = RawHidTouch.Scan();
+        bool trayOwnsDevices = false;   // 托盘接管设备生命周期后，这里不再负责释放
         try
         {
-            Console.WriteLine("TouchSuite.HidTouchBridge —— 关闭原触摸 + 读 HID + 注入符合规范的合成指针");
-            Console.WriteLine($"  显示器 {monitors.Count} 个：");
-            foreach (MonitorInfo m in monitors)
-                Console.WriteLine($"    {m}");
-
-            Console.WriteLine($"  HID 顶层集合 {devices.Count} 个（触摸类 {devices.Count(d => d.IsTouch)}）：");
-            for (int i = 0; i < devices.Count; i++)
-            {
-                RawHidTouch.TouchDevice d = devices[i];
-                Console.WriteLine($"    [{i + 1}] {d.TlcLabel} 触摸={d.IsTouch} 触点槽位={d.Links.Count} {RawHidTouch.ShortPath(d.Path)}");
-            }
-            Console.WriteLine();
-
             if (opt.List)
+            {
+                Cli.Output(BuildListText(monitors, devices));
                 return 0;
+            }
 
             if (monitors.Count == 0)
             {
-                Console.Error.WriteLine("未枚举到显示器。");
+                Cli.Error("未枚举到显示器。");
                 return 1;
             }
 
-            RawHidTouch.TouchDevice? target = PickDevice(devices, opt.Device);
+            Config cfg = Config.Load();
+
+            // 选设备优先级：命令行 --device > 上次记住的那块 > 自动挑（触点槽位最多）
+            RawHidTouch.TouchDevice? target = opt.Device is not null
+                ? PickDevice(devices, opt.Device)
+                : cfg.FindRemembered(devices) ?? PickDevice(devices, null);
             if (target is null)
             {
-                Console.Error.WriteLine(opt.Device is null
-                    ? "未找到触摸类 HID 设备（可用 --device <路径子串> / --list 指定）。"
-                    : $"未找到匹配 \"{opt.Device}\" 的设备。");
+                Cli.Error(opt.Device is null
+                    ? "未找到触摸类 HID 设备（可用 --device <路径子串> 指定，或 --list 查看）。"
+                    : $"未找到匹配 \"{opt.Device}\" 的设备（--list 查看可用设备）。");
                 return 1;
             }
+            if (opt.Device is null && cfg.DevicePath is not null && target.Path == cfg.DevicePath)
+                Log.Write("沿用上次记住的转发设备。");
             if (target.Links.Count == 0)
             {
-                Console.Error.WriteLine($"设备 {RawHidTouch.ShortPath(target.Path)} 没有声明任何带 X/Y 的触点槽位，无法解码。");
+                Cli.Error($"设备 {RawHidTouch.ShortPath(target.Path)} 没有声明任何带 X/Y 的触点槽位，无法解码。");
                 return 1;
             }
-            if (!target.IsTouch)
-                Console.WriteLine($"  提示：选中的 {target.TlcLabel} 不是触摸顶层集合（0x0D:0x04/0x05），结果可能不对。");
 
-            int monitorIndex = Math.Clamp(opt.Monitor, 0, monitors.Count - 1);
+            int monitorIndex = Compat.Clamp(opt.Monitor, 0, monitors.Count - 1);
             MonitorInfo monitor = monitors[monitorIndex];
 
-            Console.WriteLine($"  目标设备  : {target.TlcLabel}  {RawHidTouch.ShortPath(target.Path)}");
-            Console.WriteLine($"  触点槽位  : {string.Join(",", target.Links.Select(l => l.Link))}");
-            Console.WriteLine($"  目标显示器: {monitor}");
-            Console.WriteLine($"  最大触点  : {opt.MaxContacts}");
-            Console.WriteLine($"  接触面积  : {(opt.ContactPx > 0 ? $"{opt.ContactPx}px 直径" : "不注入")}");
-            Console.WriteLine($"  映射断点  : ({monitor.Width - 1}, {monitor.Height - 1}) 取整（stretch 全屏）");
+            Log.Write($"设备：{target.TlcLabel} {RawHidTouch.ShortPath(target.Path)}（槽位 {target.Links.Count}，触摸={target.IsTouch}）");
+            Log.Write($"显示器：{monitor}；最大触点={opt.MaxContacts}；接触面积={opt.ContactPx}px");
 
-            // ---- 1) 关掉原有触摸 ----
-            int? oldGate = null;
-            if (opt.TouchGate)
-            {
-                oldGate = TouchGate.Disable();
-                Log.Write($"TouchGate：原值 {(oldGate?.ToString() ?? "(未设置)")} → 0（已关闭原有触摸屏功能）");
-                Console.WriteLine($"  TouchGate : {(oldGate?.ToString() ?? "(未设置)")} → 0（已关闭原有触摸）");
-            }
-            else
-            {
-                Console.WriteLine("  TouchGate : 未改动（--no-touchgate）");
-            }
+            // 不在这里自动改注册表 —— 关闭「原有触摸」(TouchGate=0) 只由托盘菜单触发。
 
-            // ---- 2) 注入器 ----
+            // ---- 注入器 ----
             using var injector = new SyntheticPointerInjector(opt.MaxContacts, opt.Feedback, opt.ContactPx, opt.DryRun);
             if (!injector.Initialize())
             {
-                Console.Error.WriteLine($"初始化触摸注入失败：{injector.LastErrorText}");
-                Console.Error.WriteLine("提示：需要运行在交互式桌面会话（已登录、未锁屏）中。");
-                RestoreGate(opt, oldGate);
+                Cli.Error($"初始化触摸注入失败：{injector.LastErrorText}{Environment.NewLine}"
+                    + "提示：需要运行在交互式桌面会话（已登录、未锁屏）中。");
                 return 1;
             }
-            Console.WriteLine($"  注入接口  : {injector.ApiName}{(opt.DryRun ? "（--dry-run：只算不注入）" : "")}");
+            Log.Write($"注入接口：{injector.ApiName}");
 
-            // ---- 3) 收 HID → 注入 ----
-            using var window = new InputWindow();
-            IntPtr hwnd = window.Handle;
-            if (!RawHidTouch.Register(hwnd, target.UsagePage, target.Usage))
+            // ---- 托盘常驻：隐藏消息窗收 HID，注入合成指针 ----
+            TrayApplicationContext tray;
+            try
             {
-                Console.Error.WriteLine("RegisterRawInputDevices 失败。");
-                RestoreGate(opt, oldGate);
+                tray = new TrayApplicationContext(injector, devices, target, monitor, opt, cfg);
+                trayOwnsDevices = true;   // 之后由托盘负责在切换/退出时释放设备
+            }
+            catch (Exception ex)
+            {
+                Cli.Error("托盘/原始输入初始化失败：" + ex.Message);
                 return 1;
             }
 
-            long frames = 0;
-            long down = 0;
-            long lastStatsAt = Environment.TickCount64;
-
-            window.WmInput = lParam =>
+            using (tray)
             {
-                if (!RawHidTouch.TryGetHidData(lParam, out IntPtr hdev, out byte[][] reports))
-                    return;
-                if (hdev != target.RawHandle)
-                    return;
-
-                foreach (byte[] report in reports)
+                if (Cli.HasConsole)
                 {
-                    RawHidTouch.Frame frame = RawHidTouch.Decode(target, report);
-                    var actives = new List<(int ContactId, int X, int Y)>(frame.Contacts.Count);
-                    foreach (RawHidTouch.Contact c in frame.Contacts)
+                    Console.CancelKeyPress += (_, e) =>
                     {
-                        // 用触点槽位（Link）当 pointerId：同一次按下内稳定，且天然唯一，规避设备 CID 复用/恒 0 的坑
-                        int px = monitor.Left + (int)Math.Round(c.Nx * (monitor.Width - 1));
-                        int py = monitor.Top + (int)Math.Round(c.Ny * (monitor.Height - 1));
-                        actives.Add((c.Link, px, py));
-                    }
-
-                    injector.Apply(actives);
-                    frames++;
-                    down += frame.Contacts.Count;
-
-                    if (opt.Verbose && frames % 50 == 0)
-                    {
-                        long now = Environment.TickCount64;
-                        double sec = Math.Max(0.001, (now - lastStatsAt) / 1000.0);
-                        lastStatsAt = now;
-                        Log.Write($"帧 {frames} 活动点 {injector.ActiveCount} 注入 {injector.InjectedFrames} 失败 {injector.FailedFrames} "
-                            + $"(接触数 {frame.ContactCount}) 首点 {(frame.Contacts.Count > 0 ? $"L{frame.Contacts[0].Link} CID={frame.Contacts[0].ContactId} n=({frame.Contacts[0].Nx:0.###},{frame.Contacts[0].Ny:0.###})" : "无")}"
-                            + (injector.FailedFrames > 0 ? $" 错误={injector.LastErrorText}" : ""));
-                    }
+                        e.Cancel = true;
+                        tray.RequestExit();
+                    };
                 }
-            };
 
-            Console.CancelKeyPress += (_, e) =>
-            {
-                e.Cancel = true;
-                try { window.BeginInvoke(new Action(Application.ExitThread)); } catch { /* 忽略 */ }
-            };
+                Application.Run(tray);
+            }
 
-            Console.WriteLine();
-            Console.WriteLine("运行中…… 在触摸屏上操作即可。按 Ctrl+C 退出（退出会恢复 TouchGate）。");
-            if (!opt.TouchGate)
-                Console.WriteLine("  注意：未改动 TouchGate，可能与原有触摸叠加（双重输入）。");
-            Application.Run(new ApplicationContext());
-
-            injector.ReleaseAll();
-            RestoreGate(opt, oldGate);
-            Log.Write($"结束：累计子报文 {frames}，累计触点 {down}，注入帧 {injector.InjectedFrames}，失败 {injector.FailedFrames}");
             return 0;
         }
         finally
         {
-            foreach (RawHidTouch.TouchDevice d in devices)
-                d.Dispose();
+            if (!trayOwnsDevices)
+            {
+                foreach (RawHidTouch.TouchDevice d in devices)
+                    d.Dispose();
+            }
         }
-    }
-
-    private static void RestoreGate(Options opt, int? oldGate)
-    {
-        if (!opt.TouchGate)
-            return;
-        TouchGate.Restore(oldGate);
-        Log.Write($"TouchGate 已恢复为 {(oldGate?.ToString() ?? "(删除)")}");
     }
 
     /// <summary>选设备：给了 --device 就按路径子串匹配；否则挑「触点槽位最多」的触摸类设备。</summary>
@@ -205,9 +166,9 @@ internal static class Program
         if (!string.IsNullOrEmpty(filter))
         {
             return devices.FirstOrDefault(d =>
-                       d.Path.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                       d.Path.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
                    ?? devices.FirstOrDefault(d =>
-                       RawHidTouch.ShortPath(d.Path).Contains(filter, StringComparison.OrdinalIgnoreCase));
+                       RawHidTouch.ShortPath(d.Path).IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0);
         }
 
         RawHidTouch.TouchDevice? best = null;
@@ -219,6 +180,70 @@ internal static class Program
                 best = d;
         }
         return best ?? devices.FirstOrDefault(d => d.IsTouch) ?? devices[0];
+    }
+
+    private static string BuildListText(List<MonitorInfo> monitors, List<RawHidTouch.TouchDevice> devices)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("显示器：");
+        foreach (MonitorInfo m in monitors)
+            sb.AppendLine("  " + m);
+        sb.AppendLine($"HID 顶层集合 {devices.Count} 个（触摸类 {devices.Count(d => d.IsTouch)}）：");
+        for (int i = 0; i < devices.Count; i++)
+        {
+            RawHidTouch.TouchDevice d = devices[i];
+            sb.AppendLine($"  [{i + 1}] {d.TlcLabel} 触摸={d.IsTouch} 触点槽位={d.Links.Count} {RawHidTouch.ShortPath(d.Path)}");
+        }
+        return sb.ToString();
+    }
+}
+
+/// <summary>
+/// 控制台交互：WinExe 默认没有控制台。若从终端启动（有父控制台），就附加上去，
+/// 让 Console.Write/WriteLine 与日志正常打印；否则帮助/错误走弹窗。
+/// </summary>
+internal static class Cli
+{
+    private const uint AttachParentProcess = 0xFFFFFFFF;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(uint dwProcessId);
+
+    public static bool HasConsole { get; private set; }
+
+    public static void Attach()
+    {
+        try
+        {
+            HasConsole = AttachConsole(AttachParentProcess);
+            if (!HasConsole)
+                return;
+            Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+            Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+        }
+        catch
+        {
+            HasConsole = false;
+        }
+    }
+
+    public static void Output(string text)
+    {
+        if (HasConsole)
+        {
+            Console.Write(text);
+            return;
+        }
+        MessageBox.Show(text, "TouchSuite.HidTouchBridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    public static void Error(string text)
+    {
+        Log.Write("错误：" + text.Replace(Environment.NewLine, " "));
+        if (HasConsole)
+            Console.Error.WriteLine(text);
+        else
+            MessageBox.Show(text, "TouchSuite.HidTouchBridge", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 }
 
@@ -259,8 +284,10 @@ internal sealed class Options
     /// <summary>注入的接触面积直径（像素）；0 = 不注入接触面积。</summary>
     public int ContactPx = 8;
     public bool DryRun;
-    /// <summary>是否改动 TouchGate（默认改，退出时恢复）。</summary>
-    public bool TouchGate = true;
+    /// <summary>非管理员时是否自动提权（默认是）。</summary>
+    public bool Elevate = true;
+    /// <summary>内部哨兵：本次已是提权后的实例（避免反复提权）。</summary>
+    public bool AlreadyElevated;
     public bool Verbose;
     public bool List;
     public bool Help;
@@ -307,8 +334,11 @@ internal sealed class Options
                 case "--dry-run":
                     o.DryRun = true;
                     break;
-                case "--no-touchgate":
-                    o.TouchGate = false;
+                case "--no-elevate":
+                    o.Elevate = false;
+                    break;
+                case "--elevated":
+                    o.AlreadyElevated = true;
                     break;
                 case "-v":
                 case "--verbose":
@@ -321,37 +351,39 @@ internal sealed class Options
         return o;
     }
 
-    public static void PrintUsage()
-    {
-        Console.WriteLine("""
-            用法: TouchSuite.HidTouchBridge [选项]
+    public static string UsageText() => """
+        用法: TouchSuite.HidTouchBridge [选项]
 
-              说明：先把 HKCU\Software\Microsoft\Wisp\Touch\TouchGate 置 0 关掉原有触摸屏功能，
-                    再用 RawInput 读该触摸屏的 HID 报告，最后用 user32 合成指针注入「符合规范」的触摸。
-                    退出时自动恢复 TouchGate 原值。
+          说明：默认以管理员启动（UAC 自动提权），常驻托盘。
+                用 RawInput 读触摸屏的 HID 报告，再用 user32 合成指针注入「符合规范」的触摸。
+                本程序不自动改系统设置 ——「关闭原有触摸」(TouchGate=0) 只在托盘菜单里手动开关，
+                需要时勾一下即可（再点一下就恢复原值）。
 
-              --list                 只列出 HID 设备与显示器后退出
-              --device <子串>        按设备路径子串选触摸屏（默认自动挑触点最多的触摸类设备）
-              --monitor <n>          目标显示器序号（默认 0）
-              --feedback <mode>      触摸视觉反馈：default|indirect|none（默认 default）
-              --max-contacts <n>     最大同时接触点（默认 10）
-              --contact-size <px>    注入的接触面积直径（默认 8；0 = 不注入接触面积）
-              --dry-run              只解码不注入（不碰桌面，用于核对坐标）
-              --no-touchgate         不改动 TouchGate（调试用；会与原有触摸叠加）
-              -v, --verbose          打印统计
-              -h, --help             显示本帮助
+          托盘菜单：启用转发 / 关闭原有触摸（TouchGate=0） / 转发设备 / 开机自启 / 打开日志 / 退出
+            开机自启走「计划任务（登录即启，最高权限）」以免每次登录弹 UAC；失败回退 HKCU Run。
 
-            注意：TouchGate 的改动可能要注销/重启才完全生效；若关闭后仍有双重输入，请注销再登录。
-            """);
-    }
+          --list                 只列出 HID 设备与显示器后退出
+          --device <子串>        按设备路径子串选触摸屏（默认沿用上次记住的，否则挑触点最多的触摸类设备）
+          --monitor <n>          目标显示器序号（默认 0）
+          --feedback <mode>      触摸视觉反馈：default|indirect|none（默认 default）
+          --max-contacts <n>     最大同时接触点（默认 10）
+          --contact-size <px>    注入的接触面积直径（默认 8；0 = 不注入接触面积）
+          --dry-run              只解码不注入（不碰桌面，用于核对坐标）
+          --no-elevate           不自动提权（调试用）
+          -v, --verbose          打印统计
+          -h, --help             显示本帮助
+
+        注意：托盘里「关闭原有触摸」的改动可能要注销/重启才完全生效；关掉后即恢复原有触摸。
+        """;
 }
 
-/// <summary>落地日志：同时写控制台和 exe 同级的 TouchSuite.HidTouchBridge.log。</summary>
+/// <summary>落地日志：同时写控制台（若已附着）和 exe 同级的 TouchSuite.HidTouchBridge.log。</summary>
 internal static class Log
 {
     private static readonly object Gate = new();
-    private static readonly string FilePath =
-        Path.Combine(AppContext.BaseDirectory, "TouchSuite.HidTouchBridge.log");
+    private static readonly string FileName = "TouchSuite.HidTouchBridge.log";
+
+    public static string FileFullPath { get; } = Path.Combine(AppContext.BaseDirectory, FileName);
 
     public static void Write(string message)
     {
@@ -361,7 +393,7 @@ internal static class Log
             Console.WriteLine(line);
             try
             {
-                File.AppendAllText(FilePath, line + Environment.NewLine);
+                File.AppendAllText(FileFullPath, line + Environment.NewLine);
             }
             catch
             {

@@ -1,8 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <TargetFramework>net9.0-windows</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <!-- net462：Win10 1607+ 自带（免装运行时）；Win7 SP1 / 8.1 需装一次 .NET Framework 4.6.2 安装包。
+         .NET 8/9/10 已不支持 Win7，所以想覆盖 Win7 只能用 .NET Framework。
+         本程序用到的合成指针注入是 P/Invoke，与框架版本无关：
+         Win8/8.1 走 InitializeTouchInjection，Win10 1809+ 走 CreateSyntheticPointerDevice。 -->
+    <TargetFramework>net462</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -15,6 +19,16 @@
     <NoWarn>$(NoWarn);WFO0003</NoWarn>
     <Version>1.0.0</Version>
     <Product>TouchSuite HID Touch Bridge</Product>
+    <Deterministic>true</Deterministic>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 没装 .NET Framework 目标包的机器也能编译 -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <!-- net462 无内置 ValueTuple（C# 元组需要） -->
+    <PackageReference Include="System.ValueTuple" Version="4.5.0" />
+  </ItemGroup>
 
 </Project>

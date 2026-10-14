@@ -135,7 +135,17 @@ internal sealed class SyntheticPointerInjector : IDisposable
         if (_initialized)
             return true;
 
-        _device = CreateSyntheticPointerDevice(PT_TOUCH, _maxContacts, (uint)_feedback);
+        // Win7 没有触摸注入 API（InitializeTouchInjection 是 Win8+ 才有），
+        // 调用时 user32 里找不到导出会抛 EntryPointNotFoundException —— 这里优雅降级。
+        try
+        {
+            _device = CreateSyntheticPointerDevice(PT_TOUCH, _maxContacts, (uint)_feedback);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            _device = IntPtr.Zero;   // Win8/8.1：无此导出
+        }
+
         if (_device != IntPtr.Zero)
         {
             _usingSynthetic = true;
@@ -143,14 +153,21 @@ internal sealed class SyntheticPointerInjector : IDisposable
             return true;
         }
 
-        int err = Marshal.GetLastWin32Error();
-        string syntheticErr = new Win32Exception(err).Message;
+        string syntheticErr = new Win32Exception(Marshal.GetLastWin32Error()).Message;
 
-        if (InitializeTouchInjection(_maxContacts, (uint)_feedback))
+        try
         {
-            _usingSynthetic = false;
-            _initialized = true;
-            return true;
+            if (InitializeTouchInjection(_maxContacts, (uint)_feedback))
+            {
+                _usingSynthetic = false;
+                _initialized = true;
+                return true;
+            }
+        }
+        catch (EntryPointNotFoundException)
+        {
+            LastErrorText = "本机不支持触摸注入 API（合成指针需 Windows 8 及以上）。";
+            return false;
         }
 
         LastErrorText = $"CreateSyntheticPointerDevice 失败：{syntheticErr}；"
