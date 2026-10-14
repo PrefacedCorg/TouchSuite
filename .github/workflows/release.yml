@@ -2,7 +2,7 @@ name: release
 
 on:
   # 推 tag（形如 v1.0.0 / v1.1.0-beta.1）也直接发版：版本号取自 tag，
-  # 组件按固定组合出（app / receiver / android / hidump；App.old 与驱动仍走手动勾选）
+  # 组件按固定组合出（app / receiver / android / hidump / bridge；App.old 与驱动仍走手动勾选）
   push:
     tags:
       - 'v*'
@@ -42,6 +42,10 @@ on:
         description: '⑥ 虚拟触摸屏驱动（自包含安装包）'
         type: boolean
         default: false
+      bridge:
+        description: '⑦ TouchSuite.HidTouchBridge（HID 触摸→合成指针转发，托盘常驻，net462）'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -59,6 +63,7 @@ jobs:
       receiver: ${{ steps.ver.outputs.receiver }}
       android: ${{ steps.ver.outputs.android }}
       hidump: ${{ steps.ver.outputs.hidump }}
+      bridge: ${{ steps.ver.outputs.bridge }}
       driver: ${{ steps.ver.outputs.driver }}
     steps:
       - name: Checkout
@@ -75,6 +80,7 @@ jobs:
           INPUT_RECEIVER: ${{ inputs.receiver }}
           INPUT_ANDROID: ${{ inputs.android }}
           INPUT_HIDUMP: ${{ inputs.hidump }}
+          INPUT_BRIDGE: ${{ inputs.bridge }}
           INPUT_DRIVER: ${{ inputs.driver }}
         run: |
           # 版本号优先级：手动输入 > tag 名（去掉 v 前缀）> TouchSuite.App.csproj 的 <Version>
@@ -95,7 +101,8 @@ jobs:
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             # 手动触发：完全按勾选项
             for pair in "app:$INPUT_APP" "app_old:$INPUT_APP_OLD" "receiver:$INPUT_RECEIVER" \
-                        "android:$INPUT_ANDROID" "hidump:$INPUT_HIDUMP" "driver:$INPUT_DRIVER"; do
+                        "android:$INPUT_ANDROID" "hidump:$INPUT_HIDUMP" "bridge:$INPUT_BRIDGE" \
+                        "driver:$INPUT_DRIVER"; do
               echo "${pair%%:*}=${pair#*:}" >> "$GITHUB_OUTPUT"
             done
             echo "prerelease=$INPUT_PRERELEASE" >> "$GITHUB_OUTPUT"
@@ -106,6 +113,7 @@ jobs:
             echo "receiver=true" >> "$GITHUB_OUTPUT"
             echo "android=true" >> "$GITHUB_OUTPUT"
             echo "hidump=true" >> "$GITHUB_OUTPUT"
+            echo "bridge=true" >> "$GITHUB_OUTPUT"
             echo "driver=false" >> "$GITHUB_OUTPUT"
             # 版本号带连字符（如 1.1.0-beta.1）视为预发布
             if [ "${v#*-}" != "$v" ]; then
@@ -114,7 +122,7 @@ jobs:
               echo "prerelease=false" >> "$GITHUB_OUTPUT"
             fi
           fi
-          echo "本次组件：$(grep -E '^(app|app_old|receiver|android|hidump|driver)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
+          echo "本次组件：$(grep -E '^(app|app_old|receiver|android|hidump|bridge|driver)=' "$GITHUB_OUTPUT" | tr '\n' ' ')"
 
   # ---- ① TouchSuite.App ----
   app:
@@ -298,10 +306,44 @@ jobs:
     if: ${{ needs.prepare.outputs.driver == 'true' }}
     uses: ./.github/workflows/driver.yml
 
+  # ---- ⑦ TouchSuite.HidTouchBridge ----
+  bridge:
+    name: TouchSuite.HidTouchBridge
+    if: ${{ needs.prepare.outputs.bridge == 'true' }}
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # 同为 net462（兼容 Win7），走框架依赖发布：产物 exe + config + System.ValueTuple.dll
+      - name: Publish（net462 框架依赖）
+        run: >
+          dotnet publish src/TouchSuite.HidTouchBridge/TouchSuite.HidTouchBridge.csproj -c Release
+          -p:DebugType=none
+          -p:Version=${{ needs.prepare.outputs.version }}
+          -o publish/bridge
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path publish/bridge/* -DestinationPath "TouchSuite.HidTouchBridge-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rel-bridge
+          path: TouchSuite.HidTouchBridge-v${{ needs.prepare.outputs.version }}-win-x64.zip
+          if-no-files-found: error
+
   # ---- 汇总发布 ----
   publish:
     name: 创建 GitHub Release
-    needs: [ prepare, app, app_old, receiver, android, hidump, driver ]
+    needs: [ prepare, app, app_old, receiver, android, hidump, bridge, driver ]
     # 有组件被跳过（未勾选）时也要跑，故用 always()
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest

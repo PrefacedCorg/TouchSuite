@@ -45,6 +45,7 @@
 | [android/](android) | 安卓端 App | 把平板触摸面通过网络发给 PC |
 | [driver/](driver) | 虚拟 HID 触摸屏驱动（VHF，C） | 装上后 Windows 才认成"真的触摸屏"，接触面积/压感才有意义 |
 | [src/TouchSuite.HidDump](src/TouchSuite.HidDump) | 触摸屏 HID 查看工具（WPF，.NET Framework 4.6.2，兼容 Win7） | 左边触摸框、右边表格：列出全部 HID usage（页/usage/Link/范围/Report Count）并实时显示当前值；可选设备、看原始报告描述符逐项、带诊断日志 |
+| [src/TouchSuite.HidTouchBridge](src/TouchSuite.HidTouchBridge) | HID 触摸桥（控制台+托盘，.NET Framework 4.6.2，兼容 Win7） | 把本机那块「Win7 正常、Win8+ UWP 异常」的触摸屏，用 RawInput 读其 HID 报告、再以 user32 合成指针重新注入（符合规范的触摸）；托盘可开关转发、手动关原触摸、选择转发设备、开机自启 |
 | [src/TouchSuite.App.old](src/TouchSuite.App.old) | 旧主项目（历史 Demo） | 之前的手掌擦 Demo，一般不用；其 `README.md`/`TESTING.md` 内容仍是旧名 TouchErase |
 
 > 为什么需要驱动：`user32` 合成指针注入的触摸**不带接触面积**，也基本不吃压感。要让应用看到真实的面积/压感，得走虚拟 HID 触摸屏（`--vhid`）。
@@ -237,8 +238,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 - **build.yml**：push / PR 到 `main` 时**按改动目录**触发对应构建（改哪个目录编哪个）。
 - **release.yml**：两种触发方式 ——
-  - **推 tag**（`v1.0.0`、`v1.1.0-beta.1`）：自动发版，版本号取自 tag，固定出 App / Receiver / 安卓 / HidDump；tag 带 `-` 自动标记为 Pre-release（App.old 与驱动仍走手动勾选）。
-  - **手动触发**：可**勾选** 6 个组件（App / App.old / Receiver / 安卓 / HidDump / 驱动），版本号优先用手动输入，留空则回退到 tag 名 > `TouchSuite.App.csproj` 的 `<Version>`。
+  - **推 tag**（`v1.0.0`、`v1.1.0-beta.1`）：自动发版，版本号取自 tag，固定出 App / Receiver / 安卓 / HidDump / HidTouchBridge；tag 带 `-` 自动标记为 Pre-release（App.old 与驱动仍走手动勾选）。
+  - **手动触发**：可**勾选** 7 个组件（App / App.old / Receiver / 安卓 / HidDump / HidTouchBridge / 驱动），版本号优先用手动输入，留空则回退到 tag 名 > `TouchSuite.App.csproj` 的 `<Version>`。
 - **driver.yml**：`driver/` 有改动时自动跑，也可手动触发。
 
 ## 环境要求
