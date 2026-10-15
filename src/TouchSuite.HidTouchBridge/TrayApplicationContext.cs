@@ -404,7 +404,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                + $"\n原有触摸：{(TouchGate.Read() == 0 ? "已关闭 (TouchGate=0)" : "未关闭（可在托盘菜单手动关闭）")}"
                + $"\n开机自启：{AutoStart.Describe()}"
                + $"\n全量日志：{(_verbose ? "开" : "关")}"
-               + $"\n管理员：{(Elevation.IsElevated() ? "是" : "否")}"
+               + $"\n权限：{(Elevation.IsElevated() ? "管理员（注入可能失效，请改用普通用户运行）" : "普通用户（正确）")}"
                + $"\n配置：{Config.FileFullPath}";
         }
         return s;

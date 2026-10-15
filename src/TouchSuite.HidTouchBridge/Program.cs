@@ -12,8 +12,8 @@ namespace TouchSuite.HidTouchBridge;
 ///   2) 用 CreateSyntheticPointerDevice + InjectSyntheticPointerInput 注入（Win8 回退旧版 API）；
 ///   3) 托盘菜单可手动「关闭原有触摸」（写 HKCU\...\Wisp\Touch\TouchGate = 0），避免与原触摸叠加。
 ///
-/// 以管理员运行（manifest requireAdministrator，必要时进程内再 runas 兜底），常驻托盘；
-/// 托盘可开关「开机自启」（计划任务，免 UAC 提示）。
+/// 平时以**普通用户**运行（asInvoker）—— 合成指针注入必须在用户的中完整性会话里，提权反而会失效；
+/// 只有「开机自启」建计划任务那一刻才临时请求一次 UAC。
 /// </summary>
 internal static class Program
 {
@@ -51,13 +51,15 @@ internal static class Program
             return 0;
         }
 
-        // ---- 提权兜底：manifest 已 requireAdministrator；这里处理清单未生效的宿主 ----
+        // 默认**不提权**：user32 合成指针注入必须发生在用户的中完整性会话里，
+        // 提权（高完整性）注入的触摸送不到普通窗口 —— 症状是注入返回成功但点不动。
+        // 只有确实需要时才用 --elevate 显式提权。
         if (opt.Elevate && !opt.AlreadyElevated && !Elevation.IsElevated())
         {
-            Log.Write("当前非管理员，尝试自动提权（runas）…");
+            Log.Write("按 --elevate 要求，尝试以管理员身份重启…");
             if (Elevation.RelaunchElevated(args))
                 return 0;
-            Cli.Error("自动提权被取消或失败，将以当前权限继续运行（部分注入场景可能失败）。");
+            Cli.Error("提权被取消或失败，将以当前（普通）权限继续运行。");
         }
 
         Log.Write($"===== 启动 ===== args=[{string.Join(" ", args)}] 管理员={Elevation.IsElevated()}");
@@ -284,8 +286,8 @@ internal sealed class Options
     /// <summary>注入的接触面积直径（像素）；0 = 不注入接触面积。</summary>
     public int ContactPx = 8;
     public bool DryRun;
-    /// <summary>非管理员时是否自动提权（默认是）。</summary>
-    public bool Elevate = true;
+    /// <summary>是否以管理员身份重启（默认否；提权会让合成指针注入失效）。</summary>
+    public bool Elevate;
     /// <summary>内部哨兵：本次已是提权后的实例（避免反复提权）。</summary>
     public bool AlreadyElevated;
     public bool Verbose;
@@ -334,8 +336,8 @@ internal sealed class Options
                 case "--dry-run":
                     o.DryRun = true;
                     break;
-                case "--no-elevate":
-                    o.Elevate = false;
+                case "--elevate":
+                    o.Elevate = true;
                     break;
                 case "--elevated":
                     o.AlreadyElevated = true;
@@ -354,13 +356,13 @@ internal sealed class Options
     public static string UsageText() => """
         用法: TouchSuite.HidTouchBridge [选项]
 
-          说明：默认以管理员启动（UAC 自动提权），常驻托盘。
+          说明：默认以普通用户运行（**不要提权** —— 提权会让合成指针注入失效），常驻托盘。
                 用 RawInput 读触摸屏的 HID 报告，再用 user32 合成指针注入「符合规范」的触摸。
                 本程序不自动改系统设置 ——「关闭原有触摸」(TouchGate=0) 只在托盘菜单里手动开关，
                 需要时勾一下即可（再点一下就恢复原值）。
 
           托盘菜单：启用转发 / 关闭原有触摸（TouchGate=0） / 转发设备 / 开机自启 / 详细日志（全量） / 打开日志 / 退出
-            开机自启走「计划任务（登录即启，最高权限）」以免每次登录弹 UAC；失败回退 HKCU Run。
+            开机自启走「计划任务（登录即启）」，建任务时临时弹一次 UAC；失败回退 HKCU Run。
 
           --list                 只列出 HID 设备与显示器后退出
           --device <子串>        按设备路径子串选触摸屏（默认沿用上次记住的，否则挑触点最多的触摸类设备）
@@ -369,7 +371,7 @@ internal sealed class Options
           --max-contacts <n>     最大同时接触点（默认 10）
           --contact-size <px>    注入的接触面积直径（默认 8；0 = 不注入接触面积）
           --dry-run              只解码不注入（不碰桌面，用于核对坐标）
-          --no-elevate           不自动提权（调试用）
+          --elevate              以管理员身份重启自身（一般不需要，且会让注入失效；仅个别场景用）
           -v, --verbose          启动即开全量日志（等同托盘「详细日志（全量）」开关）
           -h, --help             显示本帮助
 

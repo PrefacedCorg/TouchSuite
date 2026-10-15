@@ -45,7 +45,7 @@
 | [android/](android) | 安卓端 App | 把平板触摸面通过网络发给 PC |
 | [driver/](driver) | 虚拟 HID 触摸屏驱动（VHF，C） | 装上后 Windows 才认成"真的触摸屏"，接触面积/压感才有意义 |
 | [src/TouchSuite.HidDump](src/TouchSuite.HidDump) | 触摸屏 HID 查看工具（WPF，.NET Framework 4.6.2，兼容 Win7） | 左边触摸框、右边表格：列出全部 HID usage（页/usage/Link/范围/Report Count）并实时显示当前值；可选设备、看原始报告描述符逐项、带诊断日志 |
-| [src/TouchSuite.HidTouchBridge](src/TouchSuite.HidTouchBridge) | HID 触摸桥（控制台+托盘，.NET Framework 4.6.2，兼容 Win7） | 把本机那块「Win7 正常、Win8+ UWP 异常」的触摸屏，用 RawInput 读其 HID 报告、再以 user32 合成指针重新注入（符合规范的触摸）；托盘可开关转发、手动关原触摸、选择转发设备、开机自启 |
+| [src/TouchSuite.HidTouchBridge](src/TouchSuite.HidTouchBridge) | HID 触摸桥（控制台+托盘，.NET Framework 4.6.2，兼容 Win7） | 把本机那块「Win7 正常、Win8+ UWP 异常」的触摸屏，用 RawInput 读其 HID 报告、再以 user32 合成指针重新注入（符合规范的触摸）；托盘可开关转发、手动关原触摸、选择转发设备、开机自启。**必须以普通用户运行**（提权后合成指针注入送不到普通窗口，会点不动；只有「开机自启」建计划任务时会临时弹一次 UAC） |
 | [src/TouchSuite.App.old](src/TouchSuite.App.old) | 旧主项目（历史 Demo） | 之前的手掌擦 Demo，一般不用；其 `README.md`/`TESTING.md` 内容仍是旧名 TouchErase |
 
 > 为什么需要驱动：`user32` 合成指针注入的触摸**不带接触面积**，也基本不吃压感。要让应用看到真实的面积/压感，得走虚拟 HID 触摸屏（`--vhid`）。

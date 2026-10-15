@@ -306,7 +306,7 @@ static VOID TbBuildReport(
     }
 
     // ---- 报告级字段（必须在所有手指字段之后）----
-    // Scan Time：每帧相对扫描时间，单位 100 µs（这里用单调递增的帧计数近似）
+    // Scan Time：每帧相对扫描时间，单位 100 µs（值由调用方按真实经过时间算好传进来）
     TbPut16(report + TB_SCAN_TIME_OFFSET, scanTime & 0xFFFF);
     // Contact Count：本帧【真实按下】的触点总数（报告级【必需】用法，缺它 Windows 不认触摸屏）
     report[TB_CONTACT_COUNT_OFFSET] = (UCHAR)TbMin(frame->Count, TB_FINGER_COUNT);
@@ -397,7 +397,11 @@ static VOID TbQueueFrame(_In_ PTB_DEVICE_CONTEXT ctx, _In_ const TB_VHID_FRAME* 
     //     所以停顿后再画一笔会从 0 重新起算；帧不断则连续累加；
     //   · 同一帧内所有触点共享同一个值；16 位字段自然回绕（规范允许，不必重置）。
     {
-        ULONG64 now100ns = KeQueryInterruptTime();
+        // 时间源必须**高分辨率**：KeQueryInterruptTime 只在时钟中断时步进（默认约 15.6 ms），
+        // 连续几帧（间隔几毫秒）取到的值会一模一样 —— 表现就是「快速点按扫描时间不更新」；
+        // 而每跨过一个 tick 又一次性跳 ~156（15.6 ms ÷ 100 µs），看着「增长很突兀」。
+        // KeQueryInterruptTimePrecise 用性能计数器内插（~100 ns 分辨率），按真实经过时间平滑递增。
+        ULONG64 now100ns = KeQueryInterruptTimePrecise();
         if (ctx->ScanBase100ns == 0
             || (now100ns - ctx->LastFrame100ns) > TB_IDLE_GAP_100NS)   // 距上一帧超过 TB_IDLE_GAP 视为空闲
         {

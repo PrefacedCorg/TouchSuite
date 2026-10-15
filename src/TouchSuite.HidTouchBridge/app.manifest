@@ -2,12 +2,13 @@
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
   <assemblyIdentity version="1.0.0.0" name="TouchSuite.HidTouchBridge.app" />
 
-  <!-- 默认以管理员启动：非管理身份运行（双击 / 开机自启 / 普通调用）会由 UAC 自动提权。
-       进程内还有一层兜底：若因故未被提权，会自己用 runas 重新拉起。 -->
+  <!-- 刻意**不提权**（asInvoker），与能正常工作的 TouchSuite.Receiver 一致。
+       原因：user32 合成指针注入必须发生在「用户的中完整性会话」里；提权（高完整性）进程
+       注入的触摸送不到普通窗口，症状就是——注入 API 全部返回成功，但屏幕上点不动。 -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v2">
     <security>
       <requestedPrivileges xmlns="urn:schemas-microsoft-com:asm.v3">
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+        <requestedExecutionLevel level="asInvoker" uiAccess="false" />
       </requestedPrivileges>
     </security>
   </trustInfo>

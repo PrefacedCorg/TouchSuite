@@ -6,8 +6,8 @@ using System.Windows.Forms;
 namespace TouchSuite.HidTouchBridge;
 
 /// <summary>
-/// 提权支持。app.manifest 已声明 <c>requireAdministrator</c>（正常路径由 UAC 自动提权）；
-/// 这里再兜底：万一运行在无法应用清单的宿主里、当前又不是管理员，就用 runas 重新拉起自身。
+/// 提权支持。**默认不提权**：app.manifest 是 <c>asInvoker</c>（合成指针注入要求中完整性会话）。
+/// 这里保留 <c>--elevate</c> 这个显式开关（个别场景需要管理员时用），以及给「开机自启」按需提权用。
 /// </summary>
 internal static class Elevation
 {
