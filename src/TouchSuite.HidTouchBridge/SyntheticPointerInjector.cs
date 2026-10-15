@@ -32,6 +32,7 @@ internal sealed class SyntheticPointerInjector : IDisposable
     private const uint POINTER_FLAG_INRANGE = 0x00000002;
     private const uint POINTER_FLAG_INCONTACT = 0x00000004;
     private const uint POINTER_FLAG_PRIMARY = 0x00002000;
+    private const uint POINTER_FLAG_CONFIDENCE = 0x00004000;
     private const uint POINTER_FLAG_DOWN = 0x00010000;
     private const uint POINTER_FLAG_UPDATE = 0x00020000;
     private const uint POINTER_FLAG_UP = 0x00040000;
@@ -200,7 +201,9 @@ internal sealed class SyntheticPointerInjector : IDisposable
 
             if (!primaryAssigned)
             {
-                flags |= POINTER_FLAG_PRIMARY;
+                // 与能正常工作的 Receiver 保持一致：主指针带 PRIMARY + CONFIDENCE
+                // （置信度不置位时，个别场景会把接触当成「非可信输入」而不参与点击/手势）
+                flags |= POINTER_FLAG_PRIMARY | POINTER_FLAG_CONFIDENCE;
                 primaryAssigned = true;
             }
 

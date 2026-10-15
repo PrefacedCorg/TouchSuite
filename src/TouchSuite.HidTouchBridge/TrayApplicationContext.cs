@@ -29,6 +29,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _gateItem;
     private readonly ToolStripMenuItem _deviceMenu;
     private readonly ToolStripMenuItem _autoItem;
+    private readonly ToolStripMenuItem _verboseItem;
 
     /// <summary>当前枚举到的全部 HID 顶层集合（本上下文拥有其生命周期）。</summary>
     private List<RawHidTouch.TouchDevice> _devices;
@@ -37,8 +38,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private RawHidTouch.TouchDevice? _device;
 
     private bool _forwarding = true;   // 转发开关：false = 停止转发（不注入）
+    /// <summary>全量日志开关：true = 逐帧记录触点/坐标/注入结果。</summary>
+    private bool _verbose;
     private bool _exited;
     private long _frames;
+
+    /// <summary>当前按下的槽位（用于 DOWN/UP 诊断日志）。</summary>
+    private readonly HashSet<int> _activeLinks = new();
 
     /// <summary>首次改动前的 TouchGate 原值（供「关闭原有触摸」取消时恢复）。</summary>
     private readonly int? _gateOriginal;
@@ -76,7 +82,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             _forwarding = _forwardItem.Checked;
             if (!_forwarding)
+            {
                 _injector.ReleaseAll();   // 停止转发瞬间抬起所有触点，避免卡键
+                _activeLinks.Clear();
+            }
             Log.Write(_forwarding ? "托盘：已启用转发。" : "托盘：已停止转发。");
             RefreshStatus();
         };
@@ -96,6 +105,21 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _autoItem = new ToolStripMenuItem("开机自启") { CheckOnClick = true, Checked = AutoStart.IsEnabled() };
         _autoItem.CheckedChanged += OnAutoStartChanged;
 
+        // 全量日志开关：开启后逐帧记录（排查用；日志文件会明显变大）
+        _verbose = _opt.Verbose;
+        _verboseItem = new ToolStripMenuItem("详细日志（全量）")
+        {
+            CheckOnClick = true,
+            Checked = _opt.Verbose,
+            ToolTipText = "开启后逐帧记录触点数量/坐标/注入结果，以及每次按下-抬起。排查问题时打开。",
+        };
+        _verboseItem.CheckedChanged += (_, _) =>
+        {
+            _verbose = _verboseItem.Checked;
+            Log.Write(_verbose ? "托盘：已开启全量日志。" : "托盘：已关闭全量日志。");
+            RefreshStatus();
+        };
+
         var menu = new ContextMenuStrip();
         menu.Items.Add(_statusItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -103,6 +127,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(_gateItem);
         menu.Items.Add(_deviceMenu);
         menu.Items.Add(_autoItem);
+        menu.Items.Add(_verboseItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("打开日志", null, (_, _) => OpenLog()));
         menu.Items.Add(new ToolStripMenuItem("打开日志文件夹", null, (_, _) => OpenLogFolder()));
@@ -164,20 +189,42 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             RawHidTouch.Frame frame = RawHidTouch.Decode(_device, report);
             var actives = new List<(int ContactId, int X, int Y)>(frame.Contacts.Count);
+            var nowActive = new HashSet<int>();
+            var detail = _verbose ? new List<string>(frame.Contacts.Count) : null;
+
             foreach (RawHidTouch.Contact c in frame.Contacts)
             {
                 // 用触点槽位（Link）当 pointerId：同一次按下内稳定、天然唯一，规避设备 CID 复用/恒 0 的坑
                 int px = _monitor.Left + (int)Math.Round(c.Nx * (_monitor.Width - 1));
                 int py = _monitor.Top + (int)Math.Round(c.Ny * (_monitor.Height - 1));
                 actives.Add((c.Link, px, py));
+
+                nowActive.Add(c.Link);
+                if (_activeLinks.Add(c.Link))
+                {
+                    // 诊断：按下时把「原始 HID 坐标 → 归一化 → 最终屏幕像素」都记下来，
+                    // 一跑一看就知道点到底落在哪、有没有真正的 DOWN。
+                    Log.Write($"DOWN L{c.Link} cid={c.ContactId} raw=({c.XRaw},{c.YRaw}) "
+                        + $"norm=({c.Nx:0.###},{c.Ny:0.###}) screen=({px},{py})");
+                }
+                detail?.Add($"L{c.Link} cid={c.ContactId} raw=({c.XRaw},{c.YRaw}) screen=({px},{py})");
+            }
+
+            foreach (int link in _activeLinks.Where(l => !nowActive.Contains(l)).ToList())
+            {
+                _activeLinks.Remove(link);
+                Log.Write($"UP   L{link}");
             }
 
             _injector.Apply(actives);
             _frames++;
 
-            if (_opt.Verbose && _frames % 200 == 0)
+            // 全量日志：逐帧记录（含空帧），便于把「看到的动作」和「实际注入」对齐
+            if (detail is not null)
             {
-                Log.Write($"帧 {_frames} 活动点 {_injector.ActiveCount} 注入 {_injector.InjectedFrames} 失败 {_injector.FailedFrames}");
+                Log.Write($"帧 {_frames} 报告接触数={frame.ContactCount} 按下={frame.Contacts.Count} "
+                    + $"活动={_injector.ActiveCount} 注入={_injector.InjectedFrames} 失败={_injector.FailedFrames}"
+                    + (detail.Count > 0 ? " | " + string.Join(" | ", detail) : ""));
             }
         }
     }
@@ -224,6 +271,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             return;
 
         _injector.ReleaseAll();   // 切换前抬起旧设备的触点，避免卡键
+        _activeLinks.Clear();
         _device = dev;
         RawHidTouch.Register(_msgWindow.Handle, dev.UsagePage, dev.Usage);
 
@@ -245,6 +293,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         string oldPath = _device?.Path ?? "";
         _injector.ReleaseAll();
+        _activeLinks.Clear();
 
         foreach (RawHidTouch.TouchDevice d in _devices)
             d.Dispose();
@@ -354,6 +403,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                + $"\n显示器：{_monitor}"
                + $"\n原有触摸：{(TouchGate.Read() == 0 ? "已关闭 (TouchGate=0)" : "未关闭（可在托盘菜单手动关闭）")}"
                + $"\n开机自启：{AutoStart.Describe()}"
+               + $"\n全量日志：{(_verbose ? "开" : "关")}"
                + $"\n管理员：{(Elevation.IsElevated() ? "是" : "否")}"
                + $"\n配置：{Config.FileFullPath}";
         }
