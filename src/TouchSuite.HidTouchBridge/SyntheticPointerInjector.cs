@@ -39,6 +39,9 @@ internal sealed class SyntheticPointerInjector : IDisposable
 
     private const uint TOUCH_MASK_CONTACTAREA = 0x00000001;
 
+    /// <summary>ERROR_NOT_READY：默认时间戳的两帧间隔不足 0.1ms，文档要求重试同一帧。</summary>
+    private const int ErrorNotReady = 21;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X; public int Y; }
 
@@ -188,7 +191,6 @@ internal sealed class SyntheticPointerInjector : IDisposable
         _frameId++;
         var infos = new List<POINTER_TYPE_INFO>(actives.Count + 1);
         var seen = new HashSet<int>();
-        bool primaryAssigned = false;
 
         foreach ((int contactId, int x, int y) in actives)
         {
@@ -199,19 +201,11 @@ internal sealed class SyntheticPointerInjector : IDisposable
                 ? POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE
                 : POINTER_FLAG_NEW | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN;
 
-            if (!primaryAssigned)
-            {
-                // 与能正常工作的 Receiver 保持一致：主指针带 PRIMARY + CONFIDENCE
-                // （置信度不置位时，个别场景会把接触当成「非可信输入」而不参与点击/手势）
-                flags |= POINTER_FLAG_PRIMARY | POINTER_FLAG_CONFIDENCE;
-                primaryAssigned = true;
-            }
-
             _active[contactId] = new POINT { X = x, Y = y };
             infos.Add(Build(contactId, x, y, flags));
         }
 
-        // 抬起：本帧没再出现的接触
+        // 抬起：本帧没再出现的接触（坐标一律沿用最后一次，微软硬性要求）
         foreach (int contactId in _active.Keys.Where(id => !seen.Contains(id)).ToList())
         {
             POINT last = _active[contactId];
@@ -220,7 +214,20 @@ internal sealed class SyntheticPointerInjector : IDisposable
         }
 
         if (infos.Count > 0)
+        {
+            // 与能正常工作的 Receiver 完全一致：每批指针的**首个**一律带 PRIMARY + CONFIDENCE（含纯抬手帧）。
+            // 纯抬手帧里只有 UP 指针，若首个不带主指针标志，Windows 会把这批当成不规范帧
+            // （ERROR_INVALID_PARAMETER → 取消全部活动接触），症状就是抬手丢事件 / 触摸卡住。
+            infos[0] = WithPrimary(infos[0]);
             Inject(infos);
+        }
+    }
+
+    /// <summary>给单个指针补上 PRIMARY + CONFIDENCE（其余字段保持不变）。</summary>
+    private static POINTER_TYPE_INFO WithPrimary(POINTER_TYPE_INFO info)
+    {
+        info.touchInfo.pointerInfo.pointerFlags |= POINTER_FLAG_PRIMARY | POINTER_FLAG_CONFIDENCE;
+        return info;
     }
 
     /// <summary>抬起全部接触（退出 / 断开时调用，避免触摸卡死）。</summary>
@@ -235,6 +242,10 @@ internal sealed class SyntheticPointerInjector : IDisposable
             infos.Add(Build(kv.Key, kv.Value.X, kv.Value.Y, POINTER_FLAG_INRANGE | POINTER_FLAG_UP));
         _active.Clear();
 
+        if (infos.Count == 0)
+            return;
+
+        infos[0] = WithPrimary(infos[0]);   // 与 Apply 一致：首个必须是主指针
         Inject(infos);
     }
 
@@ -277,28 +288,44 @@ internal sealed class SyntheticPointerInjector : IDisposable
             return;
         }
 
-        bool ok;
-        if (_usingSynthetic)
-        {
-            ok = InjectSyntheticPointerInput(_device, infos.ToArray(), (uint)infos.Count);
-        }
-        else
-        {
-            var legacy = new POINTER_TOUCH_INFO[infos.Count];
-            for (int i = 0; i < infos.Count; i++)
-                legacy[i] = infos[i].touchInfo;
-            ok = InjectTouchInput((uint)infos.Count, legacy);
-        }
-
-        if (ok)
+        if (TryInject(infos))
         {
             InjectedFrames++;
+            return;
         }
-        else
+
+        int err = Marshal.GetLastWin32Error();
+
+        // 文档要求：两次注入的默认时间戳窗口靠得太近会返回 ERROR_NOT_READY(21)，
+        // 此时必须把**同一帧**重试一次，否则该帧被直接丢弃（表现为笔画漏点/卡顿）。
+        if (err == ErrorNotReady)
         {
-            FailedFrames++;
-            LastErrorText = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+            System.Threading.Thread.Sleep(1);
+            if (TryInject(infos))
+            {
+                InjectedFrames++;
+                return;
+            }
+            err = Marshal.GetLastWin32Error();
         }
+
+        FailedFrames++;
+        LastErrorText = new Win32Exception(err).Message;
+        // 失败不能静默：不开全量日志时也要能看到（与 Receiver 的失败打印同一节奏）
+        if (FailedFrames <= 5 || FailedFrames % 100 == 0)
+            Log.Write($"注入失败 ×{FailedFrames}（Win32 {err}：{LastErrorText}）");
+    }
+
+    /// <summary>真正调一次注入 API（新版合成指针 / 旧版触摸注入）。</summary>
+    private bool TryInject(List<POINTER_TYPE_INFO> infos)
+    {
+        if (_usingSynthetic)
+            return InjectSyntheticPointerInput(_device, infos.ToArray(), (uint)infos.Count);
+
+        var legacy = new POINTER_TOUCH_INFO[infos.Count];
+        for (int i = 0; i < infos.Count; i++)
+            legacy[i] = infos[i].touchInfo;
+        return InjectTouchInput((uint)infos.Count, legacy);
     }
 
     public void Dispose()
