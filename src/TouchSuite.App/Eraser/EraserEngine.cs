@@ -219,14 +219,23 @@ public sealed class EraserEngine
         public bool MultiPalm;           // 多点判手掌：本指所属组被判定为手掌擦
         public bool MultiDecided;        // 多点判手掌：本指所属组已「定夺」（定完不再改，直到抬手）
         public double ShownW, ShownH;    // 平滑抖动：上次画出来的擦除区尺寸（px），微动沿用
+        public double RawCx, RawCy;      // 最新一帧的**原始**中心：位置不参与滤波（滤波只用于尺寸）
+
+        /// <summary>对外使用的当前接触矩形：<b>尺寸取中值滤波结果、位置取最新原始值</b>。
+        /// 位置不滤波 → 画布的点/擦除区永远跟着手指走，没有中值滞后（末梢不再漏点）；
+        /// 尺寸仍滤波 → 手掌/书写判定与擦除区大小不会因 W/H 噪声来回闪。</summary>
+        public Rect? Current => Median is Rect m
+            ? new Rect(RawCx - m.Width / 2, RawCy - m.Height / 2, m.Width, m.Height)
+            : null;
     }
 
     private readonly Dictionary<int, Track> _tracks = new();
 
-    /// <summary>按指的接触矩形（中值滤波后，**物理像素**；多指=多项，单指=1 项）。抬手/超窗的指自动消失。</summary>
+    /// <summary>按指的接触矩形（**物理像素**；尺寸=中值滤波值、位置=最新原始值；多指=多项，单指=1 项）。
+    /// 抬手/超窗的指自动消失。</summary>
     public IReadOnlyList<(int Id, Rect Rect)> LastContacts
-        => _tracks.Where(kv => kv.Value.Median is not null)
-                  .Select(kv => (kv.Key, kv.Value.Median!.Value))
+        => _tracks.Where(kv => kv.Value.Current is not null)
+                  .Select(kv => (kv.Key, kv.Value.Current!.Value))
                   .ToList();
 
     private Track? BestTrack()
@@ -234,7 +243,7 @@ public sealed class EraserEngine
         Track? best = null;
         double bestA = 0;
         foreach (Track t in _tracks.Values)
-            if (t.Median is Rect r && r.Width * r.Height > bestA)
+            if (t.Current is Rect r && r.Width * r.Height > bestA)
             {
                 bestA = r.Width * r.Height;
                 best = t;
@@ -242,7 +251,7 @@ public sealed class EraserEngine
         return best;
     }
 
-    public Rect? LastContact => BestTrack()?.Median;
+    public Rect? LastContact => BestTrack()?.Current;
 
     public double LastPxW => BestTrack()?.LastPxW ?? 0;
     public double LastPxH => BestTrack()?.LastPxH ?? 0;
@@ -514,9 +523,13 @@ public sealed class EraserEngine
         if (track.History.Count > ContactHistoryMax)
             track.History.RemoveAt(0);
 
+        // 中值滤波只作用于**尺寸**（Width/Height）；位置用最新一帧的原始中心，
+        // 由 Track.Current 把两者组合起来 —— 位置因此没有滤波滞后。
         track.Median = MedianRect(track.History);
+        track.RawCx = b.X + b.Width / 2;
+        track.RawCy = b.Y + b.Height / 2;
         track.LastTicks = Environment.TickCount64;
-        Rect cur = track.Median.Value;
+        Rect cur = track.Median.Value;   // 仅供尺寸/面积类计算使用
 
         // 锁定手掌大小（按指独立）：①本指擦除面积只增不减 ②本指一旦判为手掌擦就保持到抬手
         if (LockPalmSizeActive)
@@ -552,7 +565,7 @@ public sealed class EraserEngine
         long now = Environment.TickCount64;
         var live = new List<Track>();
         foreach (Track t in _tracks.Values)
-            if (t.Median is not null && now - t.LastTicks <= SourceFreshMs)
+            if (t.Current is not null && now - t.LastTicks <= SourceFreshMs)
                 live.Add(t);
 
         if (!MultiTouchAsPalm)
@@ -848,7 +861,7 @@ public sealed class EraserEngine
     /// ②靠面积（接触面积 ≥ 阈值）。两类都没命中才算书写；两类都关 → 没有手掌判定（全按书写）。</summary>
     public bool IsWriting(int id)
     {
-        if (!_tracks.TryGetValue(id, out Track? t) || t.Median is not Rect c)
+        if (!_tracks.TryGetValue(id, out Track? t) || t.Current is not Rect c)
             return false;
 
         // ① 靠多点

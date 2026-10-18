@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.os.Build
 import android.view.MotionEvent
 import android.view.View
 import java.util.Locale
@@ -51,6 +52,9 @@ class TouchSurfaceView(context: Context) : View(context) {
     private val active = ArrayList<Dot>()
     private var sequence = 0L
 
+    /** 最近一个 MotionEvent 携带的历史采样条数。>0 说明安卓在做事件批处理，逐条回放才不丢点。 */
+    private var lastHistory = 0
+
     /** 最近一帧的原始数据，用于左上角调试信息显示。 */
     private var lastRaw: RawSample? = null
 
@@ -79,6 +83,21 @@ class TouchSurfaceView(context: Context) : View(context) {
         val points = ArrayList<PointSample>(count)
         active.clear()
 
+        // 先回放历史采样：安卓会把多个硬件采样合并进一个 MotionEvent（事件批处理），
+        // 只取当前采样会把中间那几条整批丢掉 —— 表现就是「隔一个漏一个」。
+        // historySize=0 时这段完全等价于旧行为；DOWN/UP 的历史采样语义不同，只在 MOVE 回放。
+        lastHistory = event.historySize
+        if (action == MotionEvent.ACTION_MOVE) {
+            for (hist in 0 until lastHistory) {
+                val historical = ArrayList<PointSample>(count)
+                for (i in 0 until count)
+                    historical.add(sample(event, i, w, h, Proto.STATE_UPDATE, hist))
+                listener?.onFrame(
+                    TouchFrameData(action, sequence++, event.getHistoricalEventTime(hist) * 1000L, historical),
+                )
+            }
+        }
+
         for (i in 0 until count) {
             val state = when {
                 action == MotionEvent.ACTION_DOWN -> Proto.STATE_DOWN
@@ -87,7 +106,7 @@ class TouchSurfaceView(context: Context) : View(context) {
                 action == MotionEvent.ACTION_POINTER_UP && i == event.actionIndex -> Proto.STATE_UP
                 else -> Proto.STATE_UPDATE
             }
-            val p = sample(event, i, w, h, state)
+            val p = sample(event, i, w, h, state, HIST_CURRENT)
             points.add(p)
             active.add(Dot(p.x * w, p.y * h, radiusFor(p, w, h)))
 
@@ -116,23 +135,27 @@ class TouchSurfaceView(context: Context) : View(context) {
         return if (d > 1f) (d / 2f).coerceIn(6f, 240f) else 24f * density
     }
 
-    private fun sample(event: MotionEvent, i: Int, w: Float, h: Float, state: Int): PointSample {
+    private fun sample(event: MotionEvent, i: Int, w: Float, h: Float, state: Int, hist: Int): PointSample {
         val id = event.getPointerId(i)
         val tool = event.getToolType(i)
-        val x = (event.getX(i) / w).coerceIn(0f, 1f)
-        val y = (event.getY(i) / h).coerceIn(0f, 1f)
+
+        // hist < 0 取当前采样，否则取第 hist 条历史采样（事件批处理夹带的中间采样）。
+        fun pick(current: Float, historical: (Int) -> Float) = if (hist < 0) current else historical(hist)
+
+        val x = (pick(event.getX(i)) { event.getHistoricalX(i, it) } / w).coerceIn(0f, 1f)
+        val y = (pick(event.getY(i)) { event.getHistoricalY(i, it) } / h).coerceIn(0f, 1f)
         // 不要截断到 0~1：很多设备返回的是未归一化的原始值（例如 0~10），原样上报，
         // 由电脑端决定怎么用（默认直通，不做归一化）。
-        val rawPressure = event.getPressure(i)
+        val rawPressure = pick(event.getPressure(i)) { event.getHistoricalPressure(i, it) }
         val pressure = if (rawPressure.isNaN() || rawPressure < 0f) 0f else rawPressure
 
         // 接触尺寸标量（AXIS_SIZE），也原样上报，可用于指定面积（电脑端 --contact-area size）
-        val rawSize = event.getSize(i)
+        val rawSize = pick(event.getSize(i)) { event.getHistoricalSize(i, it) }
         val size = if (rawSize.isNaN() || rawSize < 0f) 0f else rawSize
 
         // 接触椭圆：多数设备只给 major，minor 可能为 0
-        val major = event.getTouchMajor(i)
-        val minor = event.getTouchMinor(i)
+        val major = pick(event.getTouchMajor(i)) { event.getHistoricalTouchMajor(i, it) }
+        val minor = pick(event.getTouchMinor(i)) { event.getHistoricalTouchMinor(i, it) }
         var a = major / 2f
         var b = if (minor > 0f) minor / 2f else a
         if (a <= 0f) a = b
@@ -149,7 +172,12 @@ class TouchSurfaceView(context: Context) : View(context) {
         // 因此 水平(X) 半径用 minor×cosθ / major×sinθ，竖直(Y) 半径用 major×cosθ / minor×sinθ。
         // ⚠ 之前两行写反了 → 上报的 0x48 宽度 / 0x49 高度互换（圆接触看不出来，手指或手掌
         //   的长短轴差异大时很明显）。
-        val theta = event.getOrientation(i)
+        // 朝向的历史读取口是 API 29 才有：低版本（且非当前采样）就沿用当前朝向。
+        val theta = when {
+            hist < 0 -> event.getOrientation(i)
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> event.getHistoricalOrientation(i, hist)
+            else -> event.getOrientation(i)
+        }
         val ct = cos(theta)
         val st = sin(theta)
         val halfW = sqrt((b * ct) * (b * ct) + (a * st) * (a * st))   // 水平(X)方向半径
@@ -237,7 +265,7 @@ class TouchSurfaceView(context: Context) : View(context) {
         }
 
         return listOf(
-            "TouchBridge 调试   点数=${d.pointerCount}",
+            "TouchBridge 调试   点数=${d.pointerCount}   历史采样=${lastHistory}",
             "工具=${toolName(d.toolType)}   压力=${fmt(d.pressure, 2)}",
             "size=${fmt(d.size, 2)}   touchMajor=${fmt(d.touchMajor, 1)}px  touchMinor=${fmt(d.touchMinor, 1)}px",
             "坐标=(${d.px.toInt()}, ${d.py.toInt()})   朝向=${fmt(d.orientationDeg, 0)}°",
@@ -255,4 +283,9 @@ class TouchSurfaceView(context: Context) : View(context) {
 
     private fun fmt(value: Float, digits: Int): String =
         String.format(Locale.US, "%.${digits}f", value)
+
+    private companion object {
+        /** sample() 的 hist 取值：-1 = 用当前采样（而不是某条历史采样）。 */
+        const val HIST_CURRENT = -1
+    }
 }

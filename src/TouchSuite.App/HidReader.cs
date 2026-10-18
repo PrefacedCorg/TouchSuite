@@ -105,6 +105,15 @@ public static class HidReader
         /// 不再对"整帧都没按下"的帧做兜底（否则抬手帧会被驱动残留的 W/H 重新当成接触）。</summary>
         public bool TipEverSeen;
 
+        /// <summary>上一帧「真的按下」的各槽位取值。抬手过渡帧用它补出最后一组坐标 / 尺寸。</summary>
+        public readonly Dictionary<ushort, LinkValues> LastValues = new();
+
+        /// <summary>上一帧是否有「真的按下」的槽位：用来识别抬手过渡帧（只补一帧）。</summary>
+        public bool HadPress;
+
+        /// <summary>接触数量 0x0D:0x54 所在的 LinkCollection（未声明则 null）。抬手信号之一：它掉到 0。</summary>
+        public ushort? ContactCountLink;
+
         /// <summary>数字化器自己声明的屏幕物理宽高（X/Y 坐标量程的物理满量程，mm）：屏幕长度的 HID 依据。</summary>
         public double? XPhysMm, YPhysMm;
 
@@ -238,6 +247,22 @@ public static class HidReader
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint GetRawInputData(IntPtr hRawInput, uint command, IntPtr data, ref uint size, uint headerSize);
 
+    [DllImport("user32.dll")]
+    private static extern int GetSystemMetrics(int nIndex);
+
+    private const int SM_CXVIRTUALSCREEN = 78;
+    private const int SM_CYVIRTUALSCREEN = 79;
+
+    /// <summary>
+    /// user32 合成指针注入出来的触摸屏（形如 <c>\\?\Microsoft HID RID\000D_0004\3</c>）：
+    /// 它的 HID 报文里 X/Y 填的是**屏幕物理像素**（实测 0..1679 / 0..1049），
+    /// 可描述符却声明逻辑量程 0..32000 —— 按描述符归一会把坐标压到左上角外（xn≈0.02）。
+    /// 所以这里对该设备单独适配：X/Y 的有效量程改用虚拟屏幕的像素跨度。
+    /// W/H（0x0D:0x48/0x49）不动：Windows 已按物理量程换算过，本来就是正确的。
+    /// </summary>
+    private static bool IsSyntheticPointerTouch(bool isTouch, string deviceName) =>
+        isTouch && deviceName.Contains("Microsoft HID RID", StringComparison.OrdinalIgnoreCase);
+
     [DllImport("hid.dll")]
     private static extern bool HidP_GetCaps(IntPtr preparsedData, out HIDP_CAPS caps);
 
@@ -296,6 +321,11 @@ public static class HidReader
                 IsTouch = caps.UsagePage == 0x0D && caps.Usage is 0x04 or 0x20 or 0x22 or 0x05,
             };
 
+            // user32 合成指针触摸屏：X/Y 实为屏幕像素 → 有效量程取虚拟屏幕像素跨度（见 IsSyntheticPointerTouch）。
+            bool syntheticPointer = IsSyntheticPointerTouch(ctx.IsTouch, name);
+            int pixelSpanX = syntheticPointer ? GetSystemMetrics(SM_CXVIRTUALSCREEN) : 0;
+            int pixelSpanY = syntheticPointer ? GetSystemMetrics(SM_CYVIRTUALSCREEN) : 0;
+
             var usages = new StringBuilder();
             int shown = 0;
 
@@ -321,6 +351,12 @@ public static class HidReader
                         if (shown < 24) { usages.Append($"0x{usagePage:X2}:0x{usage:X2} "); shown++; }
 
                         var cap = new Cap(link, logicalMin, logicalMax, physicalMin, physicalMax, unitsExp, units);
+                        // 合成指针设备：X/Y 量程换成屏幕像素跨度（描述符写的 32000 与实际报文不符）
+                        if (pixelSpanX > 0 && usagePage == 0x01 && usage == 0x30)
+                            cap = cap with { LogMax = pixelSpanX };
+                        if (pixelSpanY > 0 && usagePage == 0x01 && usage == 0x31)
+                            cap = cap with { LogMax = pixelSpanY };
+                        if (usagePage == 0x0D && usage == 0x54) ctx.ContactCountLink = link;   // 接触数量：抬手信号
                         if (usagePage == 0x0D && usage == 0x48) ctx.Widths.Add(cap);
                         if (usagePage == 0x0D && usage == 0x49) ctx.Heights.Add(cap);
                         if (usagePage == 0x0D && usage == 0x30) ctx.Pressures.Add(cap);
@@ -393,8 +429,9 @@ public static class HidReader
                 ctx.Xs.Count == 0 && ctx.Ys.Count == 0
                     ? "X/Y 未声明"
                     : $"槽位 {ctx.Links.Length} 个（Link {string.Join(",", ctx.Links)}）"
-                      + $" X 0..{ctx.Xs.FirstOrDefault()?.LogMax ?? 0}{PhysSuffix(ctx.Xs.FirstOrDefault())}"
-                      + $"，Y 0..{ctx.Ys.FirstOrDefault()?.LogMax ?? 0}{PhysSuffix(ctx.Ys.FirstOrDefault())}"
+                      + $" X 0..{ctx.Xs.FirstOrDefault()?.LogMax ?? 0}{(syntheticPointer ? "" : PhysSuffix(ctx.Xs.FirstOrDefault()))}"
+                      + $"，Y 0..{ctx.Ys.FirstOrDefault()?.LogMax ?? 0}{(syntheticPointer ? "" : PhysSuffix(ctx.Ys.FirstOrDefault()))}"
+                      + (syntheticPointer ? "（合成指针适配：X/Y 报文实为屏幕像素，量程按屏幕跨度）" : "")
                       + $"　屏幕物理 {ctx.ScreenPhysText}"
                       + $"　TipSwitch 槽位 {ctx.TipSwitchLinks.Count}/{ctx.Links.Length}",
                 ctx.GroupKey, ctx.GroupKey));
@@ -488,14 +525,31 @@ public static class HidReader
             if (ctx.Pressures.Count > 0)
                 CacheFramePressure(ctx, reports);
 
-            // 第一遍：按 TipSwitch 过滤（只认真的按下的槽位，排除残留幽灵槽）
+            // 第一遍：按 TipSwitch 过滤（只认真的按下的槽位，排除残留幽灵槽）；同时记住本帧各槽位取值
             bool requireTip = ctx.TipSwitchLinks.Count > 0;
-            sample = PickBest(ctx, reports, requireTip);
+            RawTouchSample? pressed = PickBest(ctx, reports, requireTip, remember: true);
 
             // 兜底：**只在这台设备从来没置过 TipSwitch** 时忽略它再挑一次（个别驱动的怪癖）。
-            // 一旦见过真按下，抬手帧必须返回 null（= 抬手），不能把驱动残留的 W/H 又复活成接触。
-            if (sample is null && requireTip && !ctx.TipEverSeen)
-                sample = PickBest(ctx, reports, requireTip: false);
+            if (pressed is null && requireTip && !ctx.TipEverSeen)
+                pressed = PickBest(ctx, reports, requireTip: false);
+
+            // 抬手判定（两个信号取其一，覆盖两类设备）：
+            //   ① 本帧读不到任何接触；
+            //   ② 接触数量 0x0D:0x54 掉到 0（有"残留幽灵槽"的设备抬手帧仍能读到 W/H，只能靠这个）。
+            bool noContact = pressed is null;
+            bool countZero = ContactCountIsZero(ctx, reports);
+            bool lift = ctx.HadPress && (noContact || countZero);
+
+            sample = pressed ?? (lift ? BuildLiftSample(ctx, reports) : null);
+
+            // 置位规则：本帧有接触且"接触数"未归零 → 有活跃按压；抬手/收尾帧清零。
+            // 清零后不会重复补位（下一帧即使 countZero 仍为真，HadPress 已是 false）。
+            ctx.HadPress = pressed is not null && !countZero;
+
+            if (lift && sample is not null)
+                Log.Info($"[抬手补位] 触发={(noContact ? "无接触帧" : "接触数=0")} L={sample.LinkCollection} "
+                       + $"X={sample.XLogical}/{sample.XLogMax} Y={sample.YLogical}/{sample.YLogMax} "
+                       + $"W={sample.WidthLogical}/{sample.WidthLogMax} H={sample.HeightLogical}/{sample.HeightLogMax}");
 
             // 本集合无压感、但同一逻辑屏的别的集合有 → 用最近的压感补齐（同 ContactID 优先，退化为最新值）
             if (sample is not null && sample.Pressure01 is null && ctx.Pressures.Count == 0 && ctx.GroupKey.Length > 0)
@@ -515,9 +569,10 @@ public static class HidReader
 
     /// <summary>
     /// 逐份子报文 × 逐触点槽位挑出「接触面积最大」的那根（手掌就是最大的接触）。
-    /// requireTip=true 时只认 TipSwitch 真的按下的槽位。
+    /// requireTip=true 时只认 TipSwitch 真的按下的槽位；
+    /// remember=true 时把本帧各成功读到槽位的取值记进 <see cref="DeviceCtx.LastValues"/> 供抬手帧补位。
     /// </summary>
-    private static RawTouchSample? PickBest(DeviceCtx ctx, List<byte[]> reports, bool requireTip)
+    private static RawTouchSample? PickBest(DeviceCtx ctx, List<byte[]> reports, bool requireTip, bool remember = false)
     {
         long bestScore = 0;
         RawTouchSample? best = null;
@@ -534,6 +589,9 @@ public static class HidReader
             {
                 if (!TryReadLink(ctx, report, (uint)report.Length, link, requireTip, out LinkValues v))
                     continue;
+
+                if (remember)
+                    ctx.LastValues[link] = v;   // 记下"真的按下"时的取值，供下一步抬手过渡帧补位
 
                 frames.Add($"L{v.Link} W={v.WLogical} H={v.HLogical}");
                 contacts.Add(new RawLink(v.Link, v.ContactId, v.WLogical, v.HLogical, v.Wmm, v.Hmm,
@@ -562,6 +620,73 @@ public static class HidReader
                 ctx.XPhysMm, ctx.YPhysMm,
                 bw.Link, $"子报文{i + 1}/{reports.Count}：" + string.Join("，", frames), ToHex(report), bw.ContactId,
                 contacts);
+        }
+        return best;
+    }
+
+    /// <summary>本帧的接触数量 0x0D:0x54 是否为 0（设备未声明该 usage 则返回 false）。</summary>
+    private static bool ContactCountIsZero(DeviceCtx ctx, List<byte[]> reports)
+    {
+        if (ctx.ContactCountLink is not ushort link)
+            return false;
+        foreach (byte[] rep in reports)
+            if (HidP_GetUsageValue(HidP_Input, 0x0D, link, 0x54, out uint cc, ctx.Preparsed, rep, (uint)rep.Length) == HIDP_STATUS_SUCCESS)
+                return cc == 0;
+        return false;
+    }
+
+    /// <summary>
+    /// 抬手过渡帧的补位样本：只取「上一帧真的读到过」的槽位（<see cref="DeviceCtx.LastValues"/>），
+    /// 尺寸沿用上一帧、坐标用本帧（非 0 才采用），从而让画布能画出最后一个抬起的点。
+    /// </summary>
+    private static RawTouchSample? BuildLiftSample(DeviceCtx ctx, List<byte[]> reports)
+    {
+        RawTouchSample? best = null;
+        long bestScore = 0;
+
+        for (int i = 0; i < reports.Count; i++)
+        {
+            byte[] report = reports[i];
+            uint len = (uint)report.Length;
+
+            foreach (ushort link in ctx.Links)
+            {
+                if (!ctx.LastValues.TryGetValue(link, out LinkValues last)
+                    || last.WLogical <= 0 || last.HLogical <= 0)
+                    continue;
+
+                Cap? xc = ctx.Xs.FirstOrDefault(c => c.Link == link);
+                Cap? yc = ctx.Ys.FirstOrDefault(c => c.Link == link);
+                uint xv = 0, yv = 0;
+                bool hasX = xc is not null && Get(0x01, link, 0x30, out xv);
+                bool hasY = yc is not null && Get(0x01, link, 0x31, out yv);
+
+                LinkValues v = last with
+                {
+                    XLogical = hasX && xv > 0 ? (int)xv : last.XLogical,
+                    YLogical = hasY && yv > 0 ? (int)yv : last.YLogical,
+                };
+
+                long score = (long)v.WLogical * v.HLogical;
+                if (score <= bestScore)
+                    continue;
+                bestScore = score;
+                best = new RawTouchSample(ctx.Name, v.Wmm, v.Hmm,
+                    v.XLogMax > 0 ? (double)v.XLogical / v.XLogMax : null,
+                    v.YLogMax > 0 ? (double)v.YLogical / v.YLogMax : null,
+                    v.Pressure01,
+                    v.WLogical, v.HLogical, v.XLogical, v.YLogical, v.XLogMax, v.YLogMax,
+                    v.WLogMax, v.HLogMax,
+                    ctx.XPhysMm, ctx.YPhysMm,
+                    v.Link, "抬手帧补位：尺寸沿用上一帧、坐标用本帧", ToHex(report), v.ContactId,
+                    new[] { new RawLink(v.Link, v.ContactId, v.WLogical, v.HLogical, v.Wmm, v.Hmm,
+                        v.XLogMax > 0 ? (double)v.XLogical / v.XLogMax : null,
+                        v.YLogMax > 0 ? (double)v.YLogical / v.YLogMax : null, v.Pressure01) });
+
+                bool Get(ushort page, ushort lc, ushort usage, out uint value)
+                    => HidP_GetUsageValue(HidP_Input, page, lc, usage, out value, ctx.Preparsed, report, len)
+                       == HIDP_STATUS_SUCCESS;
+            }
         }
         return best;
     }

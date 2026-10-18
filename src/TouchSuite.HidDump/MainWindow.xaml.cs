@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -87,16 +89,26 @@ public partial class MainWindow : Window
     private readonly List<string> _pendingLog = new();
     private bool _logDirty;
     private const int LogLineCount = 12;
+    private const int MaxPendingLog = 200;   // 只是防止内存无限增长的上限，不是节流
     private long _frameIndex;
-    private long _lastSubLogTicks;           // 子报文日志节流
-    private long _lastRowLogTicks;           // 表格快照日志节流
     private string? _lastSubSig;             // 上一份子报文的触点状态签名（Tip/CID/接触数），用于识别状态跳变
+
+    // ===== 解码线程：收报（UI 线程）只把原始字节入队；解码 / 写盘 / 生成日志全在独立线程 =====
+    private readonly object _lock = new();                        // 保护全部跨线程共享状态
+    private readonly BlockingCollection<FrameBatch> _queue = new();
+    private Thread? _worker;
+    private volatile bool _stopping;
+    private int _epoch;                                           // 设备切换代次，用于作废在途的旧帧
+    private int _renderQueued;
+
+    // 画布走"按帧刷新 + 无锁读快照"，表格文字走"低频刷新"，两者互不拖累（对齐 TouchSuite.App 的做法）
+    private DispatcherTimer? _textTimer;                          // 表格文字低频刷新（如 150ms）
+    private volatile CanvasView? _canvasView;                     // 解码线程整体发布、UI 线程无锁整份读取
 
     private readonly Dictionary<int, RawContact> _rawContacts = new();     // key = 槽位(Link)
     private readonly Dictionary<int, ContactVisual> _rawVisuals = new();   // 同一批接触的可视元素
     private readonly Dictionary<int, Ellipse> _touchDots = new();        // WPF 触摸/鼠标蓝点
 
-    private readonly DispatcherTimer _renderTimer;
     private Rectangle? _screenFrame;
 
     // 当前段的表格（列宽 Auto + SharedSizeGroup）
@@ -114,15 +126,21 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        _renderTimer = new DispatcherTimer(DispatcherPriority.Background)
+
+        // 表格文字（几十上百个单元格 + 报文行）不需要每帧刷；低频刷新即可，避免每帧大 Auto 表格重排
+        _textTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
-            Interval = TimeSpan.FromMilliseconds(60),
+            Interval = TimeSpan.FromMilliseconds(150),
         };
-        _renderTimer.Tick += (_, _) => RenderTick();
+        _textTimer.Tick += (_, _) => RenderTableText();
+
         Loaded += OnLoaded;
         Closed += (_, _) =>
         {
-            _renderTimer.Stop();
+            _stopping = true;             // 停止收报入队
+            _textTimer.Stop();
+            _queue.CompleteAdding();      // 解码线程处理完在途帧后自然退出
+            _worker?.Join(1000);
             foreach (HidApi.HidDevice d in _devices)
                 d.Dispose();
         };
@@ -152,7 +170,8 @@ public partial class MainWindow : Window
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        _renderTimer.Start();
+        StartDecodeThread();
+        _textTimer?.Start();
         Rescan();
     }
 
@@ -247,41 +266,47 @@ public partial class MainWindow : Window
         if (i < 0 || i >= _comboDevices.Count)
             return;
 
-        _selected = _comboDevices[i];
-        _frames = 0;
-        _lastHex = "";
-        _lastHexLen = 0;
-        _rawContacts.Clear();
         TouchHint.Visibility = Visibility.Visible;
 
-        BuildTable(_selected);
+        HidApi.HidDevice dev = _comboDevices[i];
+        BuildTable(dev);   // 内部加锁：设 _selected / 重置计数 / epoch++ / 重建表
 
         // 原始报告描述符：走父 USB 集线器取（不依赖 HID 句柄）
-        AddDescriptorSection(_selected.Path);
+        AddDescriptorSection(dev.Path);
 
         // 产品串仅供参考；RawInput 不需要打开设备
-        IntPtr h = HidApi.Open(_selected.Path, out string err);
+        IntPtr h = HidApi.Open(dev.Path, out string err);
         if (HidApi.Ok(h))
         {
             var (product, maker, serial) = HidApi.Strings(h);
             HidApi.Close(h);
-            ProductText.Text = $"产品：{Blank(product)}　制造商：{Blank(maker)}　序列号：{Blank(serial)}　路径：{ShortPath(_selected.Path)}";
+            ProductText.Text = $"产品：{Blank(product)}　制造商：{Blank(maker)}　序列号：{Blank(serial)}　路径：{ShortPath(dev.Path)}";
         }
         else
         {
-            ProductText.Text = $"（设备句柄被其他程序占用：Win32 {err}；不影响 RawInput 实时取值）　路径：{ShortPath(_selected.Path)}";
+            ProductText.Text = $"（设备句柄被其他程序占用：Win32 {err}；不影响 RawInput 实时取值）　路径：{ShortPath(dev.Path)}";
         }
 
         IntPtr hwnd = new WindowInteropHelper(this).Handle;
-        bool ok = RawInput.Register(hwnd, _selected.UsagePage, _selected.Usage);
-        Log.Info($"选中 [{i + 1}] {HidApi.TlcText(_selected.UsagePage, _selected.Usage)} 原始输入注册={ok}；日志文件 {Log.Path}");
-        SetStatus($"原始输入注册 = {ok}（{HidApi.UsageText(_selected.UsagePage, _selected.Usage)}）。在左边触摸，表格“当前值”列实时刷新。日志：{Log.Path}");
+        bool ok = RawInput.Register(hwnd, dev.UsagePage, dev.Usage);
+        Log.Info($"选中 [{i + 1}] {HidApi.TlcText(dev.UsagePage, dev.Usage)} 原始输入注册={ok}；日志文件 {Log.Path}");
+        SetStatus($"原始输入注册 = {ok}（{HidApi.UsageText(dev.UsagePage, dev.Usage)}）。在左边触摸，表格“当前值”列实时刷新。日志：{Log.Path}");
     }
 
     // ================= 表格：每段一个 Grid，列宽 Auto 且跨段共享 =================
 
     private void BuildTable(HidApi.HidDevice d)
     {
+      lock (_lock)   // 解码线程同时在跑：重建整份解码状态期间必须持锁
+      {
+        _selected = d;
+        _epoch++;                                // 作废在途的旧设备帧
+        _frames = 0;
+        _lastHex = "";
+        _lastHexLen = 0;
+        _frameIndex = 0;
+        _rawContacts.Clear();
+
         Rows.Children.Clear();
         _rows.Clear();
         _reportLines.Clear();
@@ -442,6 +467,11 @@ public partial class MainWindow : Window
             Log.Info($"  值帽 {HidApi.UsageLabel(v.UsagePage, v.UsageMin)} L{v.LinkCollection} {HidApi.RangeText(v)}");
         foreach (HidApi.ButtonCap b in inBtns)
             Log.Info($"  按钮帽 {HidApi.UsageLabel(b.UsagePage, b.UsageMin)} L{b.LinkCollection} {HidApi.RangeText(b)}");
+
+        _canvasView = BuildCanvasView();   // 换设备立刻清掉画布上的旧接触
+      }   // end lock(_lock)
+
+      RequestRender();
     }
 
     /// <summary>把一份子报文解码成一行：报文ID、接触数量、以及每个"活着"的 Link 的 CID/TS/X/Y/W/H。</summary>
@@ -654,16 +684,19 @@ public partial class MainWindow : Window
     {
         try
         {
-            // 先把实时值刷新进报告行
-            foreach (KeyValuePair<LiveRow, int> kv in _reportIndex)
+            // 先把实时值刷新进报告行（row.Text 由解码线程写入 → 持锁读）
+            lock (_lock)
             {
-                LiveRow row = kv.Key;
-                int idx = kv.Value;
-                string[] parts = _reportLines[idx].Split('\t');
-                if (parts.Length == 5)
+                foreach (KeyValuePair<LiveRow, int> kv in _reportIndex)
                 {
-                    parts[4] = "当前 = " + row.Text;
-                    _reportLines[idx] = string.Join("\t", parts);
+                    LiveRow row = kv.Key;
+                    int idx = kv.Value;
+                    string[] parts = _reportLines[idx].Split('\t');
+                    if (parts.Length == 5)
+                    {
+                        parts[4] = "当前 = " + row.Text;
+                        _reportLines[idx] = string.Join("\t", parts);
+                    }
                 }
             }
 
@@ -826,53 +859,62 @@ public partial class MainWindow : Window
 
     // ================= WM_INPUT → 实时值 =================
 
+    /// <summary>一批待解码的原始报文（带设备与代次，用于丢弃切换设备后过期在途的帧）。</summary>
+    private sealed record FrameBatch(HidApi.HidDevice Device, int Epoch, byte[][] Reports);
+
+    /// <summary>画布用的不可变快照：解码线程整体构建后一次发布，UI 线程无锁整份读取。</summary>
+    private sealed record CanvasView(
+        List<(int Key, RawContact Rc)> Contacts, long Frames, string LastHex, int LastHexLen, string? ContactCountText);
+
+    private void StartDecodeThread()
+    {
+        _worker = new Thread(DecodeLoop)
+        {
+            IsBackground = true,
+            Name = "HidDecode",
+            Priority = ThreadPriority.AboveNormal,
+        };
+        _worker.Start();
+    }
+
+    /// <summary>独立解码线程：从队列取帧 → 解码 + 写盘 + 生成日志 → 请求 UI 刷新。全程不占用消息泵线程。</summary>
+    private void DecodeLoop()
+    {
+        foreach (FrameBatch batch in _queue.GetConsumingEnumerable())
+        {
+            foreach (byte[] report in batch.Reports)
+                ProcessReport(batch, report);   // 内部已按帧请求画布刷新
+        }
+    }
+
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
         if (msg != WM_INPUT)
             return IntPtr.Zero;
 
+        // 收报路径只做"抠字节 + 入队"，绝不解码、不写盘 —— 消息泵不被拖住，WM_INPUT 不堆积。
         if (!RawInput.TryGetHidData(lParam, out IntPtr hDevice, out byte[][] reports))
             return IntPtr.Zero;
 
-        if (_selected is HidApi.HidDevice sel && hDevice == sel.RawHandle)
+        HidApi.HidDevice? sel;
+        int epoch;
+        bool known;
+        lock (_lock)
         {
-            _frames += reports.Length;
-            var pressedCache = new Dictionary<(ushort, ushort), HashSet<ushort>>();
-            foreach (byte[] report in reports)
-            {
-                if (_lastHexLen == 0)
-                {
-                    _lastHex = Hex(report);
-                    _lastHexLen = report.Length;
-                }
-                ApplyReport(sel, report, pressedCache);
-
-                _frameIndex++;
-                // 文件日志：逐 Link 解码 + 完整原始 hex（节流 ~40 行/秒）。
-                // 但「状态跳变」帧（任一槽 Tip 位翻转、接触数变化、CID 变化）一律不节流：
-                // 抬手帧只有一帧，25ms 节流会把它整帧丢掉，日志里就只剩"连着的一笔"，
-                // 无法判断两笔之间到底有没有发出"断开"报文。跳变帧必须逐帧留证。
-                string sig = ReportSignature(sel, report);
-                bool transition = _lastSubSig != null && _lastSubSig != sig;
-                _lastSubSig = sig;
-
-                if (transition || Compat.NowMs() - _lastSubLogTicks >= 25)
-                {
-                    _lastSubLogTicks = Compat.NowMs();
-                    Log.Info($"子报文#{_frameIndex}{(transition ? " ★跳变" : "")} {DescribeReport(sel, report)} | hex={Hex(report)}");
-                }
-                // 界面上「最近报文」段：4 份取 1 条
-                if ((_frameIndex & 3) == 0)
-                {
-                    _pendingLog.Add($"#{_frameIndex} {DescribeReport(sel, report)}");
-                    if (_pendingLog.Count > 60)
-                        _pendingLog.RemoveRange(0, _pendingLog.Count - 60);
-                    _logDirty = true;
-                }
-            }
-            _dirty = true;
+            sel = _selected;
+            epoch = _epoch;
+            known = _byHandle.ContainsKey(hDevice);
         }
-        else if (!_byHandle.ContainsKey(hDevice) && Compat.NowMs() - _lastRescanTicks > 800)
+
+        if (sel is not null && hDevice == sel.RawHandle)
+        {
+            if (!_stopping)
+            {
+                try { _queue.Add(new FrameBatch(sel, epoch, reports)); }
+                catch (InvalidOperationException) { /* 正在关闭，丢帧即可 */ }
+            }
+        }
+        else if (!known && Compat.NowMs() - _lastRescanTicks > 800)
         {
             // 设备中途重枚举（句柄不在表里）→ 节流重扫
             _lastRescanTicks = Compat.NowMs();
@@ -881,7 +923,78 @@ public partial class MainWindow : Window
         return IntPtr.Zero;
     }
 
-    private void ApplyReport(HidApi.HidDevice sel, byte[] report, Dictionary<(ushort, ushort), HashSet<ushort>> pressedCache)
+    /// <summary>解码一份子报文：全部在解码线程执行。重活持锁改共享状态，磁盘写入放到锁外。</summary>
+    private void ProcessReport(FrameBatch batch, byte[] report)
+    {
+        var pressedCache = new Dictionary<(ushort, ushort), HashSet<ushort>>();
+        string logLine, snapshot;
+
+        lock (_lock)
+        {
+            if (batch.Epoch != _epoch || !ReferenceEquals(_selected, batch.Device))
+                return;                         // 设备已切换，这帧过期
+
+            if (_lastHexLen == 0)
+            {
+                _lastHex = Hex(report);
+                _lastHexLen = report.Length;
+            }
+
+            snapshot = ApplyReport(batch.Device, report, pressedCache);
+            _frames++;
+            _dirty = true;
+            _frameIndex++;
+
+            // 尽早发布画布快照并立刻请求刷新：不等后面的 DescribeReport / ReportSignature / hex 拼串完成，
+            // 画布就不会被"整张表的完整解码"拖住。
+            _canvasView = BuildCanvasView();
+            RequestRender();
+
+            // 关闭全部节流：每份子报文都完整解码 + 记原始 hex（跳变帧另加 ★ 标记）
+            string desc = DescribeReport(batch.Device, report);
+            string sig = ReportSignature(batch.Device, report);
+            bool transition = _lastSubSig is not null && _lastSubSig != sig;
+            _lastSubSig = sig;
+            logLine = $"子报文#{_frameIndex}{(transition ? " ★跳变" : "")} {desc} | hex={Hex(report)}";
+
+            // 界面「最近报文」段：不再 4 帧取 1 条，每份都进
+            _pendingLog.Add($"#{_frameIndex} {desc}");
+            if (_pendingLog.Count > MaxPendingLog)
+                _pendingLog.RemoveRange(0, _pendingLog.Count - MaxPendingLog);
+            _logDirty = true;
+        }
+
+        // 磁盘写入放到锁外：解码线程持锁做 IO 时不会挡住 UI 渲染
+        Log.Info(logLine);
+        Log.Info(snapshot);
+    }
+
+    /// <summary>构建画布快照：整体复制当前接触并清理过期项。调用方须持有 _lock。</summary>
+    private CanvasView BuildCanvasView()
+    {
+        long nowMs = Compat.NowMs();
+        foreach (int key in _rawContacts.Where(kv => nowMs - kv.Value.Seen > RawContactTtlMs).Select(kv => kv.Key).ToList())
+            _rawContacts.Remove(key);
+        return new CanvasView(
+            _rawContacts.Select(kv => (kv.Key, kv.Value)).ToList(),
+            _frames, _lastHex, _lastHexLen,
+            _selected is not null && _contactCountRow is not null ? _contactCountRow.Text : null);
+    }
+
+    /// <summary>请求一次 UI 刷新。同一帧内合并重复请求（不做时间节流）。</summary>
+    private void RequestRender()
+    {
+        if (Interlocked.Exchange(ref _renderQueued, 1) != 0)
+            return;
+        Dispatcher.BeginInvoke(DispatcherPriority.Render, new Action(() =>
+        {
+            Volatile.Write(ref _renderQueued, 0);
+            RenderTick();
+        }));
+    }
+
+    /// <summary>把一份子报文解进各 LiveRow / 左侧接触；返回一条"表格快照"日志文本（调用方在锁外写盘）。</summary>
+    private string ApplyReport(HidApi.HidDevice sel, byte[] report, Dictionary<(ushort, ushort), HashSet<ushort>> pressedCache)
     {
         int valueRows = 0, valueHits = 0;
         foreach (LiveRow row in _rows)
@@ -927,21 +1040,16 @@ public partial class MainWindow : Window
         if (valueRows > 0 && valueHits == 0 && !_allowAnyLink)
         {
             _allowAnyLink = true;
-            ApplyReport(sel, report, pressedCache);
-            return;
+            return ApplyReport(sel, report, pressedCache);
         }
 
         UpdateRawContact(report);
 
-        // 表格快照日志（节流 250ms）：记录"程序当前算出来的值"，与原始 hex 对照即可判断是解析问题还是设备行为
-        if (Compat.NowMs() - _lastRowLogTicks >= 250)
-        {
-            _lastRowLogTicks = Compat.NowMs();
-            Log.Info("表格快照：" + string.Join(" | ",
-                _rows.Where(r => r.Text.Length > 0 && r.Text != "—")
-                     .Select(r => $"{(r.IsButton ? "Btn" : "Val")} {r.Page:X2}:{r.Usage:X2}/L{r.Link}={r.Text}"))
-                + $"　_allowAnyLink={_allowAnyLink}");
-        }
+        // 表格快照：不再 250ms 节流，每份报文都带（与原始 hex 对照即可判断是解析问题还是设备行为）
+        return "表格快照：" + string.Join(" | ",
+            _rows.Where(r => r.Text.Length > 0 && r.Text != "—")
+                 .Select(r => $"{(r.IsButton ? "Btn" : "Val")} {r.Page:X2}:{r.Usage:X2}/L{r.Link}={r.Text}"))
+            + $"　_allowAnyLink={_allowAnyLink}";
     }
 
     /// <summary>当前值单元格的文本：只放 HID 原始值（计数），不做任何换算/归一化。</summary>
@@ -979,7 +1087,13 @@ public partial class MainWindow : Window
                 continue;
             if (!active)
             {
-                _rawContacts.Remove((int)lc.Link);
+                // 抬手帧：不要立刻删——让"最后一个点"留在画布上，之后由 TTL(300ms) 自然消失。
+                // 本帧坐标可用就用它（多数设备抬手帧仍带最后一组坐标），否则保留上一帧位置。
+                if (_rawContacts.TryGetValue((int)lc.Link, out RawContact? held) && (xv > 0 || yv > 0))
+                {
+                    held.Xn = xv;
+                    held.Yn = yv;
+                }
                 continue;
             }
 
@@ -1052,43 +1166,62 @@ public partial class MainWindow : Window
         return new Rect((pw - w) / 2, (ph - h) / 2, w, h);
     }
 
+    /// <summary>
+    /// 表格文字低频刷新：把解码线程算出的「当前值」写进单元格、把「最近报文」写进日志行。
+    /// 这些是给人读的，不需要每帧刷；每帧刷会触发大 Auto 表格整体重排，把 UI 线程拖垮。
+    /// </summary>
+    private void RenderTableText()
+    {
+        if (StatusText is null)
+            return;   // XAML 解析期控件尚未连上
+
+        List<string>? logTail = null;
+        lock (_lock)
+        {
+            if (_dirty)
+            {
+                _dirty = false;
+                foreach (LiveRow row in _rows)
+                    row.ValueCell.Text = "当前 = " + row.Text;
+            }
+            if (_logDirty && _logLines.Count > 0)
+            {
+                _logDirty = false;
+                logTail = _pendingLog.Count <= LogLineCount
+                    ? new List<string>(_pendingLog)
+                    : _pendingLog.GetRange(_pendingLog.Count - LogLineCount, LogLineCount);
+            }
+        }
+
+        if (logTail is not null)
+        {
+            for (int i = 0; i < _logLines.Count; i++)
+                _logLines[i].Text = i < logTail.Count ? logTail[i] : "";
+        }
+    }
+
     private void RenderTick()
     {
         if (RawCanvas is null || TouchHost is null || StatusText is null || RealPosCheck is null)
             return;   // XAML 解析期控件尚未连上
 
-        if (_dirty)
-        {
-            _dirty = false;
-            foreach (LiveRow row in _rows)
-                row.ValueCell.Text = "当前 = " + row.Text;
-        }
+        // 画布只读解码线程发布的不可变快照：无锁、且绝不等待解码（这是"跟手"的关键）。
+        // 表格文字走 RenderTableText（低频），不在这里更新，避免大 Auto 表格每帧重排。
+        CanvasView? view = _canvasView;
+        List<(int Key, RawContact Rc)> contacts = view?.Contacts ?? new List<(int Key, RawContact Rc)>();
+        long frames = view?.Frames ?? 0;
+        string lastHex = view?.LastHex ?? "";
+        int lastHexLen = view?.LastHexLen ?? 0;
+        string? contactCountText = view?.ContactCountText;
 
-        if (_logDirty && _logLines.Count > 0)
-        {
-            _logDirty = false;
-            List<string> tail = _pendingLog.Count <= LogLineCount
-                ? _pendingLog
-                : _pendingLog.GetRange(_pendingLog.Count - LogLineCount, LogLineCount);
-            for (int i = 0; i < _logLines.Count; i++)
-                _logLines[i].Text = i < tail.Count ? tail[i] : "";
-        }
+        // 界面元素比数据多（例如切换到别的设备）时也清掉
+        var liveKeys = new HashSet<int>(contacts.Select(c => c.Key));
+        foreach (int key in _rawVisuals.Keys.Where(k => !liveKeys.Contains(k)).ToList())
+            RemoveContactVisual(key);
 
         double sw = SystemParameters.VirtualScreenWidth, sh = SystemParameters.VirtualScreenHeight;
         double sl = SystemParameters.VirtualScreenLeft, st = SystemParameters.VirtualScreenTop;
         bool realPos = RealPos;
-
-        // 过期接触清理
-        long now = Compat.NowMs();
-        List<int> stale = _rawContacts.Where(kv => now - kv.Value.Seen > RawContactTtlMs).Select(kv => kv.Key).ToList();
-        foreach (int key in stale)
-        {
-            _rawContacts.Remove(key);
-            RemoveContactVisual(key);
-        }
-        // 界面元素比数据多（例如切换到别的设备）时也清掉
-        foreach (int key in _rawVisuals.Keys.Where(k => !_rawContacts.ContainsKey(k)).ToList())
-            RemoveContactVisual(key);
 
         // 红圈落点：1:1 真实屏幕位置（面板屏幕原点 + 归一化×屏幕尺寸）；
         // 或面板里的整屏等比缩放框（baseX/baseY/unitW/unitH 为映射基准）
@@ -1134,10 +1267,8 @@ public partial class MainWindow : Window
             modeText = "红圈 整屏等比缩放";
         }
 
-        foreach (KeyValuePair<int, RawContact> kv in _rawContacts)
+        foreach (var (key, rc) in contacts)
         {
-            int key = kv.Key;
-            RawContact rc = kv.Value;
             if (!_rawVisuals.TryGetValue(key, out ContactVisual? vis))
             {
                 var box = new Ellipse
@@ -1199,9 +1330,9 @@ public partial class MainWindow : Window
 
         if (_selected is not null)
         {
-            string contacts = _contactCountRow is not null ? $"　接触数量(0x54) = {_contactCountRow.Text}" : "";
-            StatusText.Text = $"帧 {_frames}　最新报文 {(_lastHexLen > 0 ? $"{_lastHexLen}B：{_lastHex}" : "—")}"
-                            + contacts
+            string contactsText = contactCountText is not null ? $"　接触数量(0x54) = {contactCountText}" : "";
+            StatusText.Text = $"帧 {frames}　最新报文 {(lastHexLen > 0 ? $"{lastHexLen}B：{lastHex}" : "—")}"
+                            + contactsText
                             + $"　屏幕 {(int)sw}×{(int)sh} DIP　{modeText}";
         }
     }
