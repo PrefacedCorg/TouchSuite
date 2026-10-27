@@ -14,6 +14,7 @@ internal static class Win32
 
     public const int GWL_EXSTYLE = -20;
 
+    public const int SW_HIDE = 0;
     public const int SW_SHOWNOACTIVATE = 4;
 
     public const int SM_CXSCREEN = 0;

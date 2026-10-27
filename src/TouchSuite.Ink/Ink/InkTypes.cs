@@ -9,8 +9,12 @@ internal enum InkToolKind
     Eraser,
 }
 
-/// <summary>一个采样点。位置是屏幕物理像素、原样不滤波；宽度已含压感与工具粗细。</summary>
-internal readonly record struct InkSample(float X, float Y, float Width, byte R, byte G, byte B, byte A);
+/// <summary>
+/// 一个采样点。位置是屏幕物理像素、原样不滤波；宽度已含压感与工具粗细。
+/// <para><see cref="Ticks"/> 是采样时刻（<c>Stopwatch.GetTimestamp()</c> 的 QPC 计数），
+/// 只给笔迹预测估速度用；手填的测试样本可以留 0，此时不预测。</para>
+/// </summary>
+internal readonly record struct InkSample(float X, float Y, float Width, byte R, byte G, byte B, byte A, long Ticks = 0);
 
 /// <summary>矩形（屏幕物理像素，左闭右开）。</summary>
 internal readonly record struct RectI(int L, int T, int R, int B)

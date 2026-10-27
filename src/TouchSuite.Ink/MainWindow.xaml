@@ -1,9 +1,10 @@
 <Window x:Class="TouchSuite.Ink.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="TouchSuite.Ink" WindowStyle="None" AllowsTransparency="True" Background="#01000000"
+        Title="TouchSuite.Ink" WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize" WindowState="Maximized"
         MouseLeftButtonDown="OnMouseDown" MouseMove="OnMouseMove" MouseLeftButtonUp="OnMouseUp"
+        PreviewMouseLeftButtonDown="OnPreviewPromotedMouse" PreviewMouseLeftButtonUp="OnPreviewPromotedMouse"
         StylusDown="OnStylusDown" StylusMove="OnStylusMove" StylusUp="OnStylusUp"
         TouchDown="OnTouchDown" TouchMove="OnTouchMove" TouchUp="OnTouchUp"
         SnapsToDevicePixels="True" UseLayoutRounding="False">
@@ -32,7 +33,9 @@
     <Canvas x:Name="FallbackCanvas" IsHitTestVisible="False" />
 
     <!-- 落笔区：alpha=1 的近乎不可见背景 —— 分层窗口按 alpha 命中测试，
-         真正全透明(alpha=0)的像素会把鼠标放过去，谁也点不到 -->
+         真正全透明(alpha=0)的像素会把鼠标放过去，谁也点不到。
+         鼠标模式下把这个 Border 收起（窗口其余像素 alpha=0），点击就穿到桌面；
+         工具栏本身是不透明像素，所以仍然点得动。 -->
     <Border x:Name="InputSurface" Background="#01000000" />
 
     <!-- 工具栏（WPF 层，永远在墨迹层之上） -->
@@ -43,14 +46,8 @@
         <ToggleButton x:Name="ModeAnnotate" Style="{StaticResource ToolToggle}" Content="批注模式" IsChecked="True" Click="OnModeAnnotate" />
         <Border Style="{StaticResource Divider}" />
         <TextBlock Text="输入源" Foreground="#CCFFFFFF" VerticalAlignment="Center" Margin="4,0,6,0" FontSize="13" />
-        <!-- 不套 ToolToggle 的白色前景：下拉弹出列表是系统白底，白字会看不见 -->
-        <ComboBox x:Name="InputSourceCombo" Width="150" VerticalAlignment="Center" FontSize="13"
-                  SelectedIndex="0" DropDownClosed="OnInputSourcePicked">
-          <ComboBoxItem Content="WPF 事件（现状）" />
-          <ComboBoxItem Content="RawInput 原始 HID" />
-          <ComboBoxItem Content="WM_POINTER 帧 API" />
-          <ComboBoxItem Content="组合 RawInput+POINTER" />
-        </ComboBox>
+        <ToggleButton x:Name="InputSourceButton" Style="{StaticResource ToolToggle}" Content="WPF 事件"
+                      Click="OnInputSourceToggle" />
         <Border Style="{StaticResource Divider}" />
         <ToggleButton x:Name="ToolPen" Style="{StaticResource ToolToggle}" Content="笔" IsChecked="True" Click="OnToolPen" />
         <ToggleButton x:Name="ToolEraser" Style="{StaticResource ToolToggle}" Content="橡皮" Click="OnToolEraser" />
@@ -68,6 +65,24 @@
         <Button Style="{StaticResource ToolButton}" Content="撤销" Click="OnUndo" />
         <Button Style="{StaticResource ToolButton}" Content="清空" Click="OnClear" />
         <Button Style="{StaticResource ToolButton}" Content="退出" Click="OnExit" />
+      </StackPanel>
+    </Border>
+
+    <!-- 输入源下拉：故意不用 ComboBox —— 它的弹出列表是独立 HWND，窗口排不进置顶带，
+         永远压在墨迹窗口下面，超出工具栏那几项就点不到。放在本窗口内部就始终在墨迹层之上。 -->
+    <Border x:Name="InputSourceMenu" Visibility="Collapsed"
+            HorizontalAlignment="Center" VerticalAlignment="Top"
+            Background="#F21B1B20" BorderBrush="#33FFFFFF" BorderThickness="1"
+            CornerRadius="8" Padding="6">
+      <StackPanel>
+        <Button Style="{StaticResource ToolButton}" Tag="0" Width="200" HorizontalContentAlignment="Left"
+                Background="#1FFFFFFF" BorderBrush="#33FFFFFF" Content="WPF 事件（现状）" Click="OnInputSourcePicked" />
+        <Button Style="{StaticResource ToolButton}" Tag="1" Width="200" HorizontalContentAlignment="Left"
+                Background="#1FFFFFFF" BorderBrush="#33FFFFFF" Content="RawInput 原始 HID" Click="OnInputSourcePicked" />
+        <Button Style="{StaticResource ToolButton}" Tag="2" Width="200" HorizontalContentAlignment="Left"
+                Background="#1FFFFFFF" BorderBrush="#33FFFFFF" Content="WM_POINTER 帧 API" Click="OnInputSourcePicked" />
+        <Button Style="{StaticResource ToolButton}" Tag="3" Width="200" HorizontalContentAlignment="Left"
+                Background="#1FFFFFFF" BorderBrush="#33FFFFFF" Content="组合 RawInput+POINTER" Click="OnInputSourcePicked" />
       </StackPanel>
     </Border>
 

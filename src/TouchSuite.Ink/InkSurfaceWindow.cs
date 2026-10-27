@@ -60,10 +60,23 @@ internal sealed class InkSurfaceWindow : IDisposable
         Log.Write($"InkSurfaceWindow: hwnd=0x{_hwnd.ToInt64():X} 区域=({X},{Y}) {Width}x{Height}");
     }
 
+    /// <summary>
+    /// 显示/隐藏墨迹层窗口。鼠标模式下必须隐藏它：
+    /// 这个窗口不是 layered 窗口，命中测试永远是整块矩形，WM_NCHITTEST 返回 HTTRANSPARENT
+    /// 只在**同线程**窗口之间往下传，传不到别的进程（桌面/其它 App）→ 不隐藏就会把整个屏幕的点击全吃掉。
+    /// </summary>
+    public void SetVisible(bool visible)
+    {
+        if (_hwnd == IntPtr.Zero)
+            return;
+        Win32.ShowWindow(_hwnd, visible ? Win32.SW_SHOWNOACTIVATE : Win32.SW_HIDE);
+        Log.Write($"InkSurfaceWindow: {(visible ? "显示" : "隐藏")} hwnd=0x{_hwnd.ToInt64():X}");
+    }
+
     private IntPtr WndProcHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam)
     {
         if (msg == Win32.WM_NCHITTEST)
-            return Win32.HTTRANSPARENT;   // 点击穿透，永不抢输入
+            return Win32.HTTRANSPARENT;   // 同线程窗口之间的点击穿透（跨进程不起作用，见 SetVisible）
         return Win32.DefWindowProcW(hwnd, msg, wParam, lParam);
     }
 

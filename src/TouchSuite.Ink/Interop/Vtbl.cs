@@ -21,14 +21,25 @@ internal static class Vtbl
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int CreateBrush(IntPtr self, ref Gfx.D2D1_COLOR_F color, IntPtr props, out IntPtr brush);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int FillEllipse(IntPtr self, ref Gfx.D2D1_ELLIPSE ellipse, IntPtr brush);
 
+    /// <summary>ID2D1RenderTarget::SetTransform（返回 void）。</summary>
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void SetTransform(IntPtr self, ref Gfx.D2D1_MATRIX_3X2_F transform);
+
+    /// <summary>ID2D1RenderTarget::SetDpi（返回 void）。</summary>
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void SetDpi(IntPtr self, float dpiX, float dpiY);
+
+    /// <summary>ID2D1RenderTarget::PushAxisAlignedClip（返回 void）。</summary>
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void PushClip(IntPtr self, ref Gfx.D2D1_RECT_F clipRect, int antialiasMode);
+
+    /// <summary>ID2D1RenderTarget::Clear（返回 void）。</summary>
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void Clear(IntPtr self, ref Gfx.D2D1_COLOR_F color);
+
+    /// <summary>ID2D1Factory1::CreateDevice（返回 HRESULT）。</summary>
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int FactoryCreateDevice(IntPtr self, IntPtr dxgiDevice, out IntPtr d2dDevice);
+
     /// <summary>IUnknown::QueryInterface（槽位 0）。</summary>
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int QueryInterface(IntPtr self, ref Guid iid, out IntPtr ppv);
 
-    /// <summary>ID3D11DeviceContext::UpdateSubresource（返回 void）。</summary>
-    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void UpdateSubresource(
-        IntPtr self, IntPtr dstResource, uint dstSubresource, IntPtr pDstBox, IntPtr pSrcData, uint srcRowPitch, uint srcDepthPitch);
-
-    /// <summary>无参、返回 void 的方法（例如 ID3D11DeviceContext::Flush）。</summary>
+    /// <summary>无参、返回 void 的方法（例如 ID2D1RenderTarget::PopAxisAlignedClip）。</summary>
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void V0(IntPtr self);
 
     /// <summary>IUnknown::Release（槽位 2）。</summary>

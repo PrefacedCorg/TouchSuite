@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -33,6 +33,21 @@ public partial class MainWindow : Window
 
     private const int MousePointerId = 0;
 
+    /// <summary>
+    /// 同一次物理点击的去抖窗口：触摸会同时产生 Stylus 与 Touch 两条通道，
+    /// 还可能被 WPF 再提升成一份鼠标事件 —— 三者都算"一次点击"。
+    /// </summary>
+    private static readonly long TapDedupeTicks = Stopwatch.Frequency / 4;   // 250ms
+
+    private long _lastToolbarTapStamp;
+    private object? _lastToolbarTapTarget;
+    private long _menuOpenedStamp;
+
+    // 正在拖动的滑块（触摸/触笔没有 WPF 的 Thumb 拖拽，只能自己跟手）
+    private Slider? _sliderDragTarget;
+    private int _sliderDragChannel;   // 0=无 1=触笔 2=触摸
+    private int _sliderDragId;
+
     private int _strokeSeq;
 
     // ---- 输入源（工具栏下拉框） ----
@@ -46,8 +61,6 @@ public partial class MainWindow : Window
     /// <summary>WPF 的 Stylus/Touch 通道是否放行。非 WPF 模式下这两条通道必须门掉，否则会被提升重复落笔。</summary>
     private bool _wpfChannelActive = true;
 
-    private bool _suppressInputCombo;         // 程序内改下拉选中项时不重入
-    private bool _uiReady;                    // InitializeComponent 期间控件还没赋值，别在这里切源/刷状态
     private IntPtr _hwnd;
     private HwndSource? _hwndSrc;
     private HwndSourceHook? _wndProcHook;    // 必须存字段，否则委托被 GC 后回调悬空
@@ -115,7 +128,6 @@ public partial class MainWindow : Window
         Log.Write($"[输入] 句柄=0x{_hwnd.ToInt64():X} hook={(_hwndSrc is not null)} "
                 + $"虚拟屏=({_vx},{_vy},{_vw},{_vh}) 墨迹层={_layerW}x{_layerH}");
 
-        _uiReady = true;
         if (App.StartupInput != InkInputMode.Wpf)
             SwitchInputSource(App.StartupInput);
     }
@@ -405,19 +417,47 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>
-    /// 只在用户**真的关掉下拉框**时切源。原先用 SelectionChanged 会被杂散输入误触发：
-    /// 实测注入触摸（被提升成鼠标点击）时选中项被改回 WPF，模式就悄悄变了。
-    /// </summary>
-    private void OnInputSourcePicked(object sender, EventArgs e)
+    /// <summary>工具栏上的「输入源」按钮：展开/收起本窗口内的下拉面板（贴着工具栏底边）。</summary>
+    private void OnInputSourceToggle(object sender, RoutedEventArgs e)
     {
-        if (_suppressInputCombo || !_uiReady)
+        if (InputSourceMenu.Visibility == Visibility.Visible)
+        {
+            // 同一次触摸可能把 Click 送到这里两次（Stylus / Touch 两条通道，或手动派发 + 提升出来的鼠标）。
+            // 刚打开就又被要求关闭 = 重复派发，忽略；不然就是"闪一下就没了"。
+            if (Stopwatch.GetTimestamp() - _menuOpenedStamp < TapDedupeTicks)
+                return;
+            CloseInputSourceMenu();
             return;
-        var requested = (InkInputMode)Math.Max(0, InputSourceCombo.SelectedIndex);
+        }
+        GeneralTransform transform = ToolbarBorder.TransformToAncestor(this);
+        Rect bounds = transform.TransformBounds(new Rect(ToolbarBorder.RenderSize));
+        InputSourceMenu.Margin = new Thickness(0, bounds.Bottom + 6, 0, 0);
+        InputSourceMenu.Visibility = Visibility.Visible;
+        InputSourceButton.IsChecked = true;
+        _menuOpenedStamp = Stopwatch.GetTimestamp();
+    }
+
+    /// <summary>下拉面板里选一项：收起面板再切源。</summary>
+    private void OnInputSourcePicked(object sender, RoutedEventArgs e)
+    {
+        CloseInputSourceMenu();
+        if (sender is not FrameworkElement item || item.Tag is not string tag || !int.TryParse(tag, out int index))
+            return;
+        var requested = (InkInputMode)Math.Clamp(index, 0, 3);
         if (requested == _mode)
             return;
-        Log.Write($"[输入源] 下拉框选定 {InkInputModes.Label(requested)}");
+        Log.Write($"[输入源] 选定 {InkInputModes.Label(requested)}");
         SwitchInputSource(requested);
+    }
+
+    /// <summary>收起下拉面板；返回"刚才是否展开着"。</summary>
+    private bool CloseInputSourceMenu()
+    {
+        if (InputSourceMenu.Visibility != Visibility.Visible)
+            return false;
+        InputSourceMenu.Visibility = Visibility.Collapsed;
+        InputSourceButton.IsChecked = false;
+        return true;
     }
 
     /// <summary>
@@ -486,9 +526,7 @@ public partial class MainWindow : Window
         if (_wpfChannelActive)
             _sawStylus = false;
 
-        _suppressInputCombo = true;
-        InputSourceCombo.SelectedIndex = (int)mode;
-        _suppressInputCombo = false;
+        InputSourceButton.Content = InkInputModes.Label(mode);
 
         Log.Write($"[输入源] 切换到 {InkInputModes.Label(mode)}：{InkInputModes.ApiName(mode, _rawInfo, _pointerInfo)}");
         UpdateStatus();
@@ -528,37 +566,48 @@ public partial class MainWindow : Window
     // ================= 模式切换 =================
 
     /// <summary>
-    /// 批注模式：本窗口正常接收输入（并保持在墨迹窗口之上）；
-    /// 鼠标模式：本窗口加 WS_EX_TRANSPARENT，鼠标/触摸穿过它落到桌面上。
+    /// 批注模式：本窗口正常接收输入（落笔区 InputSurface 显示，整屏 alpha=1 可命中）；
+    /// 鼠标模式：收起落笔区，窗口其余像素 alpha=0 —— 分层窗口按 alpha 做命中测试，点击就穿到桌面上。
+    ///
+    /// <para>不用 WS_EX_TRANSPARENT：它作用于整个窗口，工具栏会被一起变成穿透的（点不回来）；
+    /// 而且底下的 DComp 墨迹窗口不是 layered 窗口，HTTRANSPARENT 只在同线程窗口间传递，
+    /// 挡不住它吃点击 —— 所以鼠标模式必须把墨迹窗口也藏起来。</para>
     /// </summary>
     private void SetAnnotating(bool on)
     {
         _annotating = on;
         ModeMouse.IsChecked = !on;
         ModeAnnotate.IsChecked = on;
+        CloseInputSourceMenu();
+
+        InputSurface.Visibility = on ? Visibility.Visible : Visibility.Collapsed;
+        _inkWindow?.SetVisible(on);
 
         IntPtr hwnd = new WindowInteropHelper(this).Handle;
         if (hwnd != IntPtr.Zero)
         {
-            long ex = Win32.GetWindowLongPtr(hwnd, Win32.GWL_EXSTYLE).ToInt64();
-            if (on)
-                ex &= ~(long)Win32.WS_EX_TRANSPARENT;
-            else
-                ex |= Win32.WS_EX_TRANSPARENT;
-            Win32.SetWindowLongPtr(hwnd, Win32.GWL_EXSTYLE, new IntPtr(ex));
-            long after = Win32.GetWindowLongPtr(hwnd, Win32.GWL_EXSTYLE).ToInt64();
-            Log.Write($"[模式] 批注={on} GWL_EXSTYLE=0x{after:X} "
-                    + $"(LAYERED={(after & Win32.WS_EX_LAYERED) != 0} TRANSPARENT={(after & Win32.WS_EX_TRANSPARENT) != 0})");
-
             // 两个窗口都是 topmost，靠 SetWindowPos 明确把 WPF 这层压到墨迹层上面
             Win32.SetWindowPos(hwnd, new IntPtr(HWND_TOPMOST), 0, 0, 0, 0,
                 SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
         }
 
+        Log.Write($"[模式] 批注={on} 落笔区={(on ? "显示" : "收起")} 墨迹窗口={(on ? "显示" : "隐藏")}");
         UpdateStatus();
     }
 
     // ================= 落笔（鼠标 / 触笔） =================
+
+    /// <summary>
+    /// 触摸/触笔刚被我们直接派发过点击时，WPF 还会把同一次接触"提升"成一份鼠标事件；
+    /// 若它再落到按钮上就是点两下（下拉框闪一下就消失）。这里把提升出来的那一份吞掉。
+    /// 真鼠标的 <c>StylusDevice</c> 为 null，不受影响。
+    /// </summary>
+    private void OnPreviewPromotedMouse(object sender, MouseButtonEventArgs e)
+    {
+        if (e.StylusDevice is not null &&
+            Stopwatch.GetTimestamp() - _lastToolbarTapStamp < TapDedupeTicks)
+            e.Handled = true;
+    }
 
     private void OnMouseDown(object sender, MouseButtonEventArgs e)
     {
@@ -567,6 +616,13 @@ public partial class MainWindow : Window
                 + $"在工具栏={onToolbar} 触笔在用={_stylusActiveCount > 0} 层={_layer?.GetType().Name ?? "无"}");
         if (!_annotating)
             return;
+        // 工具栏是 WPF 自己的 UI：不管是真鼠标还是触摸/触笔提升出来的鼠标，都必须放行给按钮，
+        // 也不能在它下面落笔。这个判断必须在下面的门控之前 —— 否则非 WPF 输入源模式下
+        // 触摸点不动工具栏。
+        if (onToolbar)
+            return;
+        if (CloseInputSourceMenu())
+            return;   // 这一下只是关下拉面板，不落笔
         // 非 WPF 模式下，触摸/触笔会被提升成鼠标事件：必须丢掉，否则同一根手指画两遍。
         if (!_wpfChannelActive &&
             (e.StylusDevice is not null || _rawActiveCount > 0 || _pointerActiveCount > 0))
@@ -574,16 +630,104 @@ public partial class MainWindow : Window
             _gateDroppedMouse++;
             return;
         }
-        if (_stylusActiveCount > 0 || onToolbar)
+        if (_stylusActiveCount > 0)
             return;
         PointerDown(MousePointerId, PointToScreen(e.GetPosition(this)), 1f);
         CaptureMouse();
         e.Handled = true;
     }
 
-    /// <summary>工具栏上的点击不要当成落笔（事件会从子元素冒泡到 Window）。</summary>
+    /// <summary>工具栏（含输入源下拉面板）上的点击不要当成落笔（事件会从子元素冒泡到 Window）。</summary>
     private bool IsOnToolbar(object? source) =>
-        source is DependencyObject d && ToolbarBorder.IsAncestorOf(d);
+        source is DependencyObject d && (ToolbarBorder.IsAncestorOf(d) || InputSourceMenu.IsAncestorOf(d));
+
+    /// <summary>
+    /// 触摸/触笔落在工具栏上时，直接把这一次点击派发给命中的控件。
+    ///
+    /// <para>为什么不交给 WPF 自己处理：工具栏上的 Click 是鼠标语义，触摸/触笔要先被 WPF
+    /// 提升成鼠标事件；而本窗口为了落笔把触摸/触笔事件全都 Handle 掉了，画过一笔之后
+    /// 第一次点击经常被吞掉（实测要点两下）。这里自己派发，一次就生效。</para>
+    /// </summary>
+    private bool TryTapToolbar(object? source)
+    {
+        if (source is not DependencyObject node)
+            return false;
+
+        if (FindAncestor<ButtonBase>(node) is not ButtonBase button)
+            return false;
+
+        // 同一次接触可能同时走 Stylus 与 Touch 两条通道（WPF 对触摸会两条都发），
+        // 那样一个 Tap 会被派发两次（下拉框闪一下就没了、撤销一次退两步）。
+        // 同一个控件在去抖窗口内只认第一次；换了控件则不受影响，快速连点不会被吞。
+        long now = Stopwatch.GetTimestamp();
+        bool repeated = ReferenceEquals(button, _lastToolbarTapTarget) && now - _lastToolbarTapStamp < TapDedupeTicks;
+        _lastToolbarTapTarget = button;
+        _lastToolbarTapStamp = now;
+        if (repeated)
+            return true;
+
+        if (button is ToggleButton toggle)
+            toggle.IsChecked = !(toggle.IsChecked == true);   // RaiseEvent 不会走 OnClick，得自己翻
+        button.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent, button));
+        return true;
+    }
+
+    // ---- 工具栏滑块：触摸/触笔自己跟手拖 ----
+
+    /// <summary>
+    /// 触摸/触笔按下滑块时开始拖动。WPF 的 Slider 靠 Thumb + 鼠标捕获工作，而工具栏上的
+    /// 触摸/触笔事件被本层吞掉了，它收不到 Move，所以只能自己按位置算值并跟着手指更新。
+    /// </summary>
+    private bool TryBeginSliderDrag(object? source, int channel, int pointerId, Func<IInputElement, Point> positionOf)
+    {
+        if (source is not DependencyObject node || FindAncestor<Slider>(node) is not Slider slider)
+            return false;
+
+        _sliderDragTarget = slider;
+        _sliderDragChannel = channel;
+        _sliderDragId = pointerId;
+        SetSliderFromPoint(slider, positionOf(slider));
+        _lastToolbarTapStamp = Stopwatch.GetTimestamp();   // 压住提升出来的鼠标事件，别让 Thumb 同时再拖一遍
+        return true;
+    }
+
+    /// <summary>拖动中：跟着这个触点更新滑块。返回 true 表示这次 Move 属于滑块。</summary>
+    private bool ContinueSliderDrag(int channel, int pointerId, Func<IInputElement, Point> positionOf)
+    {
+        if (_sliderDragTarget is null || _sliderDragChannel != channel || _sliderDragId != pointerId)
+            return false;
+        SetSliderFromPoint(_sliderDragTarget, positionOf(_sliderDragTarget));
+        _lastToolbarTapStamp = Stopwatch.GetTimestamp();   // 拖动期间继续压住提升出来的鼠标事件
+        return true;
+    }
+
+    private bool EndSliderDrag(int channel, int pointerId)
+    {
+        if (_sliderDragTarget is null || _sliderDragChannel != channel || _sliderDragId != pointerId)
+            return false;
+        _sliderDragTarget = null;
+        _sliderDragChannel = 0;
+        return true;
+    }
+
+    private static void SetSliderFromPoint(Slider slider, Point p)
+    {
+        if (slider.ActualWidth <= 0)
+            return;
+        double ratio = Math.Clamp(p.X / slider.ActualWidth, 0, 1);
+        slider.Value = slider.Minimum + ratio * (slider.Maximum - slider.Minimum);
+    }
+
+    private static T? FindAncestor<T>(DependencyObject? node) where T : DependencyObject
+    {
+        while (node is not null)
+        {
+            if (node is T match)
+                return match;
+            node = VisualTreeHelper.GetParent(node);
+        }
+        return null;
+    }
 
     private void OnMouseMove(object sender, MouseEventArgs e)
     {
@@ -611,6 +755,25 @@ public partial class MainWindow : Window
 
     private void OnStylusDown(object sender, StylusDownEventArgs e)
     {
+        // 鼠标模式：别接、也别 handle —— 留在 WPF 手里，触笔才能点工具栏（提升成鼠标点击）。
+        if (!_annotating)
+            return;
+
+        // 落在工具栏上：自己派发点击（见 TryTapToolbar），既不落笔，也不靠 WPF 的提升。
+        if (IsOnToolbar(e.OriginalSource))
+        {
+            e.Handled = true;
+            if (TryBeginSliderDrag(e.OriginalSource, 1, e.StylusDevice.Id, element => e.GetPosition(element)))
+                return;
+            TryTapToolbar(e.OriginalSource);
+            return;
+        }
+        if (CloseInputSourceMenu())
+        {
+            e.Handled = true;
+            return;
+        }
+
         if (!_wpfChannelActive)
         {
             // 非 WPF 模式下触笔由 RawInput 通道负责（真实触笔不会走 WM_POINTER），这里只记丢弃计数
@@ -640,16 +803,24 @@ public partial class MainWindow : Window
 
     private void OnStylusMove(object sender, StylusEventArgs e)
     {
+        int pointerId = e.StylusDevice.Id;
+
+        if (ContinueSliderDrag(1, pointerId, element => e.GetPosition(element)))
+        {
+            e.Handled = true;
+            return;
+        }
+
+        // 不是墨迹层起的笔画（例如落在工具栏上、交给 WPF 提升成鼠标的那一笔）→ 一律不接管。
+        if (!_strokeOfPointer.ContainsKey(pointerId))
+            return;
+
         if (!_wpfChannelActive)
         {
             _gateDroppedStylus++;
             e.Handled = true;
             return;
         }
-
-        int pointerId = e.StylusDevice.Id;
-        if (!_strokeOfPointer.ContainsKey(pointerId))
-            return;
 
         StylusPointCollection pts = e.GetStylusPoints(this);
         if (pts.Count > 1 && _histLogged < 20)
@@ -667,6 +838,17 @@ public partial class MainWindow : Window
 
     private void OnStylusUp(object sender, StylusEventArgs e)
     {
+        int pointerId = e.StylusDevice.Id;
+
+        if (EndSliderDrag(1, pointerId))
+        {
+            e.Handled = true;
+            return;
+        }
+
+        if (!_strokeOfPointer.ContainsKey(pointerId))
+            return;   // 没在本层起笔（例如点在工具栏）→ 留给 WPF 提升成鼠标点击
+
         if (!_wpfChannelActive)
         {
             _gateDroppedStylus++;
@@ -674,7 +856,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        PointerUp(e.StylusDevice.Id);
+        PointerUp(pointerId);
         if (_stylusActiveCount > 0)
             _stylusActiveCount--;
         if (_stylusActiveCount == 0)
@@ -688,6 +870,25 @@ public partial class MainWindow : Window
 
     private void OnTouchDown(object sender, TouchEventArgs e)
     {
+        // 鼠标模式：别接、也别 handle —— 留在 WPF 手里，手指才能点工具栏（提升成鼠标点击）。
+        if (!_annotating)
+            return;
+
+        // 落在工具栏上：自己派发点击（见 TryTapToolbar），既不落笔，也不靠 WPF 的提升。
+        if (IsOnToolbar(e.OriginalSource))
+        {
+            e.Handled = true;
+            if (TryBeginSliderDrag(e.OriginalSource, 2, e.TouchDevice.Id, element => e.GetTouchPoint(element).Position))
+                return;
+            TryTapToolbar(e.OriginalSource);
+            return;
+        }
+        if (CloseInputSourceMenu())
+        {
+            e.Handled = true;
+            return;
+        }
+
         if (!_wpfChannelActive)
         {
             _gateDroppedStylus++;
@@ -703,6 +904,18 @@ public partial class MainWindow : Window
 
     private void OnTouchMove(object sender, TouchEventArgs e)
     {
+        if (ContinueSliderDrag(2, e.TouchDevice.Id, element => e.GetTouchPoint(element).Position))
+        {
+            e.Handled = true;
+            return;
+        }
+
+        // 不是墨迹层起的触点（例如落在工具栏上、交给 WPF 提升成鼠标的那根手指）→ 一律不接管。
+        if (!_strokeOfPointer.ContainsKey(e.TouchDevice.Id))
+            return;
+
+        if (!_annotating)
+            return;
         if (!_wpfChannelActive)
         {
             _gateDroppedStylus++;
@@ -710,7 +923,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!TouchUsable || !_strokeOfPointer.ContainsKey(e.TouchDevice.Id))
+        if (!TouchUsable)
             return;
         PointerMove(e.TouchDevice.Id, PointToScreen(e.GetTouchPoint(this).Position), 1f);
         e.Handled = true;
@@ -718,6 +931,16 @@ public partial class MainWindow : Window
 
     private void OnTouchUp(object sender, TouchEventArgs e)
     {
+        if (EndSliderDrag(2, e.TouchDevice.Id))
+        {
+            e.Handled = true;
+            return;
+        }
+
+        if (!_strokeOfPointer.ContainsKey(e.TouchDevice.Id))
+            return;
+        if (!_annotating)
+            return;
         if (!_wpfChannelActive)
         {
             _gateDroppedStylus++;
@@ -827,7 +1050,8 @@ public partial class MainWindow : Window
     {
         float t = Math.Clamp(pressure, 0f, 1f);
         float w = (float)(_width * (0.35 + 0.65 * t));
-        return new InkSample((float)screenPx.X, (float)screenPx.Y, w, _color.R, _color.G, _color.B, _color.A);
+        return new InkSample((float)screenPx.X, (float)screenPx.Y, w, _color.R, _color.G, _color.B, _color.A,
+            Stopwatch.GetTimestamp());   // QPC 时间戳：TickCount 只有 15.6ms 粒度，估不准速度
     }
 
     // ================= 工具栏 =================

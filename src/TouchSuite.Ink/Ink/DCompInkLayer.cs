@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using static TouchSuite.Ink.Gfx;
 
@@ -6,9 +7,15 @@ namespace TouchSuite.Ink;
 /// <summary>
 /// 底层墨迹层：DirectComposition 表面 + Direct2D 绘制，跑在自己的渲染线程上。
 ///
-/// <para>结构：表面是"持久位图"，每帧只把受影响的脏矩形交给 BeginDraw（它会把该矩形清成透明），
-/// 然后把与该矩形相交的所有笔画重画一遍 —— 这样新笔迹是增量的，而擦除/撤销这类结构性操作
+/// <para>结构：表面是"持久位图"，每帧只把受影响的脏矩形交给 BeginDraw（换出一块临时渲染目标），
+/// 清成透明后把与该矩形相交的所有笔画重画一遍 —— 这样新笔迹是增量的，而擦除/撤销这类结构性操作
 /// 只需要把受影响区域标脏即可，不用维护增量/全量两套逻辑。</para>
+///
+/// <para><b>纯 GPU</b>：这里没有任何 CPU 像素循环，也不做 CPU→GPU 上传。笔迹是 D2D 的
+/// <c>FillEllipse</c> 原语，光栅化全在 GPU 上，CPU 只负责发命令；合成由 DWM/DComp 完成。
+/// 要注意 <c>IDCompositionSurface::BeginDraw</c> 只有对"带 D2D 设备的 DComp 设备"才允许要
+/// <c>ID2D1DeviceContext</c>，所以设备必须用 <c>DCompositionCreateDevice2(ID2D1Device)</c> 创建
+/// （老的 <c>DCompositionCreateDevice(IDXGIDevice)</c> 会 E_INVALIDARG）。</para>
 ///
 /// <para>线程：UI 线程只往 BlockingCollection 里塞不可变命令；渲染线程独占笔画模型、D2D 资源与表面。
 /// 两边没有共享可变状态，也不需要锁。</para>
@@ -24,6 +31,31 @@ internal sealed class DCompInkLayer : InkLayerBase
     /// <summary>更新区最小边长：实测 1×1 这种退化矩形会被 DComp 直接判 E_INVALIDARG，所以先撑大再交上去。</summary>
     private const int MinUpdateSide = 32;
 
+    /// <summary>两次呈现的最小间隔（≈144Hz）。见 RenderLoop 里的呈现节流。</summary>
+    private static readonly long PresentIntervalTicks = Stopwatch.Frequency * 7 / 1000;
+
+    /// <summary>
+    /// 收锋系数：下标 = 距笔尖的采样数（0 是最末一个采样）。越靠尖端越细，
+    /// 于是湿墨的笔尖永远是个尖，落笔结束自然收笔 —— 压感恒为 1 的手指书写也有笔锋。
+    /// </summary>
+    private static readonly float[] TaperScale = { 0.45f, 0.60f, 0.75f, 0.87f, 0.95f };
+
+    /// <summary>笔尖附近要一起重画的采样数（平滑与收锋都会改动这一段的形状，必须一起标脏）。</summary>
+    private const int TipDirtySamples = 6;
+
+    /// <summary>
+    /// 墨迹预测的提前量（ms）。EasiNote 默认 36ms；这里取 30ms，
+    /// 在 120~250Hz 采样下大约等于"提前 1~2 个采样"，够抵消输入到上屏的那段延迟，又不容易甩过头。
+    /// </summary>
+    private const float PredictLeadMs = 30f;
+
+    /// <summary>预测点迟迟没有新采样跟上时，等这么久就撤掉（否则手指停住后墨迹会"甩"在前头）。</summary>
+    private const int PredictExpireMs = 70;
+
+    private long _lastPresentStamp;
+
+    private const int D2D1_ANTIALIAS_MODE_ALIASED = 1;
+
     [DllImport("ole32.dll")]
     private static extern int CoInitializeEx(IntPtr reserved, uint coInit);
 
@@ -38,21 +70,14 @@ internal sealed class DCompInkLayer : InkLayerBase
     private bool _shutdown;
 
     // ---- 以下字段只在渲染线程上访问 ----
-    private ID3D11Device? _d3dDevice;
-    private IntPtr _d3dContext;          // 裸指针：UpdateSubresource 走 vtable 槽位调用
+    private ID3D11Device? _d3dDevice;    // 只用来给 ID2D1Factory1::CreateDevice 提供 IDXGIDevice
     private IDCompositionDevice? _device;
     private IntPtr _target;
     private IntPtr _visual;
     private IntPtr _surface;
 
-    // BeginDraw 探针定下来的绘制通路
+    /// <summary>探针定下来的绘制目标 IID（ID2D1DeviceContext 优先）。</summary>
     private Guid _beginIid;
-    private bool _useD3D;                // true = IDXGISurface + D3D11 上传；false = D2D 印章
-
-    // CPU 侧 BGRA 预乘缓冲（按脏矩形大小复用，行距 = 宽 × 4）
-    private uint[] _scratch = Array.Empty<uint>();
-    private GCHandle _scratchPin;
-    private int _scratchW, _scratchH;
 
     private readonly List<InkStroke> _strokes = new();
     private readonly Stack<UndoEntry> _undo = new();
@@ -60,6 +85,13 @@ internal sealed class DCompInkLayer : InkLayerBase
     private RectI _dirty = RectI.Empty;
     private long _frames;
     private bool _loggedFirstFrame;
+
+    // ---- 湿墨的预测尾巴（只在渲染线程访问）----
+    private bool _predictActive;
+    private InkSample _predictColor;
+    private float _predictX0, _predictY0, _predictX1, _predictY1;
+    private float _predictW0, _predictW1;
+    private RectI _predictBounds = RectI.Empty;
 
     public DCompInkLayer(IntPtr hwnd, int originX, int originY, int width, int height)
     {
@@ -70,9 +102,7 @@ internal sealed class DCompInkLayer : InkLayerBase
         _height = height;
     }
 
-    public override string BackendName => _useD3D
-        ? "DirectComposition 表面 + D3D11 上传（DWM 合成，低延迟）"
-        : "DirectComposition 表面 + D2D（DWM 合成）";
+    public override string BackendName => "DirectComposition 表面 + D2D（GPU 光栅化，DWM 合成）";
     public override string LastError => _error;
     public bool IsReady => _ready;
 
@@ -107,12 +137,42 @@ internal sealed class DCompInkLayer : InkLayerBase
 
             while (true)
             {
-                InkCommand cmd = Queue.Take();
-                Process(cmd);
+                // 有预测尾巴时不能无限期等：超时说明手指没再动，要把预测撤掉并重画一帧
+                if (_predictActive)
+                {
+                    if (Queue.TryTake(out InkCommand? pended, PredictExpireMs))
+                        Process(pended!);
+                    else
+                        ClearPrediction();
+                }
+                else
+                {
+                    Process(Queue.Take());
+                }
+
                 while (Queue.TryTake(out InkCommand? more))
                     Process(more!);
                 if (_shutdown)
                     break;
+
+                // 呈现节流：显示刷新只有 60~144Hz，同一帧里多提交几次不会更早被看到，
+                // 只会让渲染线程被"每个输入样本一次 BeginDraw/EndDraw/Commit"拖满，
+                // 反过来把墨迹越拖越靠后。等够一帧的同时把新到的样本一并吃掉，再只呈现最新状态。
+                long due = _lastPresentStamp + PresentIntervalTicks;
+                while (true)
+                {
+                    long remain = due - Stopwatch.GetTimestamp();
+                    if (remain <= 0)
+                        break;
+                    int ms = (int)Math.Ceiling(remain * 1000.0 / Stopwatch.Frequency);
+                    if (!Queue.TryTake(out InkCommand? newer, ms))
+                        break;
+                    Process(newer!);
+                }
+                if (_shutdown)
+                    break;
+
+                _lastPresentStamp = Stopwatch.GetTimestamp();   // 从呈现开始算间隔，别把呈现本身的耗时也算进去
                 Present();
             }
         }
@@ -137,7 +197,7 @@ internal sealed class DCompInkLayer : InkLayerBase
     {
         int hr = D3D11CreateDevice(IntPtr.Zero, D3D_DRIVER_TYPE_HARDWARE, IntPtr.Zero,
             D3D11_CREATE_DEVICE_BGRA_SUPPORT, FeatureLevels, (uint)FeatureLevels.Length,
-            D3D11_SDK_VERSION, out ID3D11Device d3d, out int level, out IntPtr d3dCtx);
+            D3D11_SDK_VERSION, out ID3D11Device d3d, out int level, out _);
         Log.Hr($"D3D11CreateDevice(硬件, FL=0x{level:X})", hr);
         if (hr < 0)
         {
@@ -145,16 +205,17 @@ internal sealed class DCompInkLayer : InkLayerBase
             return false;
         }
         _d3dDevice = d3d;
-        _d3dContext = d3dCtx;
 
-        var dxgi = (IDXGIDevice)d3d;
+        if (!CreateD2DDevice(d3d, out IntPtr d2dDevice))
+            return false;
 
         Guid iidDevice = IID_IDCompositionDevice;
-        hr = DCompositionCreateDevice(dxgi, ref iidDevice, out object deviceObj);
-        Log.Hr("DCompositionCreateDevice", hr);
+        hr = DCompositionCreateDevice2(d2dDevice, ref iidDevice, out object deviceObj);
+        Log.Hr("DCompositionCreateDevice2(ID2D1Device)", hr);
+        Vtbl.Release(d2dDevice);          // DComp 设备自己会持有渲染设备，这里放掉我们这份引用
         if (hr < 0)
         {
-            _error = $"DCompositionCreateDevice 失败 (0x{hr:X8})";
+            _error = $"DCompositionCreateDevice2 失败 (0x{hr:X8})";
             return false;
         }
         _device = (IDCompositionDevice)deviceObj;
@@ -183,7 +244,7 @@ internal sealed class DCompInkLayer : InkLayerBase
         hr = setRoot(_target, _visual);
         Log.Hr("Target::SetRoot(visual)", hr);
 
-        // IDCompositionVisual::SetContent（槽位 11）
+        // IDCompositionVisual::SetContent（槽位 15）
         var setContent = Vtbl.Slot<Vtbl.D1>(_visual, Gfx.SlotVisualSetContent);
         hr = setContent(_visual, _surface);
         Log.Hr("Visual::SetContent(surface)", hr);
@@ -211,9 +272,71 @@ internal sealed class DCompInkLayer : InkLayerBase
     }
 
     /// <summary>
-    /// 用 1×1 的小更新区依次探 BeginDraw 的候选 IID，命中即定下本后端的绘制通路。
-    /// 首选 IID_IDXGISurface：换出可写 DXGI 表面 → QI 出 ID3D11Texture2D → 之后用 D3D11 上传像素。
-    /// 只有它拿不到时才退到 D2D 印章式绘制。两条都失败就返回 false，让上层回退 WPF 层。
+    /// D3D11 设备 → IDXGIDevice → ID2D1Factory1::CreateDevice → ID2D1Device。
+    /// DComp 设备必须由这个 ID2D1Device 创建，BeginDraw 才愿意给 ID2D1DeviceContext。
+    /// </summary>
+    private bool CreateD2DDevice(ID3D11Device d3d, out IntPtr d2dDevice)
+    {
+        d2dDevice = IntPtr.Zero;
+
+        Guid iidFactory = IID_ID2D1Factory1;
+        int hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, ref iidFactory, IntPtr.Zero, out IntPtr factory);
+        Log.Hr($"D2D1CreateFactory(ID2D1Factory1) ptr=0x{factory.ToInt64():X}", hr);
+        if (hr < 0 || factory == IntPtr.Zero)
+        {
+            _error = $"D2D1CreateFactory 失败 (0x{hr:X8})";
+            return false;
+        }
+
+        IntPtr dxgiDevice = IntPtr.Zero;
+        try
+        {
+            dxgiDevice = QueryDxgiDevice(d3d);
+            if (dxgiDevice == IntPtr.Zero)
+            {
+                _error = "ID3D11Device 拿不到 IDXGIDevice";
+                return false;
+            }
+
+            var createDevice = Vtbl.Slot<Vtbl.FactoryCreateDevice>(factory, Gfx.Factory.CreateDevice);
+            hr = createDevice(factory, dxgiDevice, out IntPtr created);
+            Log.Hr($"ID2D1Factory1::CreateDevice ptr=0x{created.ToInt64():X}", hr);
+            if (hr < 0 || created == IntPtr.Zero)
+            {
+                _error = $"ID2D1Factory1::CreateDevice 失败 (0x{hr:X8})";
+                return false;
+            }
+            d2dDevice = created;
+            return true;
+        }
+        finally
+        {
+            Vtbl.Release(dxgiDevice);
+            Vtbl.Release(factory);
+        }
+    }
+
+    /// <summary>ID3D11Device 裸指针 QI 出 IDXGIDevice（调用方负责 Release）。</summary>
+    private static IntPtr QueryDxgiDevice(ID3D11Device d3d)
+    {
+        IntPtr unknown = Marshal.GetIUnknownForObject(d3d);
+        try
+        {
+            Guid iid = IID_IDXGIDevice;
+            var queryInterface = Vtbl.Slot<Vtbl.QueryInterface>(unknown, 0);
+            int hr = queryInterface(unknown, ref iid, out IntPtr dxgiDevice);
+            Log.Hr("ID3D11Device → IDXGIDevice", hr);
+            return hr < 0 ? IntPtr.Zero : dxgiDevice;
+        }
+        finally
+        {
+            Marshal.Release(unknown);
+        }
+    }
+
+    /// <summary>
+    /// 依次用候选 IID 试一次 BeginDraw，命中即定下绘制目标类型。
+    /// 两条都失败就返回 false，让上层回退 WPF 层（说明这台机器拿不到 GPU 绘制上下文）。
     /// </summary>
     private bool ProbeBeginDraw()
     {
@@ -223,39 +346,24 @@ internal sealed class DCompInkLayer : InkLayerBase
             Marshal.StructureToPtr(new RECT(0, 0, _width, _height), rectMem, false);
             var beginDraw = Vtbl.Slot<Vtbl.DWithGuidRef>(_surface, Gfx.SlotSurfaceBeginDraw);
 
-            foreach ((Guid iid, bool isD3D) in Gfx.BeginDrawCandidates)
+            foreach (Guid candidate in Gfx.BeginDrawCandidates)
             {
-                Guid candidate = iid;
-                int hr = beginDraw(_surface, rectMem, ref candidate, out IntPtr obj, out _);
-                Log.Write($"探针 BeginDraw(整面, IID={iid}) hr=0x{hr:X8}");
+                Guid iid = candidate;
+                int hr = beginDraw(_surface, rectMem, ref iid, out IntPtr obj, out _);
+                Log.Write($"探针 BeginDraw(整面, IID={candidate}) hr=0x{hr:X8}");
                 if (hr < 0 || obj == IntPtr.Zero)
                     continue;
 
-                if (isD3D)
-                {
-                    // 走 D3D 上传的前提是能 QI 出纹理，拿不到就换下一个候选。
-                    bool ok = TryQiTexture(obj, out IntPtr tex);
-                    if (ok)
-                        Marshal.Release(tex);
-                    Marshal.Release(obj);
-                    if (!ok)
-                        continue;
-                }
-                else
-                {
-                    Marshal.Release(obj);
-                }
-
-                _beginIid = iid;
-                _useD3D = isD3D;
+                Marshal.Release(obj);
+                _beginIid = candidate;
                 var endDraw = Vtbl.Slot<Vtbl.D0>(_surface, Gfx.SlotSurfaceEndDraw);
                 Log.Hr("探针 EndDraw", endDraw(_surface));
                 _device!.Commit();
-                Log.Write($"BeginDraw 通路 = {(_useD3D ? "IDXGISurface + D3D11 上传" : "D2D 印章")}");
+                Log.Write("BeginDraw 通路 = D2D（GPU 光栅化）");
                 return true;
             }
 
-            _error = "IDCompositionSurface::BeginDraw 拿不到绘图上下文";
+            _error = "IDCompositionSurface::BeginDraw 拿不到 D2D 绘制目标";
             Log.Write("探针失败：" + _error);
             return false;
         }
@@ -263,21 +371,6 @@ internal sealed class DCompInkLayer : InkLayerBase
         {
             Marshal.FreeHGlobal(rectMem);
         }
-    }
-
-    /// <summary>把 BeginDraw 换出的 IDXGISurface 转成 ID3D11Texture2D（QQI 走 vtable 槽位 0，避开 IID 属性问题）。</summary>
-    private static bool TryQiTexture(IntPtr dxgiSurface, out IntPtr texture)
-    {
-        Guid iid = IID_ID3D11Texture2D;
-        var queryInterface = Vtbl.Slot<Vtbl.QueryInterface>(dxgiSurface, 0);
-        int hr = queryInterface(dxgiSurface, ref iid, out texture);
-        Log.Hr("IDXGISurface → ID3D11Texture2D", hr);
-        if (hr < 0 || texture == IntPtr.Zero)
-        {
-            texture = IntPtr.Zero;
-            return false;
-        }
-        return true;
     }
 
     private bool CreateSurface()
@@ -303,6 +396,7 @@ internal sealed class DCompInkLayer : InkLayerBase
         {
             case CmdBegin b:
             {
+                ClearPrediction();
                 var stroke = new InkStroke { Id = b.Id, Points = new List<InkSample> { b.S } };
                 stroke.Bounds = b.S.BoundsAt();
                 _strokes.Add(stroke);
@@ -317,14 +411,21 @@ internal sealed class DCompInkLayer : InkLayerBase
                     break;
                 stroke.Points.Add(e.S);
                 stroke.Bounds = RectI.Union(stroke.Bounds, e.S.BoundsAt());
-                MarkDirty(RectI.Union(stroke.Points[^2].BoundsAt(), e.S.BoundsAt()));
+                // 平滑与收锋都会改动"笔尖附近"那几段的形状，所以尾部若干采样一起标脏，
+                // 否则已经画出去的旧笔尖会留成一条细线（新形状没盖住它）。
+                MarkDirty(TailBounds(stroke));
+                UpdatePrediction(stroke);
                 break;
             }
             case CmdEnd end:
+            {
+                ClearPrediction();
                 _active.Remove(end.Id);
                 break;
+            }
             case CmdErase er:
             {
+                ClearPrediction();
                 var removed = new List<InkStroke>();
                 for (int i = _strokes.Count - 1; i >= 0; i--)
                 {
@@ -344,6 +445,7 @@ internal sealed class DCompInkLayer : InkLayerBase
             }
             case CmdUndo:
             {
+                ClearPrediction();
                 if (_undo.Count == 0)
                     break;
                 UndoEntry entry = _undo.Pop();
@@ -361,6 +463,7 @@ internal sealed class DCompInkLayer : InkLayerBase
             }
             case CmdClear:
             {
+                ClearPrediction();
                 if (_strokes.Count == 0)
                     break;
                 var all = new List<InkStroke>(_strokes);
@@ -394,6 +497,94 @@ internal sealed class DCompInkLayer : InkLayerBase
     {
         if (!r.IsEmpty)
             _dirty = RectI.Union(_dirty, r);
+    }
+
+    /// <summary>笔尖附近若干采样的包围盒（平滑 + 收锋会重画这一段）。</summary>
+    private static RectI TailBounds(InkStroke st)
+    {
+        List<InkSample> pts = st.Points;
+        int from = Math.Max(0, pts.Count - TipDirtySamples);
+        RectI r = RectI.Empty;
+        for (int i = from; i < pts.Count; i++)
+            r = RectI.Union(r, pts[i].BoundsAt());
+        return r;
+    }
+
+    // ================= 墨迹预测（湿墨尾巴） =================
+
+    /// <summary>
+    /// 用最近两个采样的速度外推一小段"预测笔尖"，只画在湿墨的最前面（抄 EasiNote 的书写预测：
+    /// 预测点只进尾巴、落笔即被真实采样替换）。提前 <see cref="PredictLeadMs"/> 毫秒，
+    /// 抵消的是"采样 → 解析 → 排队 → BeginDraw/Commit → DWM 合成"这一段固定延迟。
+    /// <para>预测段每一帧都会重画，所以旧的那一段必须一起标脏，否则手指停住会留下"甩出去"的残影。</para>
+    /// </summary>
+    private void UpdatePrediction(InkStroke st)
+    {
+        MarkDirty(_predictBounds);        // 旧的预测段一并擦掉
+        _predictBounds = RectI.Empty;
+        _predictActive = false;
+
+        List<InkSample> pts = st.Points;
+        if (pts.Count < 3)
+            return;
+
+        InkSample b = pts[^2], c = pts[^1];
+        InkSample a = pts[^3];
+        if (c.Ticks == 0 || a.Ticks == 0)
+            return;                        // 没有时间戳（自检/合成样本）→ 不预测
+
+        double dtMs = (c.Ticks - a.Ticks) * 1000.0 / Stopwatch.Frequency;
+        if (dtMs <= 0.5 || dtMs > 120)
+            return;                        // 时间戳异常 / 中间断过（隔了很久）→ 不预测
+
+        float vx = (float)((c.X - a.X) / dtMs), vy = (float)((c.Y - a.Y) / dtMs);   // px/ms
+        float speed = MathF.Sqrt(vx * vx + vy * vy);
+        if (speed < 0.05f)
+            return;                        // 基本没动：预测只会放大抖动
+
+        float leadX = vx * PredictLeadMs, leadY = vy * PredictLeadMs;
+
+        // 长度封顶：不超过最近一段的两倍，避免急转/抖动时把墨甩出去
+        float lastLen = MathF.Sqrt((c.X - b.X) * (c.X - b.X) + (c.Y - b.Y) * (c.Y - b.Y));
+        float leadLen = MathF.Sqrt(leadX * leadX + leadY * leadY);
+        float maxLen = MathF.Max(lastLen * 2f, 2f);
+        if (leadLen > maxLen)
+        {
+            leadX *= maxLen / leadLen;
+            leadY *= maxLen / leadLen;
+        }
+
+        _predictX0 = c.X;
+        _predictY0 = c.Y;
+        _predictX1 = c.X + leadX;
+        _predictY1 = c.Y + leadY;
+        _predictW0 = WidthAt(pts, pts.Count - 1);        // 接上收锋之后的笔尖宽度，视觉上连成一条
+        _predictW1 = _predictW0 * 0.66f;
+        _predictColor = c;
+        _predictActive = true;
+
+        _predictBounds = SegmentBounds(_predictX0, _predictY0, _predictX1, _predictY1,
+            MathF.Max(_predictW0, _predictW1));
+        MarkDirty(_predictBounds);
+    }
+
+    private void ClearPrediction()
+    {
+        if (!_predictActive && _predictBounds.IsEmpty)
+            return;
+        MarkDirty(_predictBounds);
+        _predictActive = false;
+        _predictBounds = RectI.Empty;
+    }
+
+    private static RectI SegmentBounds(float ax, float ay, float bx, float by, float width)
+    {
+        float pad = width * 0.5f + 2f;
+        return new RectI(
+            (int)MathF.Floor(MathF.Min(ax, bx) - pad),
+            (int)MathF.Floor(MathF.Min(ay, by) - pad),
+            (int)MathF.Ceiling(MathF.Max(ax, bx) + pad),
+            (int)MathF.Ceiling(MathF.Max(ay, by) + pad));
     }
 
     private static float DistanceToPolyline(InkStroke st, float x, float y)
@@ -442,8 +633,8 @@ internal sealed class DCompInkLayer : InkLayerBase
 
             var beginDraw = Vtbl.Slot<Vtbl.DWithGuidRef>(_surface, Gfx.SlotSurfaceBeginDraw);
             Guid iid = _beginIid;
-            int hr = beginDraw(_surface, rectMem, ref iid, out IntPtr updateObject, out POINT offset);
-            if (hr < 0 || updateObject == IntPtr.Zero)
+            int hr = beginDraw(_surface, rectMem, ref iid, out IntPtr renderTarget, out POINT offset);
+            if (hr < 0 || renderTarget == IntPtr.Zero)
             {
                 // 没画成就把原区域重新标脏 —— 否则这一帧的墨就永久丢了。
                 _dirty = RectI.Union(_dirty, dirty);
@@ -455,15 +646,12 @@ internal sealed class DCompInkLayer : InkLayerBase
             {
                 _loggedFirstFrame = true;
                 Log.Write($"[首帧] 脏区=({dirty.L},{dirty.T},{dirty.R},{dirty.B}) 更新区=({update.L},{update.T},{update.R},{update.B}) "
-                        + $"updateOffset=({offset.X},{offset.Y}) 笔画={_strokes.Count} 通路={(_useD3D ? "D3D11 上传" : "D2D 印章")}");
+                        + $"updateOffset=({offset.X},{offset.Y}) 笔画={_strokes.Count} 通路=D2D");
             }
 
             try
             {
-                if (_useD3D)
-                    UploadD3D(updateObject, update, offset);
-                else
-                    StampAll(updateObject, update, offset);
+                Draw(renderTarget, update, offset);
             }
             catch (Exception ex)
             {
@@ -471,7 +659,7 @@ internal sealed class DCompInkLayer : InkLayerBase
             }
             finally
             {
-                Marshal.Release(updateObject);   // 更新对象必须在 EndDraw 之前释放
+                Marshal.Release(renderTarget);   // 更新对象必须在 EndDraw 之前释放
             }
 
             var endDraw = Vtbl.Slot<Vtbl.D0>(_surface, Gfx.SlotSurfaceEndDraw);
@@ -512,227 +700,242 @@ internal sealed class DCompInkLayer : InkLayerBase
         return new RectI(l, t, right, b);
     }
 
-    // ================= 通路一：D3D11 上传（低延迟，首选） =================
+    // ================= 绘制（全部交给 GPU） =================
 
     /// <summary>
-    /// 在 CPU 上把更新区光栅成 BGRA 预乘位图，再用 UpdateSubresource 拷进 BeginDraw 换出的纹理。
+    /// 在 BeginDraw 换出的临时渲染目标上重画更新区。
     ///
-    /// <para><b>关键</b>：BeginDraw 返回的纹理是<b>整面</b>大小（实测 1696×1056，比 1680×1050 略大），
-    /// 而 EndDraw 时 DComp 只把<b>更新区那一块</b>回拷到表面。所以 box 必须是该更新区在<b>纹理=表面</b>
-    /// 坐标系下的矩形，绝不能减去 updateOffset —— 否则像素会写到纹理左上角，而那块永远不在回拷范围内，
-    /// 结果就是"局部更新一帧都看不见"。</para>
+    /// <para>两条关键语义（官方文档）：① 这块临时表面<b>不含上一次的内容</b>，必须自己清干净，
+    /// 否则会残留上一帧的像素；② 更新区在表面里的位置由 <paramref name="offset"/> 给出，
+    /// 它不一定等于更新区左上角，所以坐标要按 offset 平移过去。EndDraw 只把更新区回拷到表面，
+    /// 清到区外不会伤到已有墨迹。</para>
     /// </summary>
-    private void UploadD3D(IntPtr dxgiSurface, RectI region, POINT offset)
+    private void Draw(IntPtr renderTarget, RectI update, POINT offset)
     {
-        if (!TryQiTexture(dxgiSurface, out IntPtr texture))
-            return;
+        var clear = Vtbl.Slot<Vtbl.Clear>(renderTarget, Gfx.Rt.Clear);
+        var transparent = new D2D1_COLOR_F(0f, 0f, 0f, 0f);
+        clear(renderTarget, ref transparent);
 
+        // 1 单位 = 1 屏幕像素，避免设备上下文自带的 DPI 把墨迹缩放画歪
+        var setDpi = Vtbl.Slot<Vtbl.SetDpi>(renderTarget, Gfx.Rt.SetDpi);
+        setDpi(renderTarget, 96f, 96f);
+
+        var setTransform = Vtbl.Slot<Vtbl.SetTransform>(renderTarget, Gfx.Rt.SetTransform);
+        var matrix = new D2D1_MATRIX_3X2_F
+        {
+            M11 = 1f,
+            M22 = 1f,
+            DX = offset.X - _originX - update.L,
+            DY = offset.Y - _originY - update.T,
+        };
+        setTransform(renderTarget, ref matrix);
+
+        // 绘制命令本身没有裁剪，这里显式裁到更新区，省掉区外那部分无用的光栅化
+        var clip = new D2D1_RECT_F
+        {
+            Left = update.L,
+            Top = update.T,
+            Right = update.R,
+            Bottom = update.B,
+        };
+        var pushClip = Vtbl.Slot<Vtbl.PushClip>(renderTarget, Gfx.Rt.PushAxisAlignedClip);
+        pushClip(renderTarget, ref clip, D2D1_ANTIALIAS_MODE_ALIASED);
+
+        var brushes = new Dictionary<uint, IntPtr>();
         try
         {
-            int dw = region.R - region.L;
-            int dh = region.B - region.T;
-            int pixels = dw * dh;
-            if (_scratch.Length < pixels)
+            foreach (InkStroke st in _strokes)
             {
-                if (_scratchPin.IsAllocated)
-                    _scratchPin.Free();
-                _scratch = new uint[pixels];
-                _scratchPin = GCHandle.Alloc(_scratch, GCHandleType.Pinned);
+                if (st.Bounds.Intersects(update))
+                    DrawStroke(renderTarget, st, update, brushes);
             }
-            _scratchW = dw;
-            _scratchH = dh;
-            // BeginDraw 已经把更新区清成透明，本地缓冲也从全透明开始，再叠加笔画。
-            Array.Clear(_scratch, 0, pixels);
 
-            RasterizeStrokes(region);
-
-            var box = new D3D11_BOX
+            // 预测笔尖画在所有真实笔迹之后（它就是最前面那一小段）
+            if (_predictActive)
             {
-                Left = (uint)region.L,
-                Top = (uint)region.T,
-                Front = 0,
-                Right = (uint)region.R,
-                Bottom = (uint)region.B,
-                Back = 1,
-            };
-            if (_frames == 0)
-                Log.Write($"[上传] UpdateSubresource box=({box.Left},{box.Top},{box.Right},{box.Bottom}) 缓冲={dw}x{dh} "
-                        + $"updateOffset=({offset.X},{offset.Y})");
-
-            IntPtr boxMem = Marshal.AllocHGlobal(Marshal.SizeOf<D3D11_BOX>());
-            try
-            {
-                Marshal.StructureToPtr(box, boxMem, false);
-                var update = Vtbl.Slot<Vtbl.UpdateSubresource>(_d3dContext, Gfx.Ctx.UpdateSubresource);
-                update(_d3dContext, texture, 0, boxMem, _scratchPin.AddrOfPinnedObject(), (uint)(dw * 4), 0);
-
-                // UpdateSubresource 只是把上传命令排进 D3D11 命令队列；不主动 Flush，这批像素要等
-                // 队列下次刷新才真正落到纹理上 —— 表现就是"刚画的墨看不见，等下一下才蹦出来"。
-                var flush = Vtbl.Slot<Vtbl.V0>(_d3dContext, Gfx.Ctx.Flush);
-                flush(_d3dContext);
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(boxMem);
+                IntPtr predictBrush = GetBrush(renderTarget, _predictColor, brushes);
+                if (predictBrush != IntPtr.Zero)
+                {
+                    var fill = Vtbl.Slot<Vtbl.FillEllipse>(renderTarget, Gfx.SlotRtFillEllipse);
+                    StampLine(fill, renderTarget, predictBrush,
+                        _predictX0, _predictY0, _predictX1, _predictY1,
+                        _predictW0, _predictW1, update);
+                }
             }
         }
         finally
         {
-            Marshal.Release(texture);
+            foreach (IntPtr brush in brushes.Values)
+                Marshal.Release(brush);
         }
-    }
 
-    /// <summary>把与该更新区相交的笔画盖进 _scratch（预乘 BGRA，行距 = 宽 × 4）。</summary>
-    private void RasterizeStrokes(RectI region)
-    {
-        foreach (InkStroke st in _strokes)
-        {
-            if (!st.Bounds.Intersects(region))
-                continue;
-
-            List<InkSample> pts = st.Points;
-            if (pts.Count == 1)
-            {
-                StampBuffer(pts[0], pts[0], 0f, region);
-                continue;
-            }
-
-            for (int i = 0; i + 1 < pts.Count; i++)
-            {
-                InkSample a = pts[i], b = pts[i + 1];
-                float dist = MathF.Sqrt((b.X - a.X) * (b.X - a.X) + (b.Y - a.Y) * (b.Y - a.Y));
-                float minR = MathF.Max(0.6f, MathF.Min(a.Width, b.Width) * 0.5f);
-                int steps = Math.Clamp((int)MathF.Ceiling(dist / (minR * 0.6f)), 1, 96);
-                for (int k = 0; k <= steps; k++)
-                    StampBuffer(a, b, (float)k / steps, region);
-            }
-        }
-    }
-
-    /// <summary>在 (a,b) 之间按 t 插值盖一个抗锯齿圆，做预乘 alpha 的 source-over 混合。</summary>
-    private void StampBuffer(InkSample a, InkSample b, float t, RectI region)
-    {
-        float sx = a.X + (b.X - a.X) * t;      // 屏幕物理像素
-        float sy = a.Y + (b.Y - a.Y) * t;
-        float radius = (a.Width + (b.Width - a.Width) * t) * 0.5f;
-        if (radius < 0.35f)
-            return;
-
-        // 屏幕 → 缓冲：先减窗口原点，再减更新区左上角。
-        float cx = sx - _originX - region.L;
-        float cy = sy - _originY - region.T;
-        float edge = radius + 0.5f;            // 半径外再留半个像素做抗锯齿羽化
-
-        int x0 = Math.Max(0, (int)MathF.Floor(cx - edge));
-        int x1 = Math.Min(_scratchW - 1, (int)MathF.Ceiling(cx + edge));
-        int y0 = Math.Max(0, (int)MathF.Floor(cy - edge));
-        int y1 = Math.Min(_scratchH - 1, (int)MathF.Ceiling(cy + edge));
-        if (x0 > x1 || y0 > y1)
-            return;
-
-        const float Inv255 = 1f / 255f;
-        float alpha = a.A * Inv255;
-        float pr = a.R * alpha, pg = a.G * alpha, pb = a.B * alpha;
-
-        uint[] buf = _scratch;
-        int w = _scratchW;
-        for (int y = y0; y <= y1; y++)
-        {
-            float dy = y + 0.5f - cy;
-            int row = y * w;
-            for (int x = x0; x <= x1; x++)
-            {
-                float dx = x + 0.5f - cx;
-                float coverage = edge - MathF.Sqrt(dx * dx + dy * dy);
-                if (coverage <= 0f)
-                    continue;
-                if (coverage > 1f)
-                    coverage = 1f;
-
-                float srcA = alpha * coverage;
-                float keep = 1f - srcA;
-                uint dst = buf[row + x];
-                float dr = (dst >> 16) & 0xFF, dg = (dst >> 8) & 0xFF, db = dst & 0xFF, da = (dst >> 24) & 0xFF;
-
-                float nr = pr * coverage + dr * keep;
-                float ng = pg * coverage + dg * keep;
-                float nb = pb * coverage + db * keep;
-                float na = srcA * 255f + da * keep;
-
-                buf[row + x] = (ToByte(na) << 24) | (ToByte(nr) << 16) | (ToByte(ng) << 8) | ToByte(nb);
-            }
-        }
-    }
-
-    private static uint ToByte(float v) => (uint)Math.Clamp((int)(v + 0.5f), 0, 255);
-
-    // ================= 通路二：D2D 印章（备选） =================
-
-    private void StampAll(IntPtr renderTarget, RectI region, POINT offset)
-    {
-        // 屏幕像素 → 表面绘制坐标：先减窗口原点，再减本次更新区在表面内的偏移。
-        float dx = -(_originX + offset.X);
-        float dy = -(_originY + offset.Y);
-        foreach (InkStroke st in _strokes)
-        {
-            if (st.Bounds.Intersects(region))
-                StampStroke(renderTarget, st, dx, dy);
-        }
+        var popClip = Vtbl.Slot<Vtbl.V0>(renderTarget, Gfx.Rt.PopAxisAlignedClip);
+        popClip(renderTarget);
     }
 
     /// <summary>
-    /// 印章式笔刷：在相邻采样之间按半径插值盖圆。不用 ID2D1PathGeometry，
-    /// 少一大片 vtable 依赖；圆自带抗锯齿，观感够用。
+    /// 印章式笔刷：沿"中点为端、原始采样为控制点"的二次贝塞尔盖圆，圆自带抗锯齿。
+    ///
+    /// <para><b>平滑</b>（抄 EasiNote 的 BezierInterpolation / Inkeys 的 DrawCurve 思路）：
+    /// 折线直接盖章会有明显折角；把每一对相邻采样取中点当曲线端点、原采样当控制点，
+    /// 得到的曲线在采样点处切线连续，视觉上就是顺的。代价是形状永远滞后一个采样 ——
+    /// 所以<b>最后一段不插值</b>，直接从上一个中点画到最新的原始采样，笔尖零延迟跟手。</para>
+    ///
+    /// <para><b>笔锋</b>：最后 <see cref="TaperScale"/>.Length 个采样的笔宽按递减系数收窄（收锋），
+    /// 于是湿墨的尖端始终是细的、笔画结束时自然带一个尖尾巴 —— 压感为常数的手指书写也有笔锋。</para>
+    ///
+    /// <para><b>只画落在更新区里的那几段</b>：一条长笔画可能上千个点，整条重画等于每帧按点数线性烧 CPU
+    /// （实测 400 点的笔画让单帧呈现从 2ms 涨到 4ms）。按段的包围盒先筛一遍，长笔画就退化成常数级。</para>
     /// </summary>
-    private static void StampStroke(IntPtr renderTarget, InkStroke st, float dx, float dy)
+    private static void DrawStroke(IntPtr renderTarget, InkStroke st, RectI region, Dictionary<uint, IntPtr> brushes)
     {
         List<InkSample> pts = st.Points;
-        InkSample first = pts[0];
-        var color = new D2D1_COLOR_F(first.R / 255f, first.G / 255f, first.B / 255f, first.A / 255f);
+        int n = pts.Count;
+        IntPtr brush = GetBrush(renderTarget, pts[0], brushes);
+        if (brush == IntPtr.Zero)
+            return;
 
+        var fillEllipse = Vtbl.Slot<Vtbl.FillEllipse>(renderTarget, Gfx.SlotRtFillEllipse);
+
+        if (n == 1)
+        {
+            StampDot(fillEllipse, renderTarget, brush, pts[0].X, pts[0].Y, pts[0].Width);
+            return;
+        }
+
+        // 头段：首采样 → 首中点
+        StampLine(fillEllipse, renderTarget, brush,
+            pts[0].X, pts[0].Y,
+            Mid(pts[0].X, pts[1].X), Mid(pts[0].Y, pts[1].Y),
+            WidthAt(pts, 0), WidthAt(pts, 1), region);
+
+        // 中段：中点(i-1) → 中点(i)，控制点 = 原始采样 i
+        for (int i = 1; i <= n - 2; i++)
+        {
+            StampQuad(fillEllipse, renderTarget, brush,
+                Mid(pts[i - 1].X, pts[i].X), Mid(pts[i - 1].Y, pts[i].Y),
+                pts[i].X, pts[i].Y,
+                Mid(pts[i].X, pts[i + 1].X), Mid(pts[i].Y, pts[i + 1].Y),
+                WidthAt(pts, i), WidthAt(pts, i + 1), region);
+        }
+
+        // 尾段：末-1 中点 → 最新的原始采样（不平滑，笔尖直达）
+        // 宽度必须用 WidthAt(last) 的两端：上一个中段的二次贝塞尔已经在"末-1 中点"处收到 WidthAt(last)，
+        // 这里若从 WidthAt(last-1) 起笔，就会在收窄之后又跳回更粗的一档，再收到笔尖 ——
+        // 表现就是"抬起位置那一小段/那一点又变粗一点点"。
+        int last = n - 1;
+        float tipWidth = WidthAt(pts, last);
+        StampLine(fillEllipse, renderTarget, brush,
+            Mid(pts[last - 1].X, pts[last].X), Mid(pts[last - 1].Y, pts[last].Y),
+            pts[last].X, pts[last].Y,
+            tipWidth, tipWidth, region);
+    }
+
+    private static float Mid(float a, float b) => (a + b) * 0.5f;
+
+    /// <summary>第 i 个采样实际使用的笔宽。</summary>
+    private static float WidthAt(List<InkSample> pts, int i)
+    {
+        int fromEnd = pts.Count - 1 - i;
+        // 太短的笔画（点、勾）不收锋：整条都乘系数会把它画得很细
+        if (fromEnd >= TaperScale.Length || pts.Count < TaperScale.Length + 4)
+            return pts[i].Width;
+
+        // 收锋区统一用"本体笔宽"作基准，而不是各自的原始宽度：
+        // 抬手瞬间压感/接触面积常常会跳一下，原始宽度 × 系数会让末端反而鼓起来一小截
+        // （表现就是"抬起位置那一小段又变粗一点点"）。用同一个基准后收锋区一定单调变细。
+        return BodyWidth(pts) * TaperScale[fromEnd];
+    }
+
+    /// <summary>笔宽基准：取收锋区外最近的那个采样（短笔画则退回首采样）。</summary>
+    private static float BodyWidth(List<InkSample> pts)
+    {
+        int idx = Math.Max(0, pts.Count - 1 - TaperScale.Length);
+        return pts[idx].Width;
+    }
+
+    private static void StampLine(Vtbl.FillEllipse fill, IntPtr rt, IntPtr brush,
+        float ax, float ay, float bx, float by, float wa, float wb, RectI region)
+    {
+        if (!BoxTouches(ax, ay, bx, by, MathF.Max(wa, wb), region))
+            return;
+
+        float dist = MathF.Sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
+        float minR = MathF.Max(0.6f, MathF.Min(wa, wb) * 0.5f);
+        int steps = Math.Clamp((int)MathF.Ceiling(dist / StepLength(minR)), 1, 256);
+        for (int k = 0; k <= steps; k++)
+        {
+            float u = (float)k / steps;
+            StampDot(fill, rt, brush, ax + (bx - ax) * u, ay + (by - ay) * u, wa + (wb - wa) * u);
+        }
+    }
+
+    /// <summary>二次贝塞尔盖圆：A = 起点、C = 控制点、B = 终点（二次曲线一定落在 A-C-B 三角形内）。</summary>
+    private static void StampQuad(Vtbl.FillEllipse fill, IntPtr rt, IntPtr brush,
+        float ax, float ay, float cx, float cy, float bx, float by, float wa, float wb, RectI region)
+    {
+        float pad = MathF.Max(wa, wb) * 0.5f + 1f;
+        float l = MathF.Min(MathF.Min(ax, bx), cx) - pad;
+        float r = MathF.Max(MathF.Max(ax, bx), cx) + pad;
+        float t = MathF.Min(MathF.Min(ay, by), cy) - pad;
+        float bo = MathF.Max(MathF.Max(ay, by), cy) + pad;
+        if (!(l < region.R && region.L < r && t < region.B && region.T < bo))
+            return;
+
+        float approx = 0.5f * (MathF.Sqrt((cx - ax) * (cx - ax) + (cy - ay) * (cy - ay))
+                             + MathF.Sqrt((bx - cx) * (bx - cx) + (by - cy) * (by - cy)));
+        float minR = MathF.Max(0.6f, MathF.Min(wa, wb) * 0.5f);
+        int steps = Math.Clamp((int)MathF.Ceiling(approx / StepLength(minR)), 2, 256);
+        for (int k = 0; k <= steps; k++)
+        {
+            float u = (float)k / steps, iu = 1f - u;
+            float x = iu * iu * ax + 2f * iu * u * cx + u * u * bx;
+            float y = iu * iu * ay + 2f * iu * u * cy + u * u * by;
+            StampDot(fill, rt, brush, x, y, wa + (wb - wa) * u);
+        }
+    }
+
+    /// <summary>线段（含两端笔宽）的包围盒是否与更新区相交。坐标是屏幕物理像素。</summary>
+    private static bool BoxTouches(float ax, float ay, float bx, float by, float width, RectI region)
+    {
+        float pad = width * 0.5f + 1f;
+        float l = MathF.Min(ax, bx) - pad, r = MathF.Max(ax, bx) + pad;
+        float t = MathF.Min(ay, by) - pad, bo = MathF.Max(ay, by) + pad;
+        return l < region.R && region.L < r && t < region.B && region.T < bo;
+    }
+
+    private static IntPtr GetBrush(IntPtr renderTarget, InkSample s, Dictionary<uint, IntPtr> brushes)
+    {
+        uint key = ((uint)s.A << 24) | ((uint)s.R << 16) | ((uint)s.G << 8) | s.B;
+        if (brushes.TryGetValue(key, out IntPtr cached))
+            return cached;
+
+        var color = new D2D1_COLOR_F(s.R / 255f, s.G / 255f, s.B / 255f, s.A / 255f);
         var createBrush = Vtbl.Slot<Vtbl.CreateBrush>(renderTarget, Gfx.SlotRtCreateSolidColorBrush);
         int hr = createBrush(renderTarget, ref color, IntPtr.Zero, out IntPtr brush);
         if (hr < 0 || brush == IntPtr.Zero)
         {
             Log.Hr("CreateSolidColorBrush", hr);
-            return;
+            brushes[key] = IntPtr.Zero;
+            return IntPtr.Zero;
         }
-
-        try
-        {
-            var fillEllipse = Vtbl.Slot<Vtbl.FillEllipse>(renderTarget, Gfx.SlotRtFillEllipse);
-
-            if (pts.Count == 1)
-            {
-                StampCircle(fillEllipse, renderTarget, brush, first, first, 0f, dx, dy);
-                return;
-            }
-
-            for (int i = 0; i + 1 < pts.Count; i++)
-            {
-                InkSample a = pts[i], b = pts[i + 1];
-                float dist = MathF.Sqrt((b.X - a.X) * (b.X - a.X) + (b.Y - a.Y) * (b.Y - a.Y));
-                float minR = MathF.Max(0.6f, MathF.Min(a.Width, b.Width) * 0.5f);
-                int steps = Math.Clamp((int)MathF.Ceiling(dist / (minR * 0.6f)), 1, 96);
-                for (int k = 0; k <= steps; k++)
-                    StampCircle(fillEllipse, renderTarget, brush, a, b, (float)k / steps, dx, dy);
-            }
-        }
-        finally
-        {
-            Marshal.Release(brush);
-        }
+        brushes[key] = brush;
+        return brush;
     }
 
-    private static void StampCircle(Vtbl.FillEllipse fillEllipse, IntPtr rt, IntPtr brush,
-        InkSample a, InkSample b, float t, float dx, float dy)
+    /// <summary>
+    /// 相邻两个印章圆的最大圆心距。必须**始终小于圆直径**，否则细笔画会画成一串点：
+    /// 收锋后的笔尖、或压感很轻（笔宽 2px 左右）时，半径只有 1px 上下，
+    /// 一旦步距有 1.2px 的地板，圆与圆就不再重叠 —— 表现就是"最后几点断开"、"整条一点一点"。
+    /// </summary>
+    private static float StepLength(float radius) => MathF.Max(0.25f, radius * 0.32f);
+
+    private static void StampDot(Vtbl.FillEllipse fillEllipse, IntPtr rt, IntPtr brush, float x, float y, float width)
     {
-        float x = a.X + (b.X - a.X) * t + dx;
-        float y = a.Y + (b.Y - a.Y) * t + dy;
-        float r = (a.Width + (b.Width - a.Width) * t) * 0.5f;
-        if (r < 0.35f)
+        float r = width * 0.5f;
+        if (r < 0.2f)
             return;
-        var ellipse = new D2D1_ELLIPSE(x, y, r, r);
+        var ellipse = new D2D1_ELLIPSE(x, y, r, r);   // 屏幕物理像素；原点与 offset 已经由 transform 处理
         fillEllipse(rt, ref ellipse, brush);
     }
 
@@ -748,12 +951,7 @@ internal sealed class DCompInkLayer : InkLayerBase
         _target = IntPtr.Zero;
 
         if (_device is not null) { try { Marshal.ReleaseComObject(_device); } catch { } _device = null; }
-        if (_d3dContext != IntPtr.Zero) { Vtbl.Release(_d3dContext); _d3dContext = IntPtr.Zero; }
         if (_d3dDevice is not null) { try { Marshal.ReleaseComObject(_d3dDevice); } catch { } _d3dDevice = null; }
-
-        if (_scratchPin.IsAllocated)
-            _scratchPin.Free();
-        _scratch = Array.Empty<uint>();
     }
 
     public override void Dispose()

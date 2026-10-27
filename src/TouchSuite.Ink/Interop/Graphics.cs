@@ -39,33 +39,14 @@ internal static class Gfx
     [ComImport, Guid("db6f6ddb-ac77-4e88-8253-819df9bbf140"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     public interface ID3D11Device { }
 
-    /// <summary>同上，只作为 DCompositionCreateDevice 的入参（QI 已验证可用）。</summary>
+    /// <summary>同上，只作为 DCompositionCreateDevice / ID2D1Factory1::CreateDevice 的入参。</summary>
     [ComImport, Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     public interface IDXGIDevice { }
 
+    /// <summary>dxgi.h：IID_IDXGIDevice。裸指针 QI 时用。</summary>
+    public static readonly Guid IID_IDXGIDevice = new("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
+
     // ================= DXGI / D3D11 资源 IID（取自 dxgi.h / d3d11.h 原文）=================
-
-    /// <summary>dxgi.h：IID_IDXGISurface。BeginDraw 传它就能换出一块可写的 DXGI 表面。</summary>
-    public static readonly Guid IID_IDXGISurface = new("cafcb56c-6ac3-4889-bf47-9e23bbd260ec");
-
-    /// <summary>d3d11.h：IID_ID3D11Texture2D。上面那块 DXGI 表面 QI 出来的纹理，可直接喂 UpdateSubresource。</summary>
-    public static readonly Guid IID_ID3D11Texture2D = new("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct D3D11_BOX
-    {
-        public uint Left, Top, Front, Right, Bottom, Back;
-    }
-
-    /// <summary>
-    /// ID3D11DeviceContext 槽位表（按 d3d11.h 顺序数出来；基接口 ID3D11DeviceChild 占 3..6，
-    /// 所以自身方法从 7 起，该接口无重载，顺排即可）。目前只用到 UpdateSubresource 与 Flush。
-    /// </summary>
-    public static class Ctx
-    {
-        public const int UpdateSubresource = 48;   // 注意返回 void，不是 HRESULT
-        public const int Flush = 111;              // 也返回 void
-    }
 
     // ================= D2D1 结构 =================
 
@@ -81,6 +62,18 @@ internal static class Gfx
     {
         public float X, Y;
         public D2D1_POINT_2F(float x, float y) { X = x; Y = y; }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct D2D1_RECT_F
+    {
+        public float Left, Top, Right, Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct D2D1_MATRIX_3X2_F
+    {
+        public float M11, M12, M21, M22, DX, DY;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -107,8 +100,9 @@ internal static class Gfx
     public static readonly Guid IID_ID2D1Factory1 = new("bb12d362-daee-4b9a-aa1d-14ba401cfa1f");
 
     /// <summary>
-    /// ID2D1RenderTarget 的槽位表（按 d2d1.h 顺序数出来；自身方法从 4 开始）。
-    /// 只列到会用到的为止。⚠ 改这个表前先重新数头文件，重载各占一个槽位。
+    /// ID2D1RenderTarget 的槽位表（按 d2d1.h 逐行数出来；自身方法从 4 开始，基接口 ID2D1Resource 占 3）。
+    /// d2d1.h 是「带默认参数的单方法」而不是重载，所以一个方法就是一个槽位，序号一路顺排。
+    /// ⚠ 改这个表前先重新数头文件。
     /// </summary>
     public static class Rt
     {
@@ -133,27 +127,44 @@ internal static class Gfx
         public const int DrawGeometry = 22;
         public const int FillGeometry = 23;
         public const int SetTransform = 30;
+        public const int PushAxisAlignedClip = 45;
+        public const int PopAxisAlignedClip = 46;
         public const int Clear = 47;
         public const int BeginDraw = 48;
         public const int EndDraw = 49;
+        public const int SetDpi = 51;
+    }
+
+    /// <summary>
+    /// ID2D1Factory 占 3..16（ReloadSystemMetrics…CreateDCRenderTarget），
+    /// 派生接口 ID2D1Factory1 的 CreateDevice 紧随其后 = 17。
+    /// </summary>
+    public static class Factory
+    {
+        public const int CreateDevice = 17;
     }
 
     public static readonly int SlotRtCreateSolidColorBrush = Rt.CreateSolidColorBrush;
     public static readonly int SlotRtFillEllipse = Rt.FillEllipse;
-    public static readonly int SlotRtSetTransform = Rt.SetTransform;
 
     /// <summary>
-    /// BeginDraw 必须显式传 IID，而且传哪个 IID 直接决定后面走哪条绘制通路：
-    /// IID_IDXGISurface → 换出的是可写 DXGI 表面，用 D3D11 上传（首选，低延迟）；
-    /// IID_ID2D1DeviceContext / IID_ID2D1RenderTarget → 拿到 D2D 渲染目标，走印章式绘制（备选）。
+    /// BeginDraw 允许的 IID。要拿到 D2D 绘制目标，DComp 设备必须是用
+    /// <c>DCompositionCreateDevice2(ID2D1Device)</c> 创建的（用 IDXGIDevice 的老接口会 E_INVALIDARG）。
     /// 按顺序试，命中即定通路。
     /// </summary>
-    public static readonly (Guid Iid, bool IsD3D)[] BeginDrawCandidates =
+    public static readonly Guid[] BeginDrawCandidates =
     {
-        (IID_IDXGISurface, true),
-        (IID_ID2D1DeviceContext, false),
-        (IID_ID2D1RenderTarget, false),
+        IID_ID2D1DeviceContext,
+        IID_ID2D1RenderTarget,
     };
+
+    public const int D2D1_FACTORY_TYPE_SINGLE_THREADED = 0;
+
+    /// <summary>
+    /// HRESULT D2D1CreateFactory(D2D1_FACTORY_TYPE, REFIID, const D2D1_FACTORY_OPTIONS*, void**) —— d2d1.dll 导出。
+    /// </summary>
+    [DllImport("d2d1.dll", PreserveSig = true)]
+    public static extern int D2D1CreateFactory(int factoryType, ref Guid iid, IntPtr options, out IntPtr factory);
 
     // ================= DirectComposition =================
 
@@ -162,8 +173,12 @@ internal static class Gfx
 
     public static readonly Guid IID_IDCompositionDevice = new("c37ea93a-e7aa-450d-b16f-9746cb0407f3");
 
+    /// <summary>
+    /// 带 D2D 设备的 DComp 设备（renderingDevice 传 ID2D1Device 裸指针）。
+    /// 只有走这个入口，IDCompositionSurface::BeginDraw 才允许要 ID2D1DeviceContext。
+    /// </summary>
     [DllImport("dcomp.dll", PreserveSig = true)]
-    public static extern int DCompositionCreateDevice(IDXGIDevice dxgiDevice, ref Guid iid,
+    public static extern int DCompositionCreateDevice2(IntPtr renderingDevice, ref Guid iid,
         [MarshalAs(UnmanagedType.IUnknown)] out object device);
 
     [StructLayout(LayoutKind.Sequential)]
