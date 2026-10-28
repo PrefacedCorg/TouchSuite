@@ -101,15 +101,19 @@ public static class EdidReader
                     if (key.GetValue("EDID") is not byte[] edid || edid.Length < 69)
                         continue;
 
-                    // 详细时序描述符：66=宽(mm)低字节, 67=高(mm)低字节,
-                    // 68 高 4 位=宽高 4 位、低 4 位=高高 4 位
-                    int wMm = ((edid[68] & 0xF0) << 4) | edid[66];
-                    int hMm = ((edid[68] & 0x0F) << 8) | edid[67];
+                    // 优先用基本显示参数块的"最大图像尺寸"（字节 21/22，单位 cm）：
+                    // 它描述的是整块面板，按规范就是权威值。
+                    // 不能优先用详细时序描述符（66/67/68，单位 mm）——不少面板在那里写的是
+                    // 某个旧 timing 的尺寸（例如 800/450mm），与实际屏幕不符。
+                    int wMm = edid[21] * 10;
+                    int hMm = edid[22] * 10;
 
-                    if (wMm <= 0 || hMm <= 0)   // 退化到基本显示参数里的厘米值
+                    if (wMm <= 0 || hMm <= 0)   // 基本块没写，才退到详细时序描述符
                     {
-                        wMm = edid[21] * 10;
-                        hMm = edid[22] * 10;
+                        // 详细时序描述符：66=宽(mm)低字节, 67=高(mm)低字节,
+                        // 68 高 4 位=宽高 4 位、低 4 位=高高 4 位
+                        wMm = ((edid[68] & 0xF0) << 4) | edid[66];
+                        hMm = ((edid[68] & 0x0F) << 8) | edid[67];
                     }
 
                     if (wMm >= 50 && hMm >= 50 && !list.Contains(new EdidSize(wMm, hMm)))
