@@ -35,19 +35,27 @@ internal sealed class DCompInkLayer : InkLayerBase
     private static readonly long PresentIntervalTicks = Stopwatch.Frequency * 7 / 1000;
 
     /// <summary>
-    /// 收锋系数：下标 = 距笔尖的采样数（0 是最末一个采样）。越靠尖端越细，
-    /// 于是湿墨的笔尖永远是个尖，落笔结束自然收笔 —— 压感恒为 1 的手指书写也有笔锋。
+    /// 收锋（笔锋）参数：抬笔时从末端沿弧长往回 <see cref="TaperLengthPx"/> 像素，
+    /// 宽度平滑收到 <see cref="TaperTipScale"/> 倍。书写过程中宽度不变，避免"凹点"。
     /// </summary>
-    private static readonly float[] TaperScale = { 0.45f, 0.60f, 0.75f, 0.87f, 0.95f };
+    private const float TaperLengthPx = 12f;
+    private const float TaperTipScale = 0.45f;
 
-    /// <summary>笔尖附近要一起重画的采样数（平滑与收锋都会改动这一段的形状，必须一起标脏）。</summary>
-    private const int TipDirtySamples = 6;
+    /// <summary>笔尖附近要一起重画的采样数（收锋会改动这一段的形状，必须一起标脏）。</summary>
+    private const int TipDirtySamples = 8;
 
     /// <summary>
-    /// 墨迹预测的提前量（ms）。EasiNote 默认 36ms；这里取 30ms，
-    /// 在 120~250Hz 采样下大约等于"提前 1~2 个采样"，够抵消输入到上屏的那段延迟，又不容易甩过头。
+    /// 墨迹预测的提前量（秒）。Inkeys 的 Fps60 profile 用 1/45s ≈ 22ms。
+    /// 预测点从<b>模型笔尖</b>沿模型速度外推，而不是拿最近两个原始采样算差分。
     /// </summary>
-    private const float PredictLeadMs = 30f;
+    private const double PredictLeadSeconds = 1.0 / 45.0;
+
+    /// <summary>预测置信度的速度区间（px/s）：取 Inkeys/Chromium 的 5%~25% × 期望速度 500px/s。</summary>
+    private const float PredictMinSpeed = 25f;
+    private const float PredictMaxSpeed = 125f;
+
+    /// <summary>预测段长度上限（px）：速度再快也不甩出去。</summary>
+    private const float PredictMaxPx = 40f;
 
     /// <summary>预测点迟迟没有新采样跟上时，等这么久就撤掉（否则手指停住后墨迹会"甩"在前头）。</summary>
     private const int PredictExpireMs = 70;
@@ -75,6 +83,10 @@ internal sealed class DCompInkLayer : InkLayerBase
     private IntPtr _target;
     private IntPtr _visual;
     private IntPtr _surface;
+    private IntPtr _strokeStyle;   // 圆头圆角画笔样式（全局一份，设备无关）
+
+    /// <summary>模型输出缓冲（只有渲染线程用，复用以免每帧分配）。</summary>
+    private readonly List<InkSample> _modeled = new();
 
     /// <summary>探针定下来的绘制目标 IID（ID2D1DeviceContext 优先）。</summary>
     private Guid _beginIid;
@@ -307,6 +319,7 @@ internal sealed class DCompInkLayer : InkLayerBase
                 return false;
             }
             d2dDevice = created;
+            _strokeStyle = CreateRoundStrokeStyle(factory);
             return true;
         }
         finally
@@ -314,6 +327,16 @@ internal sealed class DCompInkLayer : InkLayerBase
             Vtbl.Release(dxgiDevice);
             Vtbl.Release(factory);
         }
+    }
+
+    /// <summary>圆头 + 圆角的画笔样式。笔迹被拆成很多段 DrawLine，平头端点会在拐点处露缺口（看起来"断开"）。</summary>
+    private static IntPtr CreateRoundStrokeStyle(IntPtr factory)
+    {
+        var props = Gfx.RoundStrokeStyle;
+        var create = Vtbl.Slot<Vtbl.FactoryCreateStrokeStyle>(factory, Gfx.Factory.CreateStrokeStyle);
+        int hr = create(factory, ref props, IntPtr.Zero, 0, out IntPtr style);
+        Log.Hr($"ID2D1Factory::CreateStrokeStyle(圆头圆角) ptr=0x{style.ToInt64():X}", hr);
+        return hr < 0 ? IntPtr.Zero : style;
     }
 
     /// <summary>ID3D11Device 裸指针 QI 出 IDXGIDevice（调用方负责 Release）。</summary>
@@ -397,7 +420,14 @@ internal sealed class DCompInkLayer : InkLayerBase
             case CmdBegin b:
             {
                 ClearPrediction();
-                var stroke = new InkStroke { Id = b.Id, Points = new List<InkSample> { b.S } };
+                // 有平滑开关 + 有时间戳才建模；否则（自检/合成样本）直接用原始点
+                StrokeModeler? modeler = null;
+                if (InkSettings.Smoothing && b.S.Ticks != 0)
+                {
+                    modeler = new StrokeModeler();
+                    modeler.Reset(b.S);
+                }
+                var stroke = new InkStroke { Id = b.Id, Points = new List<InkSample> { b.S }, Modeler = modeler };
                 stroke.Bounds = b.S.BoundsAt();
                 _strokes.Add(stroke);
                 _active[b.Id] = stroke;
@@ -409,18 +439,68 @@ internal sealed class DCompInkLayer : InkLayerBase
             {
                 if (!_active.TryGetValue(e.Id, out InkStroke? stroke))
                     break;
-                stroke.Points.Add(e.S);
-                stroke.Bounds = RectI.Union(stroke.Bounds, e.S.BoundsAt());
-                // 平滑与收锋都会改动"笔尖附近"那几段的形状，所以尾部若干采样一起标脏，
-                // 否则已经画出去的旧笔尖会留成一条细线（新形状没盖住它）。
-                MarkDirty(TailBounds(stroke));
+
+                RectI appended = RectI.Empty;
+                if (stroke.Modeler is { } modeler)
+                {
+                    _modeled.Clear();
+                    if (modeler.Update(e.S, _modeled) == 0)
+                    {
+                        // 时间戳异常等：退回原始点，保证笔画不断
+                        stroke.Points.Add(e.S);
+                        appended = e.S.BoundsAt();
+                        stroke.Bounds = RectI.Union(stroke.Bounds, appended);
+                    }
+                    else
+                    {
+                        foreach (InkSample p in _modeled)
+                        {
+                            stroke.Points.Add(p);
+                            RectI b = p.BoundsAt();
+                            appended = RectI.Union(appended, b);
+                        }
+                        stroke.Bounds = RectI.Union(stroke.Bounds, appended);
+                    }
+                }
+                else
+                {
+                    stroke.Points.Add(e.S);
+                    appended = e.S.BoundsAt();
+                    stroke.Bounds = RectI.Union(stroke.Bounds, appended);
+                }
+
+                // 收锋会改动"笔尖附近"那几段，尾部若干采样一起标脏，否则旧笔尖会留成一条细线
+                MarkDirty(RectI.Union(TailBounds(stroke), appended));
                 UpdatePrediction(stroke);
                 break;
             }
             case CmdEnd end:
             {
                 ClearPrediction();
-                _active.Remove(end.Id);
+                if (!_active.Remove(end.Id, out InkStroke? done))
+                    break;
+
+                // 弹簧笔尖会略微落后于真实抬笔点：抬笔时让它追到最后一个输入位置
+                if (done.Modeler is { } fm)
+                {
+                    _modeled.Clear();
+                    if (fm.Finish(done.Last, _modeled) > 0)
+                    {
+                        foreach (InkSample p in _modeled)
+                        {
+                            done.Points.Add(p);
+                            done.Bounds = RectI.Union(done.Bounds, p.BoundsAt());
+                        }
+                    }
+                }
+
+                // 收锋：抬笔时一次性改末段宽度（书写过程中宽度恒定，不会出现凹点）
+                ApplyTaper(done);
+
+                // 抬笔这一帧把**整条笔画**重画一遍：末端补齐 + 收锋 + 撤掉预测尾巴之后的最终形态
+                // 必须一次提交完。只标尾部的话，收锋那几像素要等下一次有脏区时才被重画，
+                // 表现就是"笔锋要等下一笔按下才显示"。
+                MarkDirty(done.Bounds);
                 break;
             }
             case CmdErase er:
@@ -513,54 +593,48 @@ internal sealed class DCompInkLayer : InkLayerBase
     // ================= 墨迹预测（湿墨尾巴） =================
 
     /// <summary>
-    /// 用最近两个采样的速度外推一小段"预测笔尖"，只画在湿墨的最前面（抄 EasiNote 的书写预测：
-    /// 预测点只进尾巴、落笔即被真实采样替换）。提前 <see cref="PredictLeadMs"/> 毫秒，
-    /// 抵消的是"采样 → 解析 → 排队 → BeginDraw/Commit → DWM 合成"这一段固定延迟。
-    /// <para>预测段每一帧都会重画，所以旧的那一段必须一起标脏，否则手指停住会留下"甩出去"的残影。</para>
+    /// 预测笔尖：从<b>模型笔尖</b>沿<b>模型速度</b>外推 <see cref="PredictLeadSeconds"/>，
+    /// 只画在湿墨最前面，来了新采样就被替换。
+    /// <para>置信度按速度在 <see cref="PredictMinSpeed"/>~<see cref="PredictMaxSpeed"/> 之间插值
+    /// （Inkeys/Chromium 的 Kalman confidence 用的也是这两个比例）：手慢/手停时提前量自动归零，
+    /// 不会出现"墨甩在手指前面"。</para>
     /// </summary>
     private void UpdatePrediction(InkStroke st)
     {
+        if (!InkSettings.Prediction || st.Modeler is not { HasVelocity: true } modeler)
+        {
+            ClearPrediction();
+            return;
+        }
+
         MarkDirty(_predictBounds);        // 旧的预测段一并擦掉
         _predictBounds = RectI.Empty;
         _predictActive = false;
 
-        List<InkSample> pts = st.Points;
-        if (pts.Count < 3)
+        float speed = modeler.Speed;
+        if (speed < PredictMinSpeed)
             return;
 
-        InkSample b = pts[^2], c = pts[^1];
-        InkSample a = pts[^3];
-        if (c.Ticks == 0 || a.Ticks == 0)
-            return;                        // 没有时间戳（自检/合成样本）→ 不预测
+        float conf = Math.Clamp((speed - PredictMinSpeed) / (PredictMaxSpeed - PredictMinSpeed), 0f, 1f);
+        float leadX = modeler.VelX * (float)PredictLeadSeconds * conf;
+        float leadY = modeler.VelY * (float)PredictLeadSeconds * conf;
 
-        double dtMs = (c.Ticks - a.Ticks) * 1000.0 / Stopwatch.Frequency;
-        if (dtMs <= 0.5 || dtMs > 120)
-            return;                        // 时间戳异常 / 中间断过（隔了很久）→ 不预测
-
-        float vx = (float)((c.X - a.X) / dtMs), vy = (float)((c.Y - a.Y) / dtMs);   // px/ms
-        float speed = MathF.Sqrt(vx * vx + vy * vy);
-        if (speed < 0.05f)
-            return;                        // 基本没动：预测只会放大抖动
-
-        float leadX = vx * PredictLeadMs, leadY = vy * PredictLeadMs;
-
-        // 长度封顶：不超过最近一段的两倍，避免急转/抖动时把墨甩出去
-        float lastLen = MathF.Sqrt((c.X - b.X) * (c.X - b.X) + (c.Y - b.Y) * (c.Y - b.Y));
         float leadLen = MathF.Sqrt(leadX * leadX + leadY * leadY);
-        float maxLen = MathF.Max(lastLen * 2f, 2f);
-        if (leadLen > maxLen)
+        if (leadLen < 0.5f)
+            return;
+        if (leadLen > PredictMaxPx)
         {
-            leadX *= maxLen / leadLen;
-            leadY *= maxLen / leadLen;
+            leadX *= PredictMaxPx / leadLen;
+            leadY *= PredictMaxPx / leadLen;
         }
 
-        _predictX0 = c.X;
-        _predictY0 = c.Y;
-        _predictX1 = c.X + leadX;
-        _predictY1 = c.Y + leadY;
-        _predictW0 = WidthAt(pts, pts.Count - 1);        // 接上收锋之后的笔尖宽度，视觉上连成一条
+        _predictX0 = modeler.X;
+        _predictY0 = modeler.Y;
+        _predictX1 = _predictX0 + leadX;
+        _predictY1 = _predictY0 + leadY;
+        _predictW0 = WidthAt(st.Points, st.Points.Count - 1);   // 接上收锋之后的笔尖宽度，视觉上连成一条
         _predictW1 = _predictW0 * 0.66f;
-        _predictColor = c;
+        _predictColor = st.Last;
         _predictActive = true;
 
         _predictBounds = SegmentBounds(_predictX0, _predictY0, _predictX1, _predictY1,
@@ -747,7 +821,7 @@ internal sealed class DCompInkLayer : InkLayerBase
             foreach (InkStroke st in _strokes)
             {
                 if (st.Bounds.Intersects(update))
-                    DrawStroke(renderTarget, st, update, brushes);
+                    DrawStroke(renderTarget, st, update, brushes, _strokeStyle);
             }
 
             // 预测笔尖画在所有真实笔迹之后（它就是最前面那一小段）
@@ -756,10 +830,10 @@ internal sealed class DCompInkLayer : InkLayerBase
                 IntPtr predictBrush = GetBrush(renderTarget, _predictColor, brushes);
                 if (predictBrush != IntPtr.Zero)
                 {
-                    var fill = Vtbl.Slot<Vtbl.FillEllipse>(renderTarget, Gfx.SlotRtFillEllipse);
-                    StampLine(fill, renderTarget, predictBrush,
+                    var drawLine = Vtbl.Slot<Vtbl.DrawLine>(renderTarget, Gfx.SlotRtDrawLine);
+                    StrokeSegment(drawLine, renderTarget, predictBrush,
                         _predictX0, _predictY0, _predictX1, _predictY1,
-                        _predictW0, _predictW1, update);
+                        _predictW0, _predictW1, update, _strokeStyle);
                 }
             }
         }
@@ -787,7 +861,8 @@ internal sealed class DCompInkLayer : InkLayerBase
     /// <para><b>只画落在更新区里的那几段</b>：一条长笔画可能上千个点，整条重画等于每帧按点数线性烧 CPU
     /// （实测 400 点的笔画让单帧呈现从 2ms 涨到 4ms）。按段的包围盒先筛一遍，长笔画就退化成常数级。</para>
     /// </summary>
-    private static void DrawStroke(IntPtr renderTarget, InkStroke st, RectI region, Dictionary<uint, IntPtr> brushes)
+    private static void DrawStroke(IntPtr renderTarget, InkStroke st, RectI region, Dictionary<uint, IntPtr> brushes,
+        IntPtr style)
     {
         List<InkSample> pts = st.Points;
         int n = pts.Count;
@@ -796,6 +871,7 @@ internal sealed class DCompInkLayer : InkLayerBase
             return;
 
         var fillEllipse = Vtbl.Slot<Vtbl.FillEllipse>(renderTarget, Gfx.SlotRtFillEllipse);
+        var drawLine = Vtbl.Slot<Vtbl.DrawLine>(renderTarget, Gfx.SlotRtDrawLine);
 
         if (n == 1)
         {
@@ -803,95 +879,81 @@ internal sealed class DCompInkLayer : InkLayerBase
             return;
         }
 
-        // 头段：首采样 → 首中点
-        StampLine(fillEllipse, renderTarget, brush,
-            pts[0].X, pts[0].Y,
-            Mid(pts[0].X, pts[1].X), Mid(pts[0].Y, pts[1].Y),
-            WidthAt(pts, 0), WidthAt(pts, 1), region);
-
-        // 中段：中点(i-1) → 中点(i)，控制点 = 原始采样 i
-        for (int i = 1; i <= n - 2; i++)
+        // 采样点本身已经是平滑的（模型输出间隔 240Hz，约 2~3px 一段），直接连折线即可：
+        // 圆头圆角的 style 保证段与段之间不会有缺口。
+        for (int i = 0; i < n - 1; i++)
         {
-            StampQuad(fillEllipse, renderTarget, brush,
-                Mid(pts[i - 1].X, pts[i].X), Mid(pts[i - 1].Y, pts[i].Y),
-                pts[i].X, pts[i].Y,
-                Mid(pts[i].X, pts[i + 1].X), Mid(pts[i].Y, pts[i + 1].Y),
-                WidthAt(pts, i), WidthAt(pts, i + 1), region);
+            StrokeSegment(drawLine, renderTarget, brush,
+                pts[i].X, pts[i].Y, pts[i + 1].X, pts[i + 1].Y,
+                WidthAt(pts, i), WidthAt(pts, i + 1), region, style);
         }
-
-        // 尾段：末-1 中点 → 最新的原始采样（不平滑，笔尖直达）
-        // 宽度必须用 WidthAt(last) 的两端：上一个中段的二次贝塞尔已经在"末-1 中点"处收到 WidthAt(last)，
-        // 这里若从 WidthAt(last-1) 起笔，就会在收窄之后又跳回更粗的一档，再收到笔尖 ——
-        // 表现就是"抬起位置那一小段/那一点又变粗一点点"。
-        int last = n - 1;
-        float tipWidth = WidthAt(pts, last);
-        StampLine(fillEllipse, renderTarget, brush,
-            Mid(pts[last - 1].X, pts[last].X), Mid(pts[last - 1].Y, pts[last].Y),
-            pts[last].X, pts[last].Y,
-            tipWidth, tipWidth, region);
     }
-
-    private static float Mid(float a, float b) => (a + b) * 0.5f;
 
     /// <summary>第 i 个采样实际使用的笔宽。</summary>
-    private static float WidthAt(List<InkSample> pts, int i)
-    {
-        int fromEnd = pts.Count - 1 - i;
-        // 太短的笔画（点、勾）不收锋：整条都乘系数会把它画得很细
-        if (fromEnd >= TaperScale.Length || pts.Count < TaperScale.Length + 4)
-            return pts[i].Width;
+    private static float WidthAt(List<InkSample> pts, int i) => pts[i].Width;
 
-        // 收锋区统一用"本体笔宽"作基准，而不是各自的原始宽度：
-        // 抬手瞬间压感/接触面积常常会跳一下，原始宽度 × 系数会让末端反而鼓起来一小截
-        // （表现就是"抬起位置那一小段又变粗一点点"）。用同一个基准后收锋区一定单调变细。
-        return BodyWidth(pts) * TaperScale[fromEnd];
+    /// <summary>
+    /// 抬笔收锋：从末端沿**弧长**往回 <see cref="TaperLengthPx"/>，宽度平滑收到
+    /// <see cref="TaperTipScale"/> 倍。
+    ///
+    /// <para>必须在抬笔时一次性改宽度并重画 —— 如果像以前那样每帧按"距笔尖第几个点"重算，
+    /// 点一旦离开重画窗口就再也不会被更新，宽度序列里会留下几个偏细的点，看起来就是"凹下去"。</para>
+    /// </summary>
+    private static void ApplyTaper(InkStroke st)
+    {
+        if (!InkSettings.Taper)
+            return;
+
+        List<InkSample> pts = st.Points;
+        int n = pts.Count;
+        if (n < 12)
+            return;                             // 点/勾太短，不收锋
+
+        float baseWidth = pts[n - 1].Width;     // 中值滤波后各点宽度基本一致，直接取末点
+        float acc = 0f;
+
+        for (int i = n - 1; i >= 0; i--)
+        {
+            if (i < n - 1)
+            {
+                float dx = pts[i].X - pts[i + 1].X;
+                float dy = pts[i].Y - pts[i + 1].Y;
+                acc += MathF.Sqrt(dx * dx + dy * dy);
+            }
+
+            float t = Math.Clamp(acc / TaperLengthPx, 0f, 1f);   // 0 = 笔尖，1 = 收锋区外
+            float scale = TaperTipScale + (1f - TaperTipScale) * (t * t * (3f - 2f * t)); // smoothstep，无台阶
+            pts[i] = pts[i] with { Width = baseWidth * scale };
+            st.Bounds = RectI.Union(st.Bounds, pts[i].BoundsAt());
+
+            if (t >= 1f)
+                break;
+        }
     }
 
-    /// <summary>笔宽基准：取收锋区外最近的那个采样（短笔画则退回首采样）。</summary>
-    private static float BodyWidth(List<InkSample> pts)
-    {
-        int idx = Math.Max(0, pts.Count - 1 - TaperScale.Length);
-        return pts[idx].Width;
-    }
-
-    private static void StampLine(Vtbl.FillEllipse fill, IntPtr rt, IntPtr brush,
-        float ax, float ay, float bx, float by, float wa, float wb, RectI region)
+    /// <summary>
+    /// 画一段直线（两端笔宽 wa/wb）。宽度按段内插值，每 ≈0.6px 的宽度变化拆一条 ——
+    /// 等宽时（手指书写）整段只发一条 DrawLine。
+    /// </summary>
+    private static void StrokeSegment(Vtbl.DrawLine drawLine, IntPtr rt, IntPtr brush,
+        float ax, float ay, float bx, float by, float wa, float wb, RectI region, IntPtr style)
     {
         if (!BoxTouches(ax, ay, bx, by, MathF.Max(wa, wb), region))
             return;
 
-        float dist = MathF.Sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay));
-        float minR = MathF.Max(0.6f, MathF.Min(wa, wb) * 0.5f);
-        int steps = Math.Clamp((int)MathF.Ceiling(dist / StepLength(minR)), 1, 256);
-        for (int k = 0; k <= steps; k++)
+        int steps = Math.Clamp((int)MathF.Ceiling(MathF.Abs(wb - wa) / 0.6f), 1, 8);
+        float px = ax, py = ay, pw = wa;
+        for (int k = 1; k <= steps; k++)
         {
             float u = (float)k / steps;
-            StampDot(fill, rt, brush, ax + (bx - ax) * u, ay + (by - ay) * u, wa + (wb - wa) * u);
-        }
-    }
-
-    /// <summary>二次贝塞尔盖圆：A = 起点、C = 控制点、B = 终点（二次曲线一定落在 A-C-B 三角形内）。</summary>
-    private static void StampQuad(Vtbl.FillEllipse fill, IntPtr rt, IntPtr brush,
-        float ax, float ay, float cx, float cy, float bx, float by, float wa, float wb, RectI region)
-    {
-        float pad = MathF.Max(wa, wb) * 0.5f + 1f;
-        float l = MathF.Min(MathF.Min(ax, bx), cx) - pad;
-        float r = MathF.Max(MathF.Max(ax, bx), cx) + pad;
-        float t = MathF.Min(MathF.Min(ay, by), cy) - pad;
-        float bo = MathF.Max(MathF.Max(ay, by), cy) + pad;
-        if (!(l < region.R && region.L < r && t < region.B && region.T < bo))
-            return;
-
-        float approx = 0.5f * (MathF.Sqrt((cx - ax) * (cx - ax) + (cy - ay) * (cy - ay))
-                             + MathF.Sqrt((bx - cx) * (bx - cx) + (by - cy) * (by - cy)));
-        float minR = MathF.Max(0.6f, MathF.Min(wa, wb) * 0.5f);
-        int steps = Math.Clamp((int)MathF.Ceiling(approx / StepLength(minR)), 2, 256);
-        for (int k = 0; k <= steps; k++)
-        {
-            float u = (float)k / steps, iu = 1f - u;
-            float x = iu * iu * ax + 2f * iu * u * cx + u * u * bx;
-            float y = iu * iu * ay + 2f * iu * u * cy + u * u * by;
-            StampDot(fill, rt, brush, x, y, wa + (wb - wa) * u);
+            float nx = ax + (bx - ax) * u;
+            float ny = ay + (by - ay) * u;
+            float nw = wa + (wb - wa) * u;
+            drawLine(rt, Vtbl.PackPoint(px, py), Vtbl.PackPoint(nx, ny), brush,
+                MathF.Max(0.35f, (pw + nw) * 0.5f), style);
+            px = nx;
+            py = ny;
+            pw = nw;
         }
     }
 
@@ -923,13 +985,6 @@ internal sealed class DCompInkLayer : InkLayerBase
         return brush;
     }
 
-    /// <summary>
-    /// 相邻两个印章圆的最大圆心距。必须**始终小于圆直径**，否则细笔画会画成一串点：
-    /// 收锋后的笔尖、或压感很轻（笔宽 2px 左右）时，半径只有 1px 上下，
-    /// 一旦步距有 1.2px 的地板，圆与圆就不再重叠 —— 表现就是"最后几点断开"、"整条一点一点"。
-    /// </summary>
-    private static float StepLength(float radius) => MathF.Max(0.25f, radius * 0.32f);
-
     private static void StampDot(Vtbl.FillEllipse fillEllipse, IntPtr rt, IntPtr brush, float x, float y, float width)
     {
         float r = width * 0.5f;
@@ -946,9 +1001,11 @@ internal sealed class DCompInkLayer : InkLayerBase
         Vtbl.Release(_surface);
         Vtbl.Release(_visual);
         Vtbl.Release(_target);
+        Vtbl.Release(_strokeStyle);
         _surface = IntPtr.Zero;
         _visual = IntPtr.Zero;
         _target = IntPtr.Zero;
+        _strokeStyle = IntPtr.Zero;
 
         if (_device is not null) { try { Marshal.ReleaseComObject(_device); } catch { } _device = null; }
         if (_d3dDevice is not null) { try { Marshal.ReleaseComObject(_d3dDevice); } catch { } _d3dDevice = null; }

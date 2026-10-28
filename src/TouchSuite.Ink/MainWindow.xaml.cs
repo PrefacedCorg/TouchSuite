@@ -99,6 +99,7 @@ public partial class MainWindow : Window
 
     public MainWindow()
     {
+        InkSettings.Load();
         InitializeComponent();
         Loaded += OnLoaded;
         Closed += OnClosed;
@@ -143,7 +144,11 @@ public partial class MainWindow : Window
         _inkWindow = new InkSurfaceWindow();
 
         DCompInkLayer? dcomp = null;
-        if (_inkWindow.Handle != IntPtr.Zero)
+        if (!InkSettings.DComp)
+        {
+            Log.Write("设置：DComp 已关闭 → 不创建墨迹层，直接用 WPF 层");
+        }
+        else if (_inkWindow.Handle != IntPtr.Zero)
         {
             dcomp = new DCompInkLayer(_inkWindow.Handle, _inkWindow.X, _inkWindow.Y,
                 _inkWindow.Width, _inkWindow.Height);
@@ -165,8 +170,11 @@ public partial class MainWindow : Window
 
         if (_layer is null)
         {
-            string reason = dcomp?.LastError ?? "底层窗口创建失败";
+            string reason = dcomp?.LastError
+                ?? (InkSettings.DComp ? "底层窗口创建失败" : "设置里关掉了 DComp");
             dcomp?.Dispose();
+            _inkWindow.Dispose();
+            _inkWindow = null;
             var wpf = new WpfInkLayer(FallbackCanvas) { LastError = reason };
             wpf.Initialize();
             _layer = wpf;
@@ -314,7 +322,7 @@ public partial class MainWindow : Window
             py = (float)Math.Clamp(_vy + ny * _vh, 0, _layerH - 1);
             h = (float)((double)c.HLogical / c.YLogMax * _vh);
         }
-        return new ContactTracker.TrackIn(c.Link, c.ContactId, c.Down, px, py, w, h,
+        return new ContactTracker.TrackIn(c.Link, c.HasCid, c.ContactId, c.Down, px, py, w, h,
             (float)(c.Pressure01 ?? 1.0));
     }
 
@@ -1093,6 +1101,8 @@ public partial class MainWindow : Window
     private void OnUndo(object sender, RoutedEventArgs e) => _layer?.Undo();
 
     private void OnClear(object sender, RoutedEventArgs e) => _layer?.Clear();
+
+    private void OnSettings(object sender, RoutedEventArgs e) => new SettingsWindow { Owner = this }.ShowDialog();
 
     private void OnExit(object sender, RoutedEventArgs e) => Close();
 

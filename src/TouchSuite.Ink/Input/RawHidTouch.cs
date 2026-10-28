@@ -23,12 +23,20 @@ namespace TouchSuite.Ink;
 /// </summary>
 internal static class RawHidTouch
 {
-    /// <summary>一帧里的单根触点（原始 HID 量纲）。Down=false 只在「抬手过渡帧的残留幽灵槽」出现。</summary>
-    public sealed record RawContact(int Link, int ContactId, bool Down,
+    /// <summary>
+    /// 一帧里的单根触点（原始 HID 量纲）。Down=false 只在「抬手过渡帧的残留幽灵槽」出现。
+    /// <para><see cref="HasCid"/>=true 表示设备真的声明并上报了 Contact Identifier，
+    /// 此时 <see cref="ContactId"/> <b>连 0 也是有效身份</b>（这台屏 L1 的 CID 恒为 0）。</para>
+    /// </summary>
+    public sealed record RawContact(int Link, bool HasCid, int ContactId, bool Down,
         int XLogical, int YLogical, int XLogMax, int YLogMax,
         int WLogical, int HLogical, double? Pressure01);
 
-    /// <summary>一个子报文解出的一帧。SubIndex=0..SubCount-1；CountZero=设备报「接触数 0x0D:0x54 == 0」。</summary>
+    /// <summary>
+    /// 一个子报文解出的一帧。SubIndex=0..SubCount-1；
+    /// CountZero=设备报了「接触数 0x0D:0x54 == 0」<b>且</b>本帧一根按下的触点都没有（= 真的整体抬手）。
+    /// 注意：接触数为 0 但报文里还带着按下的触点，是延迟模式的续报，不算抬手。
+    /// </summary>
     public sealed record RawFrame(int SubIndex, int SubCount, bool CountZero,
         IReadOnlyList<RawContact> Contacts);
 
@@ -112,6 +120,16 @@ internal static class RawHidTouch
 
         /// <summary>接触数量 0x0D:0x54 所在的 LinkCollection（未声明则 null）。抬手信号之一：它掉到 0。</summary>
         public ushort? ContactCountLink;
+
+        // ---- 延迟模式（手指比槽位多）的跨报文合并缓冲 ----
+        // 实测这台屏（6 个槽位）7 指时**交替**发两条、且每条各自一条 WM_INPUT：
+        //   ① 接触数=7，L1..L6（CID 0..5）；
+        //   ② 接触数=0，L1 带 CID 6（多出来那根）。
+        // 所以缓冲必须挂在设备上跨 WM_INPUT 累积，不能只在一个报文列表里合并 ——
+        // 否则每条"接触数=0"都会被当成整屏抬手，所有手指每两帧就被抬掉重建一次。
+        public readonly List<RawContact> Pending = new();
+        public int PendingNeed;
+        public long PendingSinceMs;
     }
 
     private static readonly Dictionary<IntPtr, DeviceCtx> Ctx = new();
@@ -167,6 +185,9 @@ internal static class RawHidTouch
         [Out] ushort[] usageList, ref uint usageLength, IntPtr preparsedData, byte[] report, uint reportLength);
 
     private const ushort UsageTipSwitch = 0x42;   // 0x0D:0x42 笔尖接触（该槽位真的按下）
+
+    /// <summary>延迟模式半组的最长等待（ms）：超过就把已收到的发出去，避免续报丢了把手指扣住。</summary>
+    private const int PendingTimeoutMs = 60;
 
     // ================= 枚举 + 能力探测 =================
 
@@ -370,7 +391,7 @@ internal static class RawHidTouch
 
     /// <summary>一个触点槽位本帧读到的值（不含 Down：活帧整帧为 Down、抬手补位帧整帧为 Up）。</summary>
     private readonly record struct LinkValues(
-        ushort Link, int ContactId,
+        ushort Link, bool HasCid, int ContactId,
         int XLogical, int YLogical, int XLogMax, int YLogMax,
         int WLogical, int HLogical, double? Pressure01);
 
@@ -426,6 +447,20 @@ internal static class RawHidTouch
                 reports.Add(report);
             }
 
+            // 延迟模式合并缓冲跨 WM_INPUT 存活（挂在设备上），见 DeviceCtx.Pending 的说明。
+            // 上一次留下的半组如果迟迟等不到续报（手指抬走等），先把已收到的发出去，别把手指扣住。
+            long nowMs = Environment.TickCount64;
+            if (ctx.PendingNeed > 0 && nowMs - ctx.PendingSinceMs > PendingTimeoutMs)
+            {
+                if (ctx.Pending.Count > 0)
+                {
+                    frames.Add(new RawFrame(0, 1, false, ctx.Pending.ToArray()));
+                    ctx.HadPress = true;
+                }
+                ctx.Pending.Clear();
+                ctx.PendingNeed = 0;
+            }
+
             for (int i = 0; i < reports.Count; i++)
             {
                 byte[] report = reports[i];
@@ -438,28 +473,89 @@ internal static class RawHidTouch
                 if (contacts.Count == 0 && requireTip && !ctx.TipEverSeen)
                     contacts = ReadAllLinks(ctx, report, requireTip: false);
 
-                // 抬手判定（两个信号取其一，覆盖两类设备）：
-                //   ① 本帧读不到任何接触；
-                //   ② 接触数量 0x0D:0x54 掉到 0（有"残留幽灵槽"的设备抬手帧仍能读到 W/H，只能靠这个）。
+                bool hasCount = TryReadContactCount(ctx, report, out uint count);
+                int total = hasCount ? (int)count : contacts.Count;
+
+                // ===== 延迟模式续报（接触数 = 0，但报文里带着按下的触点）=====
+                // 这类报文既不是头帧也不是抬手，只能并进挂着的那一组。
+                if (ctx.PendingNeed > 0)
+                {
+                    bool added = false;
+                    foreach (RawContact c in contacts)
+                        added |= AddUnique(ctx.Pending, c);
+                    if (total > ctx.PendingNeed)
+                        ctx.PendingNeed = total;          // 组里又多了新手指
+                    ctx.PendingSinceMs = nowMs;
+
+                    if (ctx.Pending.Count >= ctx.PendingNeed)
+                    {
+                        frames.Add(new RawFrame(i, reports.Count, false, ctx.Pending.ToArray()));
+                        ctx.HadPress = true;
+                        ctx.Pending.Clear();
+                        ctx.PendingNeed = 0;
+                        continue;
+                    }
+                    if (added)
+                        continue;                          // 还差几根，继续等续报
+
+                    // 续报没带来新手指（多半是手指抬走了）→ 这一组到此为止
+                    if (ctx.Pending.Count > 0)
+                    {
+                        frames.Add(new RawFrame(i, reports.Count, false, ctx.Pending.ToArray()));
+                        ctx.HadPress = true;
+                    }
+                    ctx.Pending.Clear();
+                    ctx.PendingNeed = 0;
+                    continue;
+                }
+
+                // ===== 延迟模式头帧：接触数超过**槽位数** =====
+                // 只有"手指比槽位多"才会这样（正常情况下悬停的手指也算进接触数，但不会超过槽位数）。
+                if (total > ctx.Links.Length && contacts.Count > 0)
+                {
+                    ctx.Pending.Clear();
+                    foreach (RawContact c in contacts)
+                        AddUnique(ctx.Pending, c);
+                    ctx.PendingNeed = total;
+                    ctx.PendingSinceMs = nowMs;
+
+                    if (ctx.Pending.Count >= ctx.PendingNeed)
+                    {
+                        frames.Add(new RawFrame(i, reports.Count, false, ctx.Pending.ToArray()));
+                        ctx.HadPress = true;
+                        ctx.Pending.Clear();
+                        ctx.PendingNeed = 0;
+                    }
+                    continue;
+                }
+
+                // ===== 普通帧 =====
                 bool noContact = contacts.Count == 0;
-                bool countZero = ContactCountIsZero(ctx, report);
-                bool lift = ctx.HadPress && (noContact || countZero);
+                bool countZero = hasCount && count == 0;
 
-                // 抬手过渡帧：用"上一帧真的按下过"的残槽补出最后一个抬起点（Down=false），避免末点漏失。
-                IReadOnlyList<RawContact> frameContacts =
-                    contacts.Count > 0 ? contacts
-                    : lift ? BuildLiftContacts(ctx, report)
-                    : Array.Empty<RawContact>();
+                // 接触数掉到 0 = **整体抬手**。抬手帧里可能还残留着上一帧的槽位（幽灵槽），
+                // 那些残留绝不能当"新按下"发出去，否则会凭空多出一笔、或者把旧轨道拖住不放。
+                if (countZero)
+                {
+                    if (!ctx.HadPress)
+                        continue;                       // 本来就没按下：这一帧什么都不用做
+                    EmitLift(ctx, report, i, reports.Count, frames);
+                    continue;
+                }
 
-                frames.Add(new RawFrame(i, reports.Count, countZero, frameContacts));
+                if (noContact)
+                {
+                    // 没有接触数可用（有些设备不声明 0x54），或者接触数 > 0 但一根都没真的按下。
+                    // 只要上一帧还有按压，这就是抬手。
+                    if (!ctx.HadPress)
+                        continue;
+                    EmitLift(ctx, report, i, reports.Count, frames);
+                    continue;
+                }
 
-                if (lift && frameContacts.Count > 0)
-                    Log.Write($"[抬手补位] 子报文{i + 1}/{reports.Count} 触发={(noContact ? "无接触帧" : "接触数=0")} "
-                            + $"补位={frameContacts.Count} 槽");
-
-                // 置位规则：本帧有接触且"接触数"未归零 → 有活跃按压；抬手/收尾帧清零。
-                // 清零后不会重复补位（下一帧即使 countZero 仍为真，HadPress 已是 false）。
-                ctx.HadPress = contacts.Count > 0 && !countZero;
+                // 真的有按下的触点
+                frames.Add(new RawFrame(i, reports.Count, false, contacts));
+                ctx.HadPress = true;
             }
 
             return frames.Count > 0;
@@ -486,20 +582,48 @@ internal static class RawHidTouch
                 continue;
 
             ctx.LastValues[link] = v;   // 记下"真的按下"时的取值，供下一步抬手过渡帧补位
-            list.Add(new RawContact(v.Link, v.ContactId, Down: true,
+            list.Add(new RawContact(v.Link, v.HasCid, v.ContactId, Down: true,
                 v.XLogical, v.YLogical, v.XLogMax, v.YLogMax, v.WLogical, v.HLogical, v.Pressure01));
         }
         return list;
     }
 
-    /// <summary>本子报文的接触数量 0x0D:0x54 是否为 0（设备未声明该 usage 则返回 false）。</summary>
-    private static bool ContactCountIsZero(DeviceCtx ctx, byte[] report)
+    /// <summary>本子报文的接触数量 0x0D:0x54（设备未声明该 usage 则返回 false）。</summary>
+    private static bool TryReadContactCount(DeviceCtx ctx, byte[] report, out uint count)
     {
+        count = 0;
         if (ctx.ContactCountLink is not ushort link)
             return false;
-        return HidP_GetUsageValue(HidP_Input, 0x0D, link, 0x54, out uint cc, ctx.Preparsed, report, (uint)report.Length)
-               == HIDP_STATUS_SUCCESS
-            && cc == 0;
+        return HidP_GetUsageValue(HidP_Input, 0x0D, link, 0x54, out count, ctx.Preparsed, report, (uint)report.Length)
+               == HIDP_STATUS_SUCCESS;
+    }
+
+    /// <summary>延迟模式合并用：报了 CID 就按 CID 去重（0 也算有效身份），否则按槽位。</summary>
+    private static bool AddUnique(List<RawContact> list, RawContact c)
+    {
+        foreach (RawContact e in list)
+        {
+            if (c.HasCid && e.HasCid ? e.ContactId == c.ContactId : e.Link == c.Link)
+                return false;
+        }
+        list.Add(c);
+        return true;
+    }
+
+    /// <summary>
+    /// 发一个「整体抬手」帧：用上一帧真的按下过的槽位补出最后一个抬起点（Down=false），
+    /// 让上层先画到真实抬手位置再结束笔画，末点不会漏。
+    /// </summary>
+    private static void EmitLift(DeviceCtx ctx, byte[] report, int subIndex, int subCount, List<RawFrame> frames)
+    {
+        IReadOnlyList<RawContact> lift = BuildLiftContacts(ctx, report);
+        frames.Add(new RawFrame(subIndex, subCount, true, lift));
+        ctx.HadPress = false;
+        // 补位用过的槽位取值立刻作废：留着会把上一次手势的残留坐标带到下一次抬手，
+        // 那会让另一根手指的轨道被拖到一个早已不存在的位置（画出一条凭空连线）。
+        ctx.LastValues.Clear();
+        if (lift.Count > 0)
+            Log.Write($"[抬手补位] 子报文{subIndex + 1}/{subCount} 补位={lift.Count} 槽");
     }
 
     /// <summary>
@@ -525,7 +649,9 @@ internal static class RawHidTouch
             bool hasX = xc is not null && Get(0x01, link, 0x30, out xv);
             bool hasY = yc is not null && Get(0x01, link, 0x31, out yv);
 
-            list.Add(new RawContact(link, last.ContactId, Down: false,
+            // 抬手补位只按位置匹配：槽位在 6 通道屏上会被交替复用，LastValues 里那个 CID
+            // 可能属于"刚借用过这个槽位的另一根手指"，按它匹配会把 Up 挂到错的轨道上。
+            list.Add(new RawContact(link, HasCid: false, last.ContactId, Down: false,
                 hasX && xv > 0 ? (int)xv : last.XLogical,
                 hasY && yv > 0 ? (int)yv : last.YLogical,
                 last.XLogMax, last.YLogMax, last.WLogical, last.HLogical, last.Pressure01));
@@ -572,8 +698,7 @@ internal static class RawHidTouch
         bool hasP = pc is not null && Get(0x0D, link, 0x30, out p);
         bool hasCid = Get(0x0D, link, 0x51, out uint cid);
 
-        v = new LinkValues(link,
-            hasCid ? (int)cid : 0,
+        v = new LinkValues(link, hasCid, hasCid ? (int)cid : 0,
             (int)x, (int)y, hasX ? xc!.LogMax : 0, hasY ? yc!.LogMax : 0,
             (int)w, (int)h,
             hasP && pc!.LogMax > pc.LogMin

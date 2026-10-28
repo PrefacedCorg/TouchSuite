@@ -141,11 +141,38 @@ internal static class Gfx
     /// </summary>
     public static class Factory
     {
+        public const int CreateStrokeStyle = 11;
         public const int CreateDevice = 17;
     }
 
+    /// <summary>D2D1_STROKE_STYLE_PROPERTIES：4 个枚举(int) + miterLimit + dashStyle(int) + dashOffset。</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct D2D1_STROKE_STYLE_PROPERTIES
+    {
+        public int StartCap;      // 0 平头 / 1 方头 / 2 圆头
+        public int EndCap;
+        public int DashCap;
+        public int LineJoin;      // 0 斜接 / 1 斜切 / 2 圆角
+        public float MiterLimit;
+        public int DashStyle;     // 0 = 实线
+        public float DashOffset;
+    }
+
+    /// <summary>圆头 + 圆角：一条折线拆成多段 DrawLine 时，端点才不会在拐点处缺口。</summary>
+    public static D2D1_STROKE_STYLE_PROPERTIES RoundStrokeStyle => new()
+    {
+        StartCap = 2,
+        EndCap = 2,
+        DashCap = 2,
+        LineJoin = 2,
+        MiterLimit = 10f,
+        DashStyle = 0,
+        DashOffset = 0f,
+    };
+
     public static readonly int SlotRtCreateSolidColorBrush = Rt.CreateSolidColorBrush;
     public static readonly int SlotRtFillEllipse = Rt.FillEllipse;
+    public static readonly int SlotRtDrawLine = Rt.DrawLine;
 
     /// <summary>
     /// BeginDraw 允许的 IID。要拿到 D2D 绘制目标，DComp 设备必须是用

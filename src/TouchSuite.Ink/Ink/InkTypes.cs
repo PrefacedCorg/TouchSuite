@@ -42,6 +42,9 @@ internal sealed class InkStroke
     public required List<InkSample> Points { get; init; }
     public RectI Bounds { get; set; } = RectI.Empty;
 
+    /// <summary>位置模型（弹簧 + wobble + 固定间隔重采样）。关掉平滑或没有时间戳时为 null，直接用原始点。</summary>
+    public StrokeModeler? Modeler { get; init; }
+
     public InkSample Last => Points[^1];
 }
 

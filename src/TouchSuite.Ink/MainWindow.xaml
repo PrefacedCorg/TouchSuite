@@ -64,6 +64,7 @@
         <Border Style="{StaticResource Divider}" />
         <Button Style="{StaticResource ToolButton}" Content="撤销" Click="OnUndo" />
         <Button Style="{StaticResource ToolButton}" Content="清空" Click="OnClear" />
+        <Button Style="{StaticResource ToolButton}" Content="设置" Click="OnSettings" />
         <Button Style="{StaticResource ToolButton}" Content="退出" Click="OnExit" />
       </StackPanel>
     </Border>

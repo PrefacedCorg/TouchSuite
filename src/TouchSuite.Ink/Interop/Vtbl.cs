@@ -21,6 +21,25 @@ internal static class Vtbl
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int CreateBrush(IntPtr self, ref Gfx.D2D1_COLOR_F color, IntPtr props, out IntPtr brush);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int FillEllipse(IntPtr self, ref Gfx.D2D1_ELLIPSE ellipse, IntPtr brush);
 
+    /// <summary>
+    /// ID2D1RenderTarget::DrawLine（返回 void）。strokeStyle 传 NULL = 平头端点。
+    /// <para>用它画笔迹主体而不是盖一串圆：一条线只被"覆盖一次"，抗锯齿边缘的覆盖率是正确的；
+    /// 盖圆时相邻圆的重叠会把边缘的半覆盖像素反复合成成接近全黑，边缘梯度塌陷成台阶（锯齿）。</para>
+    /// <para>参数按 x64 ABI：D2D1_POINT_2F 是 8 字节 POD → 走**整数**寄存器，所以这里收两个 ulong
+    /// （低 32 位 X、高 32 位 Y）；strokeStyle 必须显式传 NULL，否则 D2D 会去读调用者的影子空间。</para>
+    /// </summary>
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void DrawLine(
+        IntPtr self, ulong p0, ulong p1, IntPtr brush, float strokeWidth, IntPtr strokeStyle);
+
+    /// <summary>两个 float 打包成一个 64 位整数（低 32 位 = X）。</summary>
+    public static ulong PackPoint(float x, float y) =>
+        BitConverter.SingleToUInt32Bits(x) | ((ulong)BitConverter.SingleToUInt32Bits(y) << 32);
+
+    /// <summary>ID2D1Factory::CreateStrokeStyle（返回 HRESULT）。用来做圆头/圆角端点，否则相邻段会留缺口。</summary>
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int FactoryCreateStrokeStyle(
+        IntPtr self, ref Gfx.D2D1_STROKE_STYLE_PROPERTIES props, IntPtr dashes, uint dashesCount,
+        out IntPtr strokeStyle);
+
     /// <summary>ID2D1RenderTarget::SetTransform（返回 void）。</summary>
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void SetTransform(IntPtr self, ref Gfx.D2D1_MATRIX_3X2_F transform);
 
