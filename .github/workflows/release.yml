@@ -2,7 +2,7 @@ name: release
 
 on:
   # 推 tag（形如 v1.0.0 / v1.1.0-beta.1）也直接发版：版本号取自 tag，
-  # 组件按固定组合出（app / receiver / android / hidump / bridge；App.old 与驱动仍走手动勾选）
+  # 组件按固定组合出（app / receiver / android / hidump / bridge / ink；App.old 与驱动仍走手动勾选）
   push:
     tags:
       - 'v*'
@@ -46,6 +46,10 @@ on:
         description: '⑦ TouchSuite.HidTouchBridge（HID 触摸→合成指针转发，托盘常驻，net462）'
         type: boolean
         default: false
+      ink:
+        description: '⑧ TouchSuite.Ink（批注/墨迹层，win-x64 单文件）'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -64,6 +68,7 @@ jobs:
       android: ${{ steps.ver.outputs.android }}
       hidump: ${{ steps.ver.outputs.hidump }}
       bridge: ${{ steps.ver.outputs.bridge }}
+      ink: ${{ steps.ver.outputs.ink }}
       driver: ${{ steps.ver.outputs.driver }}
     steps:
       - name: Checkout
@@ -81,6 +86,7 @@ jobs:
           INPUT_ANDROID: ${{ inputs.android }}
           INPUT_HIDUMP: ${{ inputs.hidump }}
           INPUT_BRIDGE: ${{ inputs.bridge }}
+          INPUT_INK: ${{ inputs.ink }}
           INPUT_DRIVER: ${{ inputs.driver }}
         run: |
           # 版本号优先级：手动输入 > tag 名（去掉 v 前缀）> TouchSuite.App.csproj 的 <Version>
@@ -102,7 +108,7 @@ jobs:
             # 手动触发：完全按勾选项
             for pair in "app:$INPUT_APP" "app_old:$INPUT_APP_OLD" "receiver:$INPUT_RECEIVER" \
                         "android:$INPUT_ANDROID" "hidump:$INPUT_HIDUMP" "bridge:$INPUT_BRIDGE" \
-                        "driver:$INPUT_DRIVER"; do
+                        "ink:$INPUT_INK" "driver:$INPUT_DRIVER"; do
               echo "${pair%%:*}=${pair#*:}" >> "$GITHUB_OUTPUT"
             done
             echo "prerelease=$INPUT_PRERELEASE" >> "$GITHUB_OUTPUT"
@@ -114,6 +120,7 @@ jobs:
             echo "android=true" >> "$GITHUB_OUTPUT"
             echo "hidump=true" >> "$GITHUB_OUTPUT"
             echo "bridge=true" >> "$GITHUB_OUTPUT"
+            echo "ink=true" >> "$GITHUB_OUTPUT"
             echo "driver=false" >> "$GITHUB_OUTPUT"
             # 版本号带连字符（如 1.1.0-beta.1）视为预发布
             if [ "${v#*-}" != "$v" ]; then
@@ -304,6 +311,7 @@ jobs:
   driver:
     name: 驱动（自包含安装包）
     if: ${{ needs.prepare.outputs.driver == 'true' }}
+    needs: prepare
     uses: ./.github/workflows/driver.yml
 
   # ---- ⑦ TouchSuite.HidTouchBridge ----
@@ -340,10 +348,46 @@ jobs:
           path: TouchSuite.HidTouchBridge-v${{ needs.prepare.outputs.version }}-win-x64.zip
           if-no-files-found: error
 
+  # ---- ⑧ TouchSuite.Ink ----
+  ink:
+    name: TouchSuite.Ink
+    if: ${{ needs.prepare.outputs.ink == 'true' }}
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish（自包含单文件 win-x64）
+        run: >
+          dotnet publish src/TouchSuite.Ink/TouchSuite.Ink.csproj -c Release -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=none
+          -p:Version=${{ needs.prepare.outputs.version }}
+          -o publish/ink
+
+      - name: Zip
+        shell: pwsh
+        run: Compress-Archive -Path publish/ink/* -DestinationPath "TouchSuite.Ink-v${{ needs.prepare.outputs.version }}-win-x64.zip" -Force
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rel-ink
+          path: TouchSuite.Ink-v${{ needs.prepare.outputs.version }}-win-x64.zip
+          if-no-files-found: error
+
   # ---- 汇总发布 ----
   publish:
     name: 创建 GitHub Release
-    needs: [ prepare, app, app_old, receiver, android, hidump, bridge, driver ]
+    needs: [ prepare, app, app_old, receiver, android, hidump, bridge, ink, driver ]
     # 有组件被跳过（未勾选）时也要跑，故用 always()
     if: ${{ always() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest

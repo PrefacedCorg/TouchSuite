@@ -9,6 +9,7 @@ on:
       - 'src/TouchSuite.Receiver/**'
       - 'src/TouchSuite.HidDump/**'
       - 'src/TouchSuite.HidTouchBridge/**'
+      - 'src/TouchSuite.Ink/**'
       - 'android/**'
       - '.github/workflows/build.yml'
   pull_request:
@@ -19,6 +20,7 @@ on:
       - 'src/TouchSuite.Receiver/**'
       - 'src/TouchSuite.HidDump/**'
       - 'src/TouchSuite.HidTouchBridge/**'
+      - 'src/TouchSuite.Ink/**'
       - 'android/**'
       - '.github/workflows/build.yml'
 
@@ -37,6 +39,7 @@ jobs:
       receiver: ${{ steps.filter.outputs.receiver }}
       hidump: ${{ steps.filter.outputs.hidump }}
       bridge: ${{ steps.filter.outputs.bridge }}
+      ink: ${{ steps.filter.outputs.ink }}
       android: ${{ steps.filter.outputs.android }}
     steps:
       - name: Checkout
@@ -57,6 +60,8 @@ jobs:
               - 'src/TouchSuite.HidDump/**'
             bridge:
               - 'src/TouchSuite.HidTouchBridge/**'
+            ink:
+              - 'src/TouchSuite.Ink/**'
             android:
               - 'android/**'
 
@@ -188,6 +193,32 @@ jobs:
         with:
           name: TouchSuite.HidTouchBridge
           path: src/TouchSuite.HidTouchBridge/bin/Release/net462/
+          if-no-files-found: error
+
+  ink:
+    name: TouchSuite.Ink
+    needs: changes
+    if: needs.changes.outputs.ink == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore & Build
+        run: |
+          dotnet restore src/TouchSuite.Ink/TouchSuite.Ink.csproj
+          dotnet build src/TouchSuite.Ink/TouchSuite.Ink.csproj -c Release --no-restore
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchSuite.Ink
+          path: src/TouchSuite.Ink/bin/Release/net10.0-windows/
           if-no-files-found: error
 
   android:
