@@ -35,11 +35,14 @@ internal sealed class DCompInkLayer : InkLayerBase
     private static readonly long PresentIntervalTicks = Stopwatch.Frequency * 7 / 1000;
 
     /// <summary>
-    /// 收锋（笔锋）参数：抬笔时从末端沿弧长往回 <see cref="TaperLengthPx"/> 像素，
-    /// 宽度平滑收到 <see cref="TaperTipScale"/> 倍。书写过程中宽度不变，避免"凹点"。
+    /// 实时笔锋（照抄 Inkeys 3 的 <c>ApplyLiveTipTaper</c>，Draw3.StrokeGeometry.cpp）。
+    /// <para>收锋长度不是固定像素，而是"最后 <see cref="LiveTailSeconds"/> 秒"这段的弧长 ——
+    /// 于是长度天然 = 速度 × 时间窗：写得快尾巴长、写得慢尾巴短、停住再抬几乎没有尾巴。
+    /// 尖端收窄多少也按这段的长度 / 笔半径决定，短尾巴只轻微收，长尾巴收到
+    /// <see cref="TaperTipScaleMax"/>。</para>
     /// </summary>
-    private const float TaperLengthPx = 12f;
-    private const float TaperTipScale = 0.45f;
+    private const double LiveTailSeconds = 0.055;   // Inkeys Fps60 profile 的 live_tail_duration_seconds
+    private const float TaperTipScaleMax = 0.3f;    // 窗口够长（≥4 倍笔半径）时的尖端比例
 
     /// <summary>笔尖附近要一起重画的采样数（收锋会改动这一段的形状，必须一起标脏）。</summary>
     private const int TipDirtySamples = 8;
@@ -480,11 +483,16 @@ internal sealed class DCompInkLayer : InkLayerBase
                 if (!_active.Remove(end.Id, out InkStroke? done))
                     break;
 
+                StrokeModeler? modeler = done.Modeler;
+
+                // 抬笔时"距最后一次输入"过了多久：收锋长度按它衰减（停住再抬就没有尾巴）
+                double liftAge = SecondsSince(done.Last.Ticks);
+
                 // 弹簧笔尖会略微落后于真实抬笔点：抬笔时让它追到最后一个输入位置
-                if (done.Modeler is { } fm)
+                if (modeler is not null)
                 {
                     _modeled.Clear();
-                    if (fm.Finish(done.Last, _modeled) > 0)
+                    if (modeler.Finish(done.Last, _modeled) > 0)
                     {
                         foreach (InkSample p in _modeled)
                         {
@@ -495,7 +503,7 @@ internal sealed class DCompInkLayer : InkLayerBase
                 }
 
                 // 收锋：抬笔时一次性改末段宽度（书写过程中宽度恒定，不会出现凹点）
-                ApplyTaper(done);
+                ApplyTaper(done, liftAge);
 
                 // 抬笔这一帧把**整条笔画**重画一遍：末端补齐 + 收锋 + 撤掉预测尾巴之后的最终形态
                 // 必须一次提交完。只标尾部的话，收锋那几像素要等下一次有脏区时才被重画，
@@ -893,42 +901,97 @@ internal sealed class DCompInkLayer : InkLayerBase
     private static float WidthAt(List<InkSample> pts, int i) => pts[i].Width;
 
     /// <summary>
-    /// 抬笔收锋：从末端沿**弧长**往回 <see cref="TaperLengthPx"/>，宽度平滑收到
-    /// <see cref="TaperTipScale"/> 倍。
+    /// 抬笔收锋：照抄 Inkeys 3 的 <c>ApplyLiveTipTaper</c>。
     ///
-    /// <para>必须在抬笔时一次性改宽度并重画 —— 如果像以前那样每帧按"距笔尖第几个点"重算，
-    /// 点一旦离开重画窗口就再也不会被更新，宽度序列里会留下几个偏细的点，看起来就是"凹下去"。</para>
+    /// <para>① 用<b>时间</b>定窗口：从末点往回取最后 <see cref="LiveTailSeconds"/> 秒那段，
+    /// 于是窗口弧长 = 速度 × 时间窗（写快尾巴长、写慢尾巴短）。
+    /// ② <paramref name="ageSeconds"/> = 抬笔时刻距最后一次输入的时间，停笔越久尾巴越短，
+    /// 超过时间窗就完全不出尾巴（圆头收笔）。
+    /// ③ 尖端比例 = 1 - 0.7 × smoothstep(窗口弧长 / (4 × 笔半径))：短尾巴只轻微收，长尾巴收到 30%。</para>
+    ///
+    /// <para>必须在抬笔时一次性改宽度并重画（不能每帧按"距笔尖第几个点"重算，那样离开重画窗口的
+    /// 点不会被更新，宽度序列里会留下凹点）。</para>
     /// </summary>
-    private static void ApplyTaper(InkStroke st)
+    private static void ApplyTaper(InkStroke st, double ageSeconds)
     {
         if (!InkSettings.Taper)
             return;
 
         List<InkSample> pts = st.Points;
         int n = pts.Count;
-        if (n < 12)
-            return;                             // 点/勾太短，不收锋
+        if (n < 2)
+            return;
 
-        float baseWidth = pts[n - 1].Width;     // 中值滤波后各点宽度基本一致，直接取末点
-        float acc = 0f;
+        // ① 时间窗：末点所在时间往回 LiveTailSeconds
+        double endT = Seconds(pts[n - 1].Ticks);
+        double startT = endT - LiveTailSeconds;
+        int first = n - 1;
+        while (first > 0 && Seconds(pts[first - 1].Ticks) >= startT)
+            first--;
 
-        for (int i = n - 1; i >= 0; i--)
+        // ② 窗口弧长 / 参考半径（窗口内最大笔宽的一半）
+        float windowLength = 0f;
+        float refRadius = pts[first].Width * 0.5f;
+        bool hasTime = false;
+        for (int i = first + 1; i < n; i++)
         {
-            if (i < n - 1)
-            {
-                float dx = pts[i].X - pts[i + 1].X;
-                float dy = pts[i].Y - pts[i + 1].Y;
-                acc += MathF.Sqrt(dx * dx + dy * dy);
-            }
-
-            float t = Math.Clamp(acc / TaperLengthPx, 0f, 1f);   // 0 = 笔尖，1 = 收锋区外
-            float scale = TaperTipScale + (1f - TaperTipScale) * (t * t * (3f - 2f * t)); // smoothstep，无台阶
-            pts[i] = pts[i] with { Width = baseWidth * scale };
-            st.Bounds = RectI.Union(st.Bounds, pts[i].BoundsAt());
-
-            if (t >= 1f)
-                break;
+            windowLength += Dist(pts[i - 1], pts[i]);
+            refRadius = MathF.Max(refRadius, pts[i].Width * 0.5f);
+            hasTime |= pts[i].Ticks != pts[i - 1].Ticks;
         }
+        // 没有时间戳（合成/测试样本）：给一个中性窗口，避免退化成"完全不收锋"
+        if (!hasTime)
+            windowLength = MathF.Max(pts[n - 1].Width * 4f, 14f);
+        if (windowLength <= 0.5f || refRadius <= 0.1f)
+            return;
+
+        // ③ 停笔时间吃掉窗口：抬笔那一刻 age≈0 就是完整窗口
+        double age = Math.Clamp(ageSeconds, 0.0, LiveTailSeconds);
+        float effective = windowLength * (1f - SmoothStep01((float)(age / LiveTailSeconds)));
+        if (effective <= 0.5f)
+            return;
+
+        float tipScale = 1f - 0.7f * SmoothStep01(effective / (4f * refRadius));
+
+        // ④ 沿弧长施加：收锋区之前不动
+        float taperStart = windowLength - effective;
+        float arc = 0f;
+        for (int i = first + 1; i < n; i++)
+        {
+            arc += Dist(pts[i - 1], pts[i]);
+            if (arc <= taperStart)
+                continue;
+
+            float progress = Math.Clamp((arc - taperStart) / effective, 0f, 1f);
+            float factor = 1f + (tipScale - 1f) * SmoothStep01(progress);
+            pts[i] = pts[i] with { Width = pts[i].Width * factor };
+            st.Bounds = RectI.Union(st.Bounds, pts[i].BoundsAt());
+        }
+    }
+
+    /// <summary>跟 Chromium/Inkeys 的 SmoothStep01 一致：clamp 后 smoothstep。</summary>
+    private static float SmoothStep01(float t)
+    {
+        t = Math.Clamp(t, 0f, 1f);
+        return t * t * (3f - 2f * t);
+    }
+
+    private static double Seconds(long ticks) =>
+        ticks <= 0 ? 0 : ticks / (double)Stopwatch.Frequency;
+
+    /// <summary>距某个时间戳过了多久（秒）。</summary>
+    private static double SecondsSince(long ticks)
+    {
+        if (ticks <= 0)
+            return 0;
+        long now = Stopwatch.GetTimestamp();
+        return now <= ticks ? 0 : (now - ticks) / (double)Stopwatch.Frequency;
+    }
+
+    private static float Dist(InkSample a, InkSample b)
+    {
+        float dx = a.X - b.X, dy = a.Y - b.Y;
+        return MathF.Sqrt(dx * dx + dy * dy);
     }
 
     /// <summary>
