@@ -83,6 +83,18 @@ public partial class MainWindow : Window
     private int _rawWmInputCount;             // WM_INPUT 消息总数（不管解没解出来），用来区分"没来"与"来了解不出"
     private Stopwatch? _probeWatch;
 
+    /// <summary>
+    /// 本次要用的采样时间戳（QPC）。0 = 用当前时刻。
+    /// <para>一条消息里带回多个历史子帧时，它们必须是<b>不同</b>的时间戳；否则
+    /// <see cref="StrokeModeler.Update"/> 会因 dt&lt;=0 直接跳过建模，那些点退化成未平滑的原始点，
+    /// 笔画出现折角、速度估计失真，快写/转圈时就会"一顿一甩"。WM_POINTER 用系统给的
+    /// <c>POINTER_INFO.PerformanceCount</c>，RawInput 按子帧数把消息间隔回推分摊。</para>
+    /// </summary>
+    private long _pendingSampleTicks;
+
+    /// <summary>上一批 RawInput 消息到达的时刻（用来把一次批量里的多个子帧还原成时间正序）。</summary>
+    private long _lastRawBatchTicks;
+
     /// <summary>触点 id → 本次笔画 id（0 表示"这根在擦"，不建笔画）。多指的关键就是这份表。</summary>
     private readonly Dictionary<int, int> _strokeOfPointer = new();
 
@@ -260,8 +272,20 @@ public partial class MainWindow : Window
         _probeSubReports += frames.Count;
 
         var ins = new List<ContactTracker.TrackIn>();
-        foreach (RawHidTouch.RawFrame frame in frames)
+
+        // 一批 WM_INPUT 里可能挤着多个子帧（等于多份历史采样）。它们的真实采样时刻是均匀分布的，
+        // 只是"到得晚"。按子帧数把本批的消息间隔均摊回去，让模型看到的时间轴保持真实
+        // —— 否则同一批所有子帧共用"处理时刻"，dt≈0 的点会被模型直接跳过（退化成未平滑点）。
+        long batchNow = Stopwatch.GetTimestamp();
+        long span = _lastRawBatchTicks == 0 ? 0 : batchNow - _lastRawBatchTicks;
+        _lastRawBatchTicks = batchNow;
+        if (span < 0 || span > Stopwatch.Frequency / 4)
+            span = 0;                                  // 停很久/时钟异常：不猜，交给模型自己判断
+        int subCount = frames.Count;
+
+        for (int f = 0; f < frames.Count; f++)
         {
+            RawHidTouch.RawFrame frame = frames[f];
             _probeContacts += frame.Contacts.Count;
             ins.Clear();
             foreach (RawHidTouch.RawContact c in frame.Contacts)
@@ -280,9 +304,15 @@ public partial class MainWindow : Window
                 }
             }
 
+            // 最后一个子帧就是"现在"，更早的按均摊间隔往前推
+            _pendingSampleTicks = subCount <= 1
+                ? batchNow
+                : batchNow - (subCount - 1 - f) * span / subCount;
+
             _tracker!.Sync(ins, frame.CountZero, _events);
             FeedEvents();
         }
+        _pendingSampleTicks = 0;
 
         _rawActiveCount = _tracker!.ActiveCount;
         if (_probeFrames % 240 == 0)
@@ -403,6 +433,17 @@ public partial class MainWindow : Window
         if (!_annotating || _layer is null)
             return;
 
+        // 同一帧的所有触点是同一时刻采样的：统一用系统给的真实采样时刻（POINTER_INFO.PerformanceCount，
+        // 与 Stopwatch 同源）。这样即使这条消息在 UI 线程排了 20ms，模型看到的间隔仍然是真的。
+        long saved = _pendingSampleTicks;
+        for (int i = 0; i < frame.Count; i++)
+        {
+            if (frame[i].PerformanceCount == 0)
+                continue;
+            _pendingSampleTicks = (long)frame[i].PerformanceCount;
+            break;
+        }
+
         foreach (PointerTouchFrame.PointerContact c in frame)
         {
             int id = (int)(PointerIdBase + c.PointerId);
@@ -423,6 +464,8 @@ public partial class MainWindow : Window
                 PointerUp(id);
             }
         }
+
+        _pendingSampleTicks = saved;
     }
 
     /// <summary>工具栏上的「输入源」按钮：展开/收起本窗口内的下拉面板（贴着工具栏底边）。</summary>
@@ -1058,8 +1101,10 @@ public partial class MainWindow : Window
     {
         float t = Math.Clamp(pressure, 0f, 1f);
         float w = (float)(_width * (0.35 + 0.65 * t));
-        return new InkSample((float)screenPx.X, (float)screenPx.Y, w, _color.R, _color.G, _color.B, _color.A,
-            Stopwatch.GetTimestamp());   // QPC 时间戳：TickCount 只有 15.6ms 粒度，估不准速度
+        // 优先用调用方给的**真实采样时刻**（WM_POINTER 的 PerformanceCount / RawInput 子帧回推），
+        // 都没有才退化成"处理时刻"。QPC 时间戳：TickCount 只有 15.6ms 粒度，估不准速度。
+        long ticks = _pendingSampleTicks != 0 ? _pendingSampleTicks : Stopwatch.GetTimestamp();
+        return new InkSample((float)screenPx.X, (float)screenPx.Y, w, _color.R, _color.G, _color.B, _color.A, ticks);
     }
 
     // ================= 工具栏 =================

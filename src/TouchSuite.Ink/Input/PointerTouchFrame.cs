@@ -81,9 +81,16 @@ internal static class PointerTouchFrame
         public uint pressure;
     }
 
-    /// <summary>解出来的一根触点。Xpx/Ypx 是屏幕物理像素。</summary>
+    /// <summary>
+    /// 解出来的一根触点。Xpx/Ypx 是屏幕物理像素。
+    /// <para><see cref="PerformanceCount"/> 是系统给的<b>真实采样时刻</b>（QPC 计数，与
+    /// <c>Stopwatch.GetTimestamp()</c> 同源）。必须用它当笔迹时间戳，而不是"我们处理这条消息的时刻"：
+    /// 消息在 UI 线程排队 10~20ms 是常态，用处理时刻会把采样间隔压扁/拉长，
+    /// 速度估计直接失真 —— 表现就是快写时笔迹一顿一顿、预测一冲一收。</para>
+    /// </summary>
     public sealed record PointerContact(uint PointerId, int Xpx, int Ypx, bool InContact,
-        uint Pressure1024, RECT Contact, uint Orientation, uint FrameId, uint HistoryCount);
+        uint Pressure1024, RECT Contact, uint Orientation, uint FrameId, uint HistoryCount,
+        ulong PerformanceCount);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetPointerType(uint pointerId, out uint pointerType);
@@ -198,7 +205,8 @@ internal static class PointerTouchFrame
         t.rcContact,
         t.orientation,
         t.pointerInfo.frameId,
-        t.pointerInfo.historyCount);
+        t.pointerInfo.historyCount,
+        t.pointerInfo.PerformanceCount);
 
     /// <summary>接触面积是否可用（决定要不要把它写进日志）。</summary>
     public static bool HasContactArea(POINTER_TOUCH_INFO t) =>

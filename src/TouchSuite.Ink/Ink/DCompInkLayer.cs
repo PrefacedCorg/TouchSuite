@@ -48,20 +48,14 @@ internal sealed class DCompInkLayer : InkLayerBase
     private const int TipDirtySamples = 8;
 
     /// <summary>
-    /// 墨迹预测的提前量（秒）。Inkeys 的 Fps60 profile 用 1/45s ≈ 22ms。
-    /// 预测点从<b>模型笔尖</b>沿模型速度外推，而不是拿最近两个原始采样算差分。
+    /// 预测期内的刷新节拍（≈一帧）。没有新输入时也要按这个节拍醒来重算预测，
+    /// 让预测段随"距最后一次输入的时间"逐帧缩回去 —— 详见 <see cref="UpdatePrediction"/>。
     /// </summary>
-    private const double PredictLeadSeconds = 1.0 / 45.0;
+    private const int PredictTickMs = 8;
 
-    /// <summary>预测置信度的速度区间（px/s）：取 Inkeys/Chromium 的 5%~25% × 期望速度 500px/s。</summary>
-    private const float PredictMinSpeed = 25f;
-    private const float PredictMaxSpeed = 125f;
-
-    /// <summary>预测段长度上限（px）：速度再快也不甩出去。</summary>
-    private const float PredictMaxPx = 40f;
-
-    /// <summary>预测点迟迟没有新采样跟上时，等这么久就撤掉（否则手指停住后墨迹会"甩"在前头）。</summary>
-    private const int PredictExpireMs = 70;
+    /// <summary>预测段涂成品红（调试用）：启动前设环境变量 TSSUITE_PREDICT_DEBUG=1。</summary>
+    private static readonly bool PredictDebug =
+        Environment.GetEnvironmentVariable("TSSUITE_PREDICT_DEBUG") == "1";
 
     private long _lastPresentStamp;
 
@@ -101,11 +95,23 @@ internal sealed class DCompInkLayer : InkLayerBase
     private long _frames;
     private bool _loggedFirstFrame;
 
+    // ---- 延迟探针：从"采样时刻"到"墨水提交给 DWM" ----
+    // 不包含 DWM 合成相位（0~1 帧），所以它是可优化的那部分，做对比基线用。
+    private readonly long[] _latency = new long[256];
+    private int _latencyCount, _latencyIndex;
+    private long _lastSampleTicks;
+
     // ---- 湿墨的预测尾巴（只在渲染线程访问）----
     private bool _predictActive;
-    private InkSample _predictColor;
-    private float _predictX0, _predictY0, _predictX1, _predictY1;
-    private float _predictW0, _predictW1;
+
+    /// <summary>当前活动笔画：预测要按它每帧重算（停手后逐帧缩回），所以得留着引用。</summary>
+    private InkStroke? _liveStroke;
+
+    /// <summary>预测折线（弧线外推出来的若干点，最后一个点宽度已收到 0.3 倍）。</summary>
+    private readonly List<InkSample> _predictPts = new();
+
+    /// <summary>本帧刚算出来的预测（与 _predictPts 比对，内容没变就不重画）。</summary>
+    private readonly List<InkSample> _pendingPts = new();
     private RectI _predictBounds = RectI.Empty;
 
     public DCompInkLayer(IntPtr hwnd, int originX, int originY, int width, int height)
@@ -152,13 +158,13 @@ internal sealed class DCompInkLayer : InkLayerBase
 
             while (true)
             {
-                // 有预测尾巴时不能无限期等：超时说明手指没再动，要把预测撤掉并重画一帧
+                // 有预测尾巴时不能无限期等：到点就按"距最后输入的时间"把预测缩回去并重画一帧
                 if (_predictActive)
                 {
-                    if (Queue.TryTake(out InkCommand? pended, PredictExpireMs))
+                    if (Queue.TryTake(out InkCommand? pended, PredictTickMs))
                         Process(pended!);
                     else
-                        ClearPrediction();
+                        RefreshPrediction();
                 }
                 else
                 {
@@ -189,6 +195,7 @@ internal sealed class DCompInkLayer : InkLayerBase
 
                 _lastPresentStamp = Stopwatch.GetTimestamp();   // 从呈现开始算间隔，别把呈现本身的耗时也算进去
                 Present();
+                NotePresentLatency();
             }
         }
         catch (InvalidOperationException)
@@ -434,12 +441,14 @@ internal sealed class DCompInkLayer : InkLayerBase
                 stroke.Bounds = b.S.BoundsAt();
                 _strokes.Add(stroke);
                 _active[b.Id] = stroke;
+                _liveStroke = stroke;
                 _undo.Push(new UndoEntry(new[] { stroke }, Array.Empty<InkStroke>()));
                 MarkDirty(stroke.Bounds);
                 break;
             }
             case CmdExtend e:
             {
+                NoteSample(e.S.Ticks);
                 if (!_active.TryGetValue(e.Id, out InkStroke? stroke))
                     break;
 
@@ -480,6 +489,7 @@ internal sealed class DCompInkLayer : InkLayerBase
             case CmdEnd end:
             {
                 ClearPrediction();
+                _liveStroke = null;
                 if (!_active.Remove(end.Id, out InkStroke? done))
                     break;
 
@@ -601,72 +611,89 @@ internal sealed class DCompInkLayer : InkLayerBase
     // ================= 墨迹预测（湿墨尾巴） =================
 
     /// <summary>
-    /// 预测笔尖：从<b>模型笔尖</b>沿<b>模型速度</b>外推 <see cref="PredictLeadSeconds"/>，
-    /// 只画在湿墨最前面，来了新采样就被替换。
-    /// <para>置信度按速度在 <see cref="PredictMinSpeed"/>~<see cref="PredictMaxSpeed"/> 之间插值
-    /// （Inkeys/Chromium 的 Kalman confidence 用的也是这两个比例）：手慢/手停时提前量自动归零，
-    /// 不会出现"墨甩在手指前面"。</para>
+    /// 重算预测段。位置/方向/曲率全部来自 <see cref="StrokeModeler"/> 的<b>原始输入运动学窗口</b>：
+    /// 沿圆弧外推，而不是拿弹簧速度沿切线直推 —— 后者在转圈时必然甩到圆外。
+    ///
+    /// <para><b>为什么要带 age</b>：预测提前量会被"距最后一次输入的时间"吃掉。手指停住后，
+    /// 每帧重算得到的预测段越来越短，最后自然缩成 0；而不是像以前那样挂满 70ms 再突然消失
+    /// （那 70ms 里手指已经转向/停住，尾巴就"甩"出去了）。</para>
     /// </summary>
     private void UpdatePrediction(InkStroke st)
     {
-        if (!InkSettings.Prediction || st.Modeler is not { HasVelocity: true } modeler)
+        if (!InkSettings.Prediction || st.Modeler is not { } modeler)
         {
             ClearPrediction();
             return;
         }
 
-        MarkDirty(_predictBounds);        // 旧的预测段一并擦掉
+        double age = st.Last.Ticks <= 0 ? 0 : SecondsSince(st.Last.Ticks);
+        int n = modeler.BuildPrediction(st.Last, age, _pendingPts);
+
+        // 这一帧没有新样本、预测也没缩短到需要重画的程度 → 什么都不做。
+        // 否则渲染线程每 8ms 都会提交一帧内容完全相同的画面，白烧 GPU。
+        if (n >= 2 && _predictActive && n == _predictPts.Count)
+        {
+            InkSample a = _pendingPts[n - 1], b = _predictPts[n - 1];
+            if (Math.Abs(a.X - b.X) < 0.4 && Math.Abs(a.Y - b.Y) < 0.4)
+                return;
+        }
+
+        ApplyPrediction(n >= 2 ? _pendingPts : null);
+    }
+
+    /// <summary>把一份新的预测折线换上去，并只脏化"旧段 ∪ 新段"。</summary>
+    private void ApplyPrediction(List<InkSample>? pts)
+    {
+        MarkDirty(_predictBounds);              // 旧段可能比新段长，不擦会留残影
         _predictBounds = RectI.Empty;
         _predictActive = false;
 
-        float speed = modeler.Speed;
-        if (speed < PredictMinSpeed)
-            return;
-
-        float conf = Math.Clamp((speed - PredictMinSpeed) / (PredictMaxSpeed - PredictMinSpeed), 0f, 1f);
-        float leadX = modeler.VelX * (float)PredictLeadSeconds * conf;
-        float leadY = modeler.VelY * (float)PredictLeadSeconds * conf;
-
-        float leadLen = MathF.Sqrt(leadX * leadX + leadY * leadY);
-        if (leadLen < 0.5f)
-            return;
-        if (leadLen > PredictMaxPx)
+        if (pts is null || pts.Count < 2)
         {
-            leadX *= PredictMaxPx / leadLen;
-            leadY *= PredictMaxPx / leadLen;
+            _predictPts.Clear();
+            return;
         }
 
-        _predictX0 = modeler.X;
-        _predictY0 = modeler.Y;
-        _predictX1 = _predictX0 + leadX;
-        _predictY1 = _predictY0 + leadY;
-        _predictW0 = WidthAt(st.Points, st.Points.Count - 1);   // 接上收锋之后的笔尖宽度，视觉上连成一条
-        _predictW1 = _predictW0 * 0.66f;
-        _predictColor = st.Last;
-        _predictActive = true;
+        _predictPts.Clear();
+        _predictPts.AddRange(pts);
 
-        _predictBounds = SegmentBounds(_predictX0, _predictY0, _predictX1, _predictY1,
-            MathF.Max(_predictW0, _predictW1));
-        MarkDirty(_predictBounds);
+        // 调试：把预测段画成品红，一眼看出它到底往哪偏、有没有在跳。
+        // 启动前设 TSSUITE_PREDICT_DEBUG=1 即可。
+        if (PredictDebug)
+        {
+            for (int i = 0; i < _predictPts.Count; i++)
+                _predictPts[i] = _predictPts[i] with { R = 255, G = 0, B = 255, A = 255 };
+        }
+
+        RectI bounds = RectI.Empty;
+        foreach (InkSample p in _predictPts)
+            bounds = RectI.Union(bounds, p.BoundsAt());
+
+        _predictBounds = bounds;
+        _predictActive = true;
+        MarkDirty(bounds);
+    }
+
+    /// <summary>没有新输入、但预测还挂着：按当前时间重算一次（结果是变短，直到消失）。</summary>
+    private void RefreshPrediction()
+    {
+        if (_liveStroke is null)
+        {
+            ClearPrediction();
+            return;
+        }
+        UpdatePrediction(_liveStroke);
     }
 
     private void ClearPrediction()
     {
+        _liveStroke = null;
         if (!_predictActive && _predictBounds.IsEmpty)
             return;
         MarkDirty(_predictBounds);
         _predictActive = false;
         _predictBounds = RectI.Empty;
-    }
-
-    private static RectI SegmentBounds(float ax, float ay, float bx, float by, float width)
-    {
-        float pad = width * 0.5f + 2f;
-        return new RectI(
-            (int)MathF.Floor(MathF.Min(ax, bx) - pad),
-            (int)MathF.Floor(MathF.Min(ay, by) - pad),
-            (int)MathF.Ceiling(MathF.Max(ax, bx) + pad),
-            (int)MathF.Ceiling(MathF.Max(ay, by) + pad));
+        _predictPts.Clear();
     }
 
     private static float DistanceToPolyline(InkStroke st, float x, float y)
@@ -754,11 +781,53 @@ internal sealed class DCompInkLayer : InkLayerBase
                 Log.Hr("Commit", hr);
 
             _frames++;
+            if (_frames % 600 == 0)
+                ReportLatency();
         }
         finally
         {
             Marshal.FreeHGlobal(rectMem);
         }
+    }
+
+    /// <summary>记下最新一个样本的真实采样时刻（预测/延迟统计都用它）。</summary>
+    private void NoteSample(long ticks)
+    {
+        if (ticks > 0)
+            _lastSampleTicks = ticks;
+    }
+
+    /// <summary>一次 Present 完成 = 墨水已经交给 DWM，剩下的只是合成相位。</summary>
+    private void NotePresentLatency()
+    {
+        if (_lastSampleTicks <= 0)
+            return;
+        long now = Stopwatch.GetTimestamp();
+        long d = now - _lastSampleTicks;
+        if (d <= 0 || d > Stopwatch.Frequency)      // 异常值（时钟回退/停顿）直接丢
+            return;
+        _latency[_latencyIndex] = d;
+        _latencyIndex = (_latencyIndex + 1) % _latency.Length;
+        if (_latencyCount < _latency.Length)
+            _latencyCount++;
+    }
+
+    /// <summary>
+    /// 每 600 帧报一次"采样 → 墨水提交"的分布。这是<b>能优化的那一段</b>：
+    /// 后面还有 DWM 合成相位（平均约半帧），那部分要靠交换链/合成器时钟对齐去压。
+    /// </summary>
+    private void ReportLatency()
+    {
+        if (_latencyCount < 64)
+            return;
+        long[] a = new long[_latencyCount];
+        Array.Copy(_latency, a, _latencyCount);
+        Array.Sort(a);
+        double Ms(long t) => t * 1000.0 / Stopwatch.Frequency;
+        Log.Write($"[延迟] 采样→墨水提交 样本={a.Length} P50={Ms(a[a.Length / 2]):0.0}ms "
+                + $"P95={Ms(a[Math.Min(a.Length - 1, (int)(a.Length * 0.95))]):0.0}ms 最大={Ms(a[^1]):0.0}ms");
+        _latencyCount = 0;
+        _latencyIndex = 0;
     }
 
     /// <summary>把矩形撑到至少 minSide×minSide，优先往有空间的一侧扩，扩到边界就不越过。</summary>
@@ -832,16 +901,20 @@ internal sealed class DCompInkLayer : InkLayerBase
                     DrawStroke(renderTarget, st, update, brushes, _strokeStyle);
             }
 
-            // 预测笔尖画在所有真实笔迹之后（它就是最前面那一小段）
-            if (_predictActive)
+            // 预测笔尖画在所有真实笔迹之后（它就是最前面那一小段）。
+            // 逐段画折线：BuildPrediction 给的是沿圆弧的若干点，单条直线表达不了曲率。
+            if (_predictActive && _predictPts.Count >= 2)
             {
-                IntPtr predictBrush = GetBrush(renderTarget, _predictColor, brushes);
+                IntPtr predictBrush = GetBrush(renderTarget, _predictPts[0], brushes);
                 if (predictBrush != IntPtr.Zero)
                 {
                     var drawLine = Vtbl.Slot<Vtbl.DrawLine>(renderTarget, Gfx.SlotRtDrawLine);
-                    StrokeSegment(drawLine, renderTarget, predictBrush,
-                        _predictX0, _predictY0, _predictX1, _predictY1,
-                        _predictW0, _predictW1, update, _strokeStyle);
+                    for (int i = 0; i + 1 < _predictPts.Count; i++)
+                    {
+                        InkSample p0 = _predictPts[i], p1 = _predictPts[i + 1];
+                        StrokeSegment(drawLine, renderTarget, predictBrush,
+                            p0.X, p0.Y, p1.X, p1.Y, p0.Width, p1.Width, update, _strokeStyle);
+                    }
                 }
             }
         }
